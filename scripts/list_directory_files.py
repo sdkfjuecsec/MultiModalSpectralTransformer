@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""List every file below a directory and write the inventory to a text file.
+"""List every file below one directory and write the inventory to a text file.
 
 Motivation: the dataset groups are tens of gigabytes, so the fastest way to
 inspect a downloaded group (for example the extracted models/ folder in Colab)
 is to produce a small text report and download that instead of the binaries.
 
-Usage:
-    python scripts/list_directory_files.py
+Usage: exactly one directory per run, plus an optional report path.
     python scripts/list_directory_files.py /content/MultiModalSpectralTransformer/models
-    python scripts/list_directory_files.py "D:\\Challenge\\MultiModalSpectralTransformer\\models" -o models_files.txt
+    python scripts/list_directory_files.py /content/MultiModalSpectralTransformer/models -o models_files.txt
+    python scripts/list_directory_files.py "D:\\Challenge\\MultiModalSpectralTransformer\\models"
 
 The report contains:
     * one aligned row per file: relative path, exact bytes, human size, mtime
@@ -20,7 +20,6 @@ import argparse
 import datetime
 from pathlib import Path
 
-DEFAULT_DIRECTORY = "/content/MultiModalSpectralTransformer/models"
 DEFAULT_OUTPUT = "file_list.txt"
 
 
@@ -120,9 +119,7 @@ def main() -> int:
     )
     parser.add_argument(
         "directory",
-        nargs="?",
-        default=DEFAULT_DIRECTORY,
-        help=f"directory to inspect (default: {DEFAULT_DIRECTORY})",
+        help="the one folder to inspect; quote the path if it contains spaces",
     )
     parser.add_argument(
         "-o",

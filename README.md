@@ -101,6 +101,30 @@ analysis; extract it with
 `bash scripts/download_zenodo_group.sh reviewer` (it unpacks into
 `past_experiments/ChemXriv/`).
 
+### Inspecting a downloaded group
+
+`scripts/list_directory_files.py` writes a text inventory of **exactly one
+folder** per run: every file with relative path, exact bytes, readable size and
+modification time, plus a per-extension summary and the totals.
+
+```bash
+# Colab (the extracted models group)
+python scripts/list_directory_files.py /content/MultiModalSpectralTransformer/models
+
+# local Windows: quote the path, and optionally choose the report name
+python scripts/list_directory_files.py "D:\Challenge\MultiModalSpectralTransformer\models" -o models_files.txt
+```
+
+The report is written to `file_list.txt` by default and printed to the terminal
+at the same time. Pass one folder per run; a second path is rejected by argparse.
+Because the report is a few kilobytes, downloading it is much cheaper than
+browsing gigabytes of weights:
+
+```python
+from google.colab import files
+files.download("file_list.txt")
+```
+
 ### Folder Structure
 
 After cloning the repository and adding the required data and models, your folder structure should look like this:
