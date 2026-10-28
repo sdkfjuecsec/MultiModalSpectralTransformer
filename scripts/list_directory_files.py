@@ -6,8 +6,8 @@ inspect a downloaded group (for example the extracted models/ folder in Colab)
 is to produce a small text report and download that instead of the binaries.
 
 Usage: exactly one directory per run, plus an optional report path.
-    python scripts/list_directory_files.py /content/MultiModalSpectralTransformer/models
-    python scripts/list_directory_files.py /content/MultiModalSpectralTransformer/models -o models_files.txt
+    python scripts/list_directory_files.py models
+    python scripts/list_directory_files.py /data/MultiModalSpectralTransformer/models -o models_files.txt
     python scripts/list_directory_files.py "D:\\Challenge\\MultiModalSpectralTransformer\\models"
 
 The report contains:

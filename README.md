@@ -63,10 +63,18 @@ supersede it and it does not contain `models.zip` / `data.zip` anymore.
 Download, verify and extract with the helper script, one group at a time:
 
 ```bash
-bash scripts/download_zenodo_group.sh models            /content/MultiModalSpectralTransformer
-bash scripts/download_zenodo_group.sh past_experiments /content/MultiModalSpectralTransformer
-bash scripts/download_zenodo_group.sh reviewer          /content/MultiModalSpectralTransformer
-bash scripts/download_zenodo_group.sh data              /content/MultiModalSpectralTransformer   # needs ~140 GB free
+bash scripts/download_zenodo_group.sh models
+bash scripts/download_zenodo_group.sh past_experiments
+bash scripts/download_zenodo_group.sh reviewer
+bash scripts/download_zenodo_group.sh data             # needs ~140 GB free
+```
+
+Run the commands from the repository root. The script derives the root from its
+own location, so no path argument is needed; pass one as the second argument
+only when the repository lives somewhere else:
+
+```bash
+bash scripts/download_zenodo_group.sh models /data/MultiModalSpectralTransformer
 ```
 
 It fetches the parts with aria2 (16 connections per file, resumable), checks
@@ -79,7 +87,7 @@ the extracted tree. The trade-off is that an interrupted run cannot be resumed,
 because already-consumed parts are gone:
 
 ```bash
-LOW_DISK=1 bash scripts/download_zenodo_group.sh data /content/MultiModalSpectralTransformer
+LOW_DISK=1 bash scripts/download_zenodo_group.sh data
 ```
 
 Because the archive is one sequential xz stream, a single part cannot be
@@ -88,7 +96,7 @@ a subset on disk, set `ONLY_PATHS` (tar patterns, quoted):
 
 ```bash
 ONLY_PATHS='data/IBM_dataset/* data/test_data/*' \
-    bash scripts/download_zenodo_group.sh data /content/MultiModalSpectralTransformer
+    bash scripts/download_zenodo_group.sh data
 ```
 
 This still transfers the full 93 GB, but tar writes only the matching entries,
@@ -108,10 +116,13 @@ folder** per run: every file with relative path, exact bytes, readable size and
 modification time, plus a per-extension summary and the totals.
 
 ```bash
-# Colab (the extracted models group)
-python scripts/list_directory_files.py /content/MultiModalSpectralTransformer/models
+# from the repository root (the extracted models group)
+python scripts/list_directory_files.py models
 
-# local Windows: quote the path, and optionally choose the report name
+# an absolute path, with a custom report name
+python scripts/list_directory_files.py /data/MultiModalSpectralTransformer/models -o models_files.txt
+
+# local Windows: quote paths that contain spaces
 python scripts/list_directory_files.py "D:\Challenge\MultiModalSpectralTransformer\models" -o models_files.txt
 ```
 

@@ -24,8 +24,8 @@ import torch
 from rdkit import Chem
 
 # --- FIX: Correctly determine the project root directory ---
-# The project root is now the directory where this script is located.
-project_root = os.path.dirname(os.path.abspath(__file__))
+# This script lives in scripts/, so the project root is one level above it.
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Add the utils directory to the Python path to ensure modules are found
 sys.path.append(os.path.join(project_root, 'utils_MMT'))
 

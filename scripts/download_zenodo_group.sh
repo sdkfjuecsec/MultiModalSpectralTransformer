@@ -144,8 +144,10 @@ set -euo pipefail
 
 # First argument = which group to fetch; defaults to "models".
 GROUP="${1:-models}"
-# Second argument = repository root; defaults to the Colab path.
-ROOT="${2:-/content/MultiModalSpectralTransformer}"
+# Absolute directory holding this script, so the default root works on any machine.
+SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Second argument = repository root; defaults to the parent of scripts/.
+ROOT="${2:-$(cd "$SCRIPT_DIRECTORY/.." && pwd)}"
 # Downloaded parts live in a staging directory inside the repository.
 PARTS_DIRECTORY="$ROOT/zenodo_parts"
 # How many files aria2 downloads at the same time (bulk mode).
