@@ -46,9 +46,10 @@ Thumbs.db
 *.swp
 *.swo
 
-# Local manuscript copies (publisher PDFs are not redistributable; the
-# ChemRxiv and Zenodo DOIs in README.md are the citable sources)
-/paper/
+# Local reference material: manuscript copies and study notes. Publisher PDFs
+# are not redistributable; the ChemRxiv and Zenodo DOIs in README.md are the
+# citable sources.
+/references/
 
 # Staging directory used by scripts/download_zenodo_group.sh
 /zenodo_parts/
