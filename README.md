@@ -20,7 +20,10 @@ This project requires significant computational resources:
 
 - **GPU**: A high-performance GPU is necessary. We recommend using an NVIDIA GPU with CUDA 11.1 support (e.g., NVIDIA V100 or K80).
 - **Memory**: At least 16GB RAM to handle datasets and model training.
-- **Storage**: At least 50GB storage space for datasets, model checkpoints, and results.
+- **Storage**: The dataset archives are 114 GB compressed and typically expand
+  to well over 200 GB, so plan for at least 250 GB free when unpacking
+  everything. `models`, `past_experiments` and the reviewer zip alone need
+  about 40 GB.
 - **Python**: Python 3.7.x is required (tested with Python 3.7.12).
 
 Please ensure your system meets these requirements before proceeding with the installation and usage of MultiModalSpectralTransformer.
@@ -41,14 +44,62 @@ The ESI contains:
 
 ### Required Downloads from Zenodo
 
-Before using this software, you need to download the necessary data and pre-trained models from our Zenodo repository: [https://doi.org/10.5281/zenodo.14712886](https://doi.org/10.5281/zenodo.14712886)
+The dataset is published as **one split archive set spread over three
+complementary records**. Each record holds a contiguous slice of the same
+`*.tar.xz.partXX` files, so all of them are required:
 
-You'll need to download the following files:
+| Record | Contents | Files | Size |
+|---|---|---|---|
+| [10.5281/zenodo.16076914](https://doi.org/10.5281/zenodo.16076914) | `data` parts aa–bc, `models` parts aa–ak, `past_experiments` parts aa–ah | 48 | 49.78 GB |
+| [10.5281/zenodo.16257786](https://doi.org/10.5281/zenodo.16257786) | `data` parts bd and bf–cx (`partae` is a duplicate upload) | 47 | 49.28 GB |
+| [10.5281/zenodo.17284940](https://doi.org/10.5281/zenodo.17284940) | `data` parts be and cy–dk, plus `Reviewer_Experiment_Global_Impact.zip` | 15 | 16.32 GB |
 
-1. **Models (Required)**: Download `models.zip` and extract its contents into the `models` directory of this repository
-2. **Data (Required)**: Download `data.zip` and extract its contents into the `data` directory of this repository
-3. **Experiment Data (Required for Reproducibility)**: Download experiment data and place it in the `experiment` directory to reproduce the figures and results from the paper
-4. **Extra Assets (Optional)**: Additional resources for extended functionality
+Combined totals: `data.tar.xz` **89 parts / 93.16 GB**, `models.tar.xz`
+11 parts / 11.08 GB, `past_experiments.tar.xz` 8 parts / 8.29 GB, reviewer zip
+1.80 GB. Record `10.5281/zenodo.14712886` (February 2025, 44 `*_split.z01…zip`
+files) is a **legacy upload** of an earlier packaging; the three records above
+supersede it and it does not contain `models.zip` / `data.zip` anymore.
+
+Download, verify and extract with the helper script, one group at a time:
+
+```bash
+bash scripts/download_zenodo_group.sh models            /path/to/MultiModalSpectralTransformer
+bash scripts/download_zenodo_group.sh past_experiments /path/to/MultiModalSpectralTransformer
+bash scripts/download_zenodo_group.sh reviewer          /path/to/MultiModalSpectralTransformer
+bash scripts/download_zenodo_group.sh data              /path/to/MultiModalSpectralTransformer   # needs ~140 GB free
+```
+
+It fetches the parts with aria2 (16 connections per file, resumable), checks
+every part against the MD5 published by Zenodo, merges them in archive order
+and streams the result through `xz`/`tar` into the repository root.
+
+If disk space is tight, `LOW_DISK=1` downloads one part at a time, feeds it to
+`tar` and deletes it immediately, so the peak footprint is a single part plus
+the extracted tree. The trade-off is that an interrupted run cannot be resumed,
+because already-consumed parts are gone:
+
+```bash
+LOW_DISK=1 bash scripts/download_zenodo_group.sh data /path/to/MultiModalSpectralTransformer
+```
+
+Because the archive is one sequential xz stream, a single part cannot be
+decompressed on its own: every part is always downloaded and read. To keep only
+a subset on disk, set `ONLY_PATHS` (tar patterns, quoted):
+
+```bash
+ONLY_PATHS='data/IBM_dataset/* data/test_data/*' \
+    bash scripts/download_zenodo_group.sh data /path/to/MultiModalSpectralTransformer
+```
+
+This still transfers the full 93 GB, but tar writes only the matching entries,
+so the disk footprint equals the selected files. `LOW_DISK=1` and `ONLY_PATHS`
+can be combined.
+
+
+The reviewer zip is required only for the reviewer-requested global impact
+analysis; extract it with
+`bash scripts/download_zenodo_group.sh reviewer` (it unpacks into
+`past_experiments/ChemXriv/`).
 
 ### Folder Structure
 
@@ -76,7 +127,7 @@ MultiModalSpectralTransformer
 │   ├── 📁 mol2mol
 │   ├── 📁 sgnn
 ├── 📁 nmr_sgnn_norm
-├── 📁 past_experiments / ChemXriv # Notebooks and data to reproduce paper experiments
+├── 📁 past_experiments/ChemXriv # Notebooks and data to reproduce paper experiments
 │   ├── 📁 0.0_Experiment_Training_Strategy
 │   ├── 📁 1.0_Experiment_Trainings_Experiments
 │   └── 📁 ... (and other experiment folders)
@@ -127,10 +178,20 @@ Please refer to these notebooks for detailed procedures on data generation and e
    ```
 
 2. **Download Required Data and Models**:
-   Download the necessary files from our Zenodo repository:
-   - [https://doi.org/10.5281/zenodo.16076914](https://doi.org/10.5281/zenodo.16076914)
-   - [https://doi.org/10.5281/zenodo.16257786](https://doi.org/10.5281/zenodo.16257786)
-   - [https://doi.org/10.5281/zenodo.16283829](https://doi.org/10.5281/zenodo.17284940)
+   Download every `*.tar.xz.partXX` file from all three records listed in
+   [Required Downloads from Zenodo](#required-downloads-from-zenodo) and place
+   them in one directory, or let the helper script do it:
+
+   ```bash
+   bash scripts/download_zenodo_group.sh models            .
+   bash scripts/download_zenodo_group.sh past_experiments  .
+   bash scripts/download_zenodo_group.sh reviewer          .
+   bash scripts/download_zenodo_group.sh data              .   # needs ~140 GB free
+   ```
+
+   The manual equivalent follows. Each archive already contains its own
+   top-level directory (`data/`, `models/`, `past_experiments/`), so it must be
+   extracted into the repository root and not into the group directory:
 
    ```bash
    # Create directories if they don't exist
@@ -138,21 +199,21 @@ Please refer to these notebooks for detailed procedures on data generation and e
    
    # Extract data files (after downloading all data.tar.xz.part* files)
    cat data.tar.xz.part* > data.tar.xz
-   tar -xJf data.tar.xz -C data/
+   tar -xJf data.tar.xz -C .
    rm data.tar.xz
    
    # Extract model files (after downloading all models.tar.xz.part* files)
    cat models.tar.xz.part* > models.tar.xz
-   tar -xJf models.tar.xz -C models/
+   tar -xJf models.tar.xz -C .
    rm models.tar.xz
    
    # Extract past experiments files (after downloading all past_experiments.tar.xz.part* files)
    cat past_experiments.tar.xz.part* > past_experiments.tar.xz
-   tar -xJf past_experiments.tar.xz -C past_experiments/
+   tar -xJf past_experiments.tar.xz -C .
    rm past_experiments.tar.xz
    ```
 
-4. **Environment Setup**:
+3. **Environment Setup**:
    We provide an installation script that sets up all the necessary dependencies:
    
    ```bash
