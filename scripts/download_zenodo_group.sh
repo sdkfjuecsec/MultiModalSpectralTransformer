@@ -41,8 +41,10 @@
 # Shell crash course: every construct this file uses, in reading order
 # -----------------------------------------------------------------------------
 # #!/usr/bin/env bash
-#     First line of a script. It names the interpreter that runs the file, so
-#     `./script.sh` behaves exactly like `bash script.sh`.
+#     First line of a script. It names the interpreter that runs the file when
+#     the file is started directly, i.e. `./scripts/download_zenodo_group.sh`
+#     runs exactly like `bash scripts/download_zenodo_group.sh` (the direct
+#     form additionally needs the executable bit: chmod +x).
 #
 # set -euo pipefail
 #     Three safety switches:
@@ -307,7 +309,7 @@ import urllib.request
 prefix, parts_directory = sys.argv[1], sys.argv[2]
 record_ids = sys.argv[3:]
 # Environment variables are visible to Python too. Example:
-#   shell `LOW_DISK=1 bash script.sh data` -> "1" -> True
+#   shell `LOW_DISK=1 bash scripts/download_zenodo_group.sh data` -> "1" -> True
 #   shell without LOW_DISK                 -> None -> False
 low_disk = os.environ.get("LOW_DISK") == "1"
 
@@ -380,7 +382,8 @@ print(f"{len(entries)} files, {total_bytes / 1e9:.2f} GB compressed, "
 required_bytes = int(largest_part * 3) if low_disk else int(total_bytes * 1.5)
 # SKIP_SPACE_CHECK=1 is the documented escape hatch for users who know that the
 # extracted tree lives on another disk, e.g.
-#   SKIP_SPACE_CHECK=1 bash script.sh data /content/repo
+#   SKIP_SPACE_CHECK=1 bash scripts/download_zenodo_group.sh data \
+#       /content/MultiModalSpectralTransformer
 if os.environ.get("SKIP_SPACE_CHECK") != "1" and free_bytes < required_bytes:
     # Example message: "not enough free space: 19.9 GB available, about
     # 139.7 GB recommended for mode bulk (re-run with SKIP_SPACE_CHECK=1 ...)"

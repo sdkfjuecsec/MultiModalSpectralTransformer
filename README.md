@@ -63,10 +63,10 @@ supersede it and it does not contain `models.zip` / `data.zip` anymore.
 Download, verify and extract with the helper script, one group at a time:
 
 ```bash
-bash scripts/download_zenodo_group.sh models            /path/to/MultiModalSpectralTransformer
-bash scripts/download_zenodo_group.sh past_experiments /path/to/MultiModalSpectralTransformer
-bash scripts/download_zenodo_group.sh reviewer          /path/to/MultiModalSpectralTransformer
-bash scripts/download_zenodo_group.sh data              /path/to/MultiModalSpectralTransformer   # needs ~140 GB free
+bash scripts/download_zenodo_group.sh models            /content/MultiModalSpectralTransformer
+bash scripts/download_zenodo_group.sh past_experiments /content/MultiModalSpectralTransformer
+bash scripts/download_zenodo_group.sh reviewer          /content/MultiModalSpectralTransformer
+bash scripts/download_zenodo_group.sh data              /content/MultiModalSpectralTransformer   # needs ~140 GB free
 ```
 
 It fetches the parts with aria2 (16 connections per file, resumable), checks
@@ -79,7 +79,7 @@ the extracted tree. The trade-off is that an interrupted run cannot be resumed,
 because already-consumed parts are gone:
 
 ```bash
-LOW_DISK=1 bash scripts/download_zenodo_group.sh data /path/to/MultiModalSpectralTransformer
+LOW_DISK=1 bash scripts/download_zenodo_group.sh data /content/MultiModalSpectralTransformer
 ```
 
 Because the archive is one sequential xz stream, a single part cannot be
@@ -88,7 +88,7 @@ a subset on disk, set `ONLY_PATHS` (tar patterns, quoted):
 
 ```bash
 ONLY_PATHS='data/IBM_dataset/* data/test_data/*' \
-    bash scripts/download_zenodo_group.sh data /path/to/MultiModalSpectralTransformer
+    bash scripts/download_zenodo_group.sh data /content/MultiModalSpectralTransformer
 ```
 
 This still transfers the full 93 GB, but tar writes only the matching entries,
