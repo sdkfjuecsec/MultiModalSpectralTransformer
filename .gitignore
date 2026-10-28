@@ -45,3 +45,10 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Local manuscript copies (publisher PDFs are not redistributable; the
+# ChemRxiv and Zenodo DOIs in README.md are the citable sources)
+/paper/
+
+# Staging directory used by scripts/download_zenodo_group.sh
+/zenodo_parts/
