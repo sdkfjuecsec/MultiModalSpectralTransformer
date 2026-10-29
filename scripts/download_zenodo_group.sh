@@ -20,17 +20,9 @@
 #   data              89 parts   93.16 GB   records 16076914 16257786 17284940
 #   reviewer           1 zip      1.80 GB   record 17284940
 #
-# Two download modes:
-#   default     all parts first (resumable), then one streaming extraction
-#   LOW_DISK=1  parts are fetched in archive order, piped into tar one by one
-#               and deleted immediately, so peak disk use is one part plus the
-#               extracted tree; a broken session cannot be resumed because the
-#               already-consumed parts are gone
-#
-# ONLY_PATHS limits what tar writes to disk, e.g.
-#   ONLY_PATHS='data/IBM_dataset/* data/test_data/*'
-# The xz stream is single and sequential, so every part is still downloaded and
-# read; only the disk footprint shrinks to the selected files.
+# Download strategy: every part is fetched first (parallel, resumable) and
+# checked against the MD5 published by Zenodo, then the parts are concatenated
+# in archive order and streamed through xz/tar in one pass.
 #
 # Every tar archive already contains its own top-level directory (models/,
 # data/, past_experiments/), so it is extracted into the repository root.
@@ -80,15 +72,7 @@
 # <<'WORD' ... WORD      heredoc: a block of text (here: Python code) fed to the
 #                       previous command as its stdin. The quotes around WORD
 #                       switch off all $variable expansion inside the block.
-# <<< "text"            here-string: feed one text value as stdin to a command.
 #
-# read -r a b           read one line of stdin and split it into variables a, b.
-# IFS=$'\t'             tell `read` that fields are separated by a TAB character.
-# while read ...; do ...; done < file
-#                       run the loop body once per line of `file`.
-# read -r -a ARRAY <<< "$TEXT"
-#                       split TEXT on spaces and store the words in an array.
-# ARRAY=(one two)       build an array; "${ARRAY[@]}" expands to all its items.
 # VAR="$(...)"          capture a command output into a variable.
 # mapfile -t ARRAY < <(command)
 #                       run `command`, store each output line as one array item;
@@ -97,10 +81,6 @@
 # cut -f1 file          print only the first TAB-separated field of every line.
 # ${#ARRAY[@]}          number of items in an array.
 # ${ARRAY[0]}           first item of an array.
-# "${ARRAY[@]+"${ARRAY[@]}"}"
-#                       expand an array only when it is non-empty. Without this
-#                       guard, `set -u` would abort on an empty array in older
-#                       bash versions.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -150,25 +130,10 @@ SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${2:-$(cd "$SCRIPT_DIRECTORY/.." && pwd)}"
 # Downloaded parts live in a staging directory inside the repository.
 PARTS_DIRECTORY="$ROOT/zenodo_parts"
-# How many files aria2 downloads at the same time (bulk mode).
+# How many files aria2 downloads at the same time.
 ARIA2_JOBS="${ARIA2_JOBS:-4}"
 # How many TCP connections aria2 opens per file.
 ARIA2_CONNECTIONS="${ARIA2_CONNECTIONS:-16}"
-# "1" = delete each part as soon as it has been fed to tar.
-LOW_DISK="${LOW_DISK:-0}"
-# Optional tar patterns; empty means "extract everything".
-ONLY_PATHS="${ONLY_PATHS:-}"
-
-# tar arguments for selective extraction; empty array means "extract everything".
-TAR_MEMBER_ARGS=()
-# Only build the argument list when the caller asked for a subset.
-if [ -n "$ONLY_PATHS" ]; then
-    # Split the space-separated string into one array item per pattern.
-    read -r -a SELECTED_PATHS <<< "$ONLY_PATHS"
-    # --wildcards lets tar treat `*` inside the patterns as a wildcard.
-    TAR_MEMBER_ARGS=(--wildcards "${SELECTED_PATHS[@]}")
-    echo "selective extraction: $ONLY_PATHS (the full stream is still read)"
-fi
 
 # Pick the record ids, archive prefix and output directory for the group.
 case "$GROUP" in
@@ -310,10 +275,6 @@ import urllib.request
 #   sys.argv[3:] == ["16076914", "16257786", "17284940"]
 prefix, parts_directory = sys.argv[1], sys.argv[2]
 record_ids = sys.argv[3:]
-# Environment variables are visible to Python too. Example:
-#   shell `LOW_DISK=1 bash scripts/download_zenodo_group.sh data` -> "1" -> True
-#   shell without LOW_DISK                 -> None -> False
-low_disk = os.environ.get("LOW_DISK") == "1"
 
 # Key = archive file name, value = that file's Zenodo API entry.
 # Example after the three records are merged (data group):
@@ -362,36 +323,50 @@ entries = sorted(manifest.values(), key=lambda entry: entry["key"])
 if not entries:
     sys.exit(f"no files matched prefix {prefix}")
 
-# Sum and maximum over all parts. Examples: 93.16e9 bytes; largest 1.048576e9
-# (the last part dk is smaller, 0.883e9, so max() is what matters for low-disk).
+# Sum over all parts, e.g. 93.16e9 bytes for the 89 data parts.
 total_bytes = sum(entry["size"] for entry in entries)
-largest_part = max(entry["size"] for entry in entries)
-# Free bytes of the filesystem holding the staging directory, e.g. 19.9e9 on
-# a local disk, or 108e9 on a Colab temporary drive.
+# Free bytes of the filesystem holding the staging directory, e.g. 108e9 on a
+# Colab temporary drive or 563e9 on a 1 TB data disk.
 free_bytes = shutil.disk_usage(parts_directory).free
-# Only used to print a readable mode name, e.g. "low-disk" / "bulk".
-mode = "low-disk" if low_disk else "bulk"
 # One status line, e.g.
-#   89 files, 93.16 GB compressed, 108.0 GB free, mode bulk
+#   89 files, 93.16 GB compressed, 563.4 GB free
 print(f"{len(entries)} files, {total_bytes / 1e9:.2f} GB compressed, "
-      f"{free_bytes / 1e9:.1f} GB free, mode {mode}")
+      f"{free_bytes / 1e9:.1f} GB free")
 
-# How much space this mode needs, roughly:
-#   bulk     93.16 GB of parts * 1.5 = ~140 GB (parts + extracted tree)
-#   low-disk  1.048576 GB largest part * 3 = ~3.1 GB (one part + small slack)
-# The extracted tree is NOT included in the bulk estimate; 1.5x is a warning
-# threshold, not a promise.
-required_bytes = int(largest_part * 3) if low_disk else int(total_bytes * 1.5)
+# Space needed, computed from measured values instead of a blind multiplier.
+# The tables below are `du -sh` results of a full, checksum-verified extraction
+# on a 1 TB data disk; a single factor cannot describe every group because text
+# CSV archives expand far more than binary model weights:
+#   data.tar.xz              93.16 GB compressed -> 258 GiB extracted
+#   past_experiments.tar.xz   8.29 GB compressed -> 110 GiB extracted
+#   models.tar.xz            11.08 GB compressed ->  13 GiB extracted
+#   Reviewer_..._Impact.zip   1.80 GB compressed -> 3.41 GiB extracted
+MEASURED_EXPANDED_GIB = {
+    "data.tar.xz": 260,              # 258 GiB measured, rounded up
+    "past_experiments.tar.xz": 112,  # 110 GiB measured, rounded up
+    "models.tar.xz": 14,             #  13 GiB measured, rounded up
+    # 3.41 GiB (3,664,137,508 bytes) measured, rounded up
+    "Reviewer_Experiment_Global_Impact": 4,
+}
+GIB = 2 ** 30
+# Every group in the `case` above has a measured entry, so a plain lookup is
+# enough; an unknown prefix would raise KeyError before downloading anything.
+extracted_bytes = MEASURED_EXPANDED_GIB[prefix] * GIB
+# The parts and the extracted tree coexist until tar has consumed the last one.
+# Example, data group: (93.16 GB + 260 GiB) * 1.05 = ~391 GB.
+# Example, models group: (11.08 GB + 14 GiB) * 1.05 = ~27 GB.
+# Example, reviewer zip: (1.80 GB + 4 GiB) * 1.05 = ~6.4 GB.
+required_bytes = int((total_bytes + extracted_bytes) * 1.05)
 # SKIP_SPACE_CHECK=1 is the documented escape hatch for users who know that the
 # extracted tree lives on another disk, e.g.
 #   SKIP_SPACE_CHECK=1 bash scripts/download_zenodo_group.sh data \
 #       /content/MultiModalSpectralTransformer
 if os.environ.get("SKIP_SPACE_CHECK") != "1" and free_bytes < required_bytes:
     # Example message: "not enough free space: 19.9 GB available, about
-    # 139.7 GB recommended for mode bulk (re-run with SKIP_SPACE_CHECK=1 ...)"
+    # 391.0 GB recommended (re-run with SKIP_SPACE_CHECK=1 to override)"
     sys.exit(
         f"not enough free space: {free_bytes / 1e9:.1f} GB available, "
-        f"about {required_bytes / 1e9:.1f} GB recommended for mode {mode} "
+        f"about {required_bytes / 1e9:.1f} GB recommended "
         f"(re-run with SKIP_SPACE_CHECK=1 to override)"
     )
 
@@ -433,48 +408,20 @@ with open(os.path.join(parts_directory, "parts_manifest.tsv"), "w") as handle:
         )
 PYTHON
 
-# Low-disk mode: the whole block inside `( ... )` runs in a subshell whose
-# stdout is the raw archive stream, which is piped into tar.
-if [ "$LOW_DISK" = "1" ] && [ "$GROUP" != "reviewer" ]; then
-    # Ordered streaming: fetch one part, push it into tar, delete it again.
-    # tar reads the concatenation of all parts as a single xz stream, so the
-    # parts must arrive in exactly the order written to parts_manifest.tsv.
-    echo "low-disk mode: parts are streamed into tar and deleted one by one"
-    (
-        # One loop iteration per line of the TSV: name, size, url, checksum.
-        while IFS=$'\t' read -r PART_NAME PART_SIZE PART_URL PART_CHECKSUM; do
-            # All progress output must go to stderr: stdout is the tar stream
-            echo "part $PART_NAME (${PART_SIZE} bytes)" >&2
-            # Download exactly this one part, resuming it if present, and let
-            # aria2 verify its MD5. 1>&2 keeps aria2's progress off the stream.
-            aria2c --dir="$PARTS_DIRECTORY" --out="$PART_NAME" "$PART_URL" \
-                --split="$ARIA2_CONNECTIONS" \
-                --max-connection-per-server="$ARIA2_CONNECTIONS" \
-                --min-split-size=16M --continue=true \
-                --auto-file-renaming=false --file-allocation=none \
-                --disk-cache=64M --max-tries=5 --retry-wait=5 \
-                --checksum="$PART_CHECKSUM" --summary-interval=20 1>&2
-            # Print the raw bytes: this is what tar receives.
-            cat "$PARTS_DIRECTORY/$PART_NAME"
-            # Free the space immediately; its bytes are already in the pipe.
-            rm -f "$PARTS_DIRECTORY/$PART_NAME" "$PARTS_DIRECTORY/$PART_NAME.aria2"
-        done < "$PARTS_DIRECTORY/parts_manifest.tsv"
-    ) | tar -xJf - -C "$ROOT" ${TAR_MEMBER_ARGS[@]+"${TAR_MEMBER_ARGS[@]}"}
-    # -x extract, -J xz, -f - read from stdin, -C change into the output folder.
-else
-    # Bulk mode: parallel downloads, 16 connections per file, per-part MD5 check
-    cd "$PARTS_DIRECTORY"
-    aria2c --input-file=aria2_input.txt --dir="$PARTS_DIRECTORY" \
-        --max-concurrent-downloads="$ARIA2_JOBS" \
-        --split="$ARIA2_CONNECTIONS" \
-        --max-connection-per-server="$ARIA2_CONNECTIONS" \
-        --min-split-size=16M \
-        --continue=true --auto-file-renaming=false --file-allocation=none \
-        --disk-cache=64M --max-tries=5 --retry-wait=5 \
-        --summary-interval=20
+# Download every part in parallel (16 connections per file, per-part MD5 check
+# done by aria2 itself through the `checksum=` option in aria2_input.txt).
+cd "$PARTS_DIRECTORY"
+aria2c --input-file=aria2_input.txt --dir="$PARTS_DIRECTORY" \
+    --max-concurrent-downloads="$ARIA2_JOBS" \
+    --split="$ARIA2_CONNECTIONS" \
+    --max-connection-per-server="$ARIA2_CONNECTIONS" \
+    --min-split-size=16M \
+    --continue=true --auto-file-renaming=false --file-allocation=none \
+    --disk-cache=64M --max-tries=5 --retry-wait=5 \
+    --summary-interval=20
 
-    # Size check against the API manifest before spending time on extraction
-    python3 - "$PARTS_DIRECTORY" <<'PYTHON'
+# Size check against the API manifest before spending time on extraction
+python3 - "$PARTS_DIRECTORY" <<'PYTHON'
 import json
 import os
 import sys
@@ -495,27 +442,26 @@ if missing:
 print(f"all {len(manifest)} files present with the expected sizes")
 PYTHON
 
-    # Turn the first TSV column (the file names) into an array.
-    mapfile -t PART_NAMES < <(cut -f1 parts_manifest.tsv)
+# Turn the first TSV column (the file names) into an array.
+mapfile -t PART_NAMES < <(cut -f1 parts_manifest.tsv)
 
-    if [ "$GROUP" = "reviewer" ]; then
-        # A single zip: no concatenation, no xz, just unzip it.
-        echo "extracting ${PART_NAMES[0]} into $TARGET_DIRECTORY"
-        unzip -oq "${PART_NAMES[0]}" -d "$ROOT/$TARGET_DIRECTORY"
+if [ "$GROUP" = "reviewer" ]; then
+    # A single zip: no concatenation, no xz, just unzip it.
+    echo "extracting ${PART_NAMES[0]} into $TARGET_DIRECTORY"
+    unzip -oq "${PART_NAMES[0]}" -d "$ROOT/$TARGET_DIRECTORY"
+else
+    # Feed all parts to tar in name order, which is archive order.
+    echo "streaming ${#PART_NAMES[@]} parts through xz into the repository root"
+    if command -v pv >/dev/null 2>&1; then
+        # pv is optional: it only draws a throughput meter in the middle.
+        cat "${PART_NAMES[@]}" | pv | tar -xJf - -C "$ROOT"
     else
-        # Feed all parts to tar in name order, which is archive order.
-        echo "streaming ${#PART_NAMES[@]} parts through xz into the repository root"
-        if command -v pv >/dev/null 2>&1; then
-            # pv is optional: it only draws a throughput meter in the middle.
-            cat "${PART_NAMES[@]}" | pv | tar -xJf - -C "$ROOT" ${TAR_MEMBER_ARGS[@]+"${TAR_MEMBER_ARGS[@]}"}
-        else
-            cat "${PART_NAMES[@]}" | tar -xJf - -C "$ROOT" ${TAR_MEMBER_ARGS[@]+"${TAR_MEMBER_ARGS[@]}"}
-        fi
+        cat "${PART_NAMES[@]}" | tar -xJf - -C "$ROOT"
     fi
-
-    # Extraction succeeded: only now remove the downloaded parts
-    rm -f "${PART_NAMES[@]}" ./*.aria2
 fi
+
+# Extraction succeeded: only now remove the downloaded parts
+rm -f "${PART_NAMES[@]}" ./*.aria2
 
 # Remove bookkeeping files; the staging directory itself stays for the next run.
 rm -f "$PARTS_DIRECTORY"/aria2_input.txt "$PARTS_DIRECTORY"/manifest.json \

@@ -20,10 +20,11 @@ This project requires significant computational resources:
 
 - **GPU**: A high-performance GPU is necessary. We recommend using an NVIDIA GPU with CUDA 11.1 support (e.g., NVIDIA V100 or K80).
 - **Memory**: At least 16GB RAM to handle datasets and model training.
-- **Storage**: The dataset archives are 114 GB compressed and typically expand
-  to well over 200 GB, so plan for at least 250 GB free when unpacking
-  everything. `models`, `past_experiments` and the reviewer zip alone need
-  about 40 GB.
+- **Storage**: The dataset archives are 116 GB compressed and expand to about
+  384 GB (measured: `data` 258 GB, `models` 13 GB, `past_experiments` 110 GB,
+  reviewer zip 3.5 GB), so plan for at least 500 GB free when unpacking
+  everything and preferably a 1 TB data disk. `models` plus `past_experiments`
+  alone need about 127 GB.
 - **Python**: Python 3.7.x is required (tested with Python 3.7.12).
 
 Please ensure your system meets these requirements before proceeding with the installation and usage of MultiModalSpectralTransformer.
@@ -66,7 +67,7 @@ Download, verify and extract with the helper script, one group at a time:
 bash scripts/download_zenodo_group.sh models
 bash scripts/download_zenodo_group.sh past_experiments
 bash scripts/download_zenodo_group.sh reviewer
-bash scripts/download_zenodo_group.sh data             # needs ~140 GB free
+bash scripts/download_zenodo_group.sh data             # needs ~390 GB free
 ```
 
 Run the commands from the repository root. The script derives the root from its
@@ -79,35 +80,45 @@ bash scripts/download_zenodo_group.sh models /data/MultiModalSpectralTransformer
 
 It fetches the parts with aria2 (16 connections per file, resumable), checks
 every part against the MD5 published by Zenodo, merges them in archive order
-and streams the result through `xz`/`tar` into the repository root.
-
-If disk space is tight, `LOW_DISK=1` downloads one part at a time, feeds it to
-`tar` and deletes it immediately, so the peak footprint is a single part plus
-the extracted tree. The trade-off is that an interrupted run cannot be resumed,
-because already-consumed parts are gone:
-
-```bash
-LOW_DISK=1 bash scripts/download_zenodo_group.sh data
-```
-
-Because the archive is one sequential xz stream, a single part cannot be
-decompressed on its own: every part is always downloaded and read. To keep only
-a subset on disk, set `ONLY_PATHS` (tar patterns, quoted):
-
-```bash
-ONLY_PATHS='data/IBM_dataset/* data/test_data/*' \
-    bash scripts/download_zenodo_group.sh data
-```
-
-This still transfers the full 93 GB, but tar writes only the matching entries,
-so the disk footprint equals the selected files. `LOW_DISK=1` and `ONLY_PATHS`
-can be combined.
+and streams the result through `xz`/`tar` into the repository root. Because the
+archive is one sequential xz stream, all parts of a group are always downloaded
+together and `data` needs the 93 GB of parts plus the 258 GB extracted tree on
+the same disk at the same time.
 
 
 The reviewer zip is required only for the reviewer-requested global impact
 analysis; extract it with
 `bash scripts/download_zenodo_group.sh reviewer` (it unpacks into
-`past_experiments/ChemXriv/`).
+`past_experiments/ChemXriv/`). It is one 1.80 GB zip that expands to 3.41 GiB
+and contains `Finetuning_Datasets` plus the `PC_0_250_Da`, `PC_250_350_Da` and
+`PC_350_500_Da` result sets used by section 6.0 of the 1.0 notebook.
+
+### Measured extracted layout
+
+A full download of all four groups, verified part by part against the MD5
+values published by Zenodo, produces the following layout at the repository
+root (`du -sh` on a 1 TB data disk):
+
+| Directory | Size | Key contents |
+|---|---|---|
+| `data` | 258 GB | `IBM_dataset`, `PubChem_dataset`, `SGNN_gen_folder`, `test_data`, `ZINC_4000`, `ZINK_dataset` |
+| `models` | 13 GB | 81 files, matching the release inventory (see below) |
+| `past_experiments` | 110 GB | `ChemXriv` |
+| `past_experiments/ChemXriv/Reviewer_Experiment_Global_Impact` | 3.5 GB | `Finetuning_Datasets`, `PC_0_250_Da`, `PC_250_350_Da`, `PC_350_500_Da` |
+
+The `data` group compressed to 93.16 GB expands to 258 GB. `past_experiments`
+grows from 8.29 GB to 110 GB because it consists mostly of text CSV files,
+which compress far better than the binary model weights (11.08 GB -> 13 GB).
+The reviewer zip is the opposite case: 1.80 GB compressed becomes 3.41 GiB
+(3,664,137,508 bytes) of CSV and pickle files.
+
+The files the notebooks expect are present after extraction:
+
+- `data/test_data/IBM_SMI_data_top20.csv` (20-molecule demo input) and
+  `data/test_data/IBM_SMI_data_top500.csv`
+- `data/ZINK_dataset/ML_NMR_5M_XL_1H_comb_test_V8.csv`,
+  `ML_NMR_5M_XL_1H_comb_train_V8.csv`,
+  `ML_NMR_5M_XL_13C_test.csv`, `ML_NMR_5M_XL_13C_train_V8.csv`
 
 ### Inspecting a downloaded group
 
@@ -221,7 +232,7 @@ Please refer to these notebooks for detailed procedures on data generation and e
    bash scripts/download_zenodo_group.sh models            .
    bash scripts/download_zenodo_group.sh past_experiments  .
    bash scripts/download_zenodo_group.sh reviewer          .
-   bash scripts/download_zenodo_group.sh data              .   # needs ~140 GB free
+   bash scripts/download_zenodo_group.sh data              .   # needs ~390 GB free
    ```
 
    The manual equivalent follows. Each archive already contains its own
