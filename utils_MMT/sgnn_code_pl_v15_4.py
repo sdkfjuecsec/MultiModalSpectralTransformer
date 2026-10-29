@@ -6,6 +6,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 import time
 
 # Third-party imports
@@ -589,11 +590,15 @@ def save_as_npy_for_13C(mol_list):
     mol_dict['h_x_connectivity'] = np.array(mol_dict['h_x_connectivity'])
 
     #save the paramenters
-    folder = os.getcwd()
+    # This file is only an intermediate for the inference loader and is deleted
+    # by main_execute, so keep it in the temp dir: writing it to the caller's
+    # working directory leaves stray sample_*.npz files in the repository
+    # whenever a batch raises before the cleanup lines run.
+    folder = tempfile.gettempdir()
     rand_num = random.randint(0,100000)
     name = f"sample_{rand_num}_{target}.npz"
     save_path = os.path.join(folder, name)
-    np.savez_compressed(f'./{name}', data = [mol_dict])
+    np.savez_compressed(save_path, data = [mol_dict])
     return save_path
 
 
@@ -707,11 +712,15 @@ def save_as_npy_for_1H(mol_list):
     mol_dict['h_x_connectivity'] = np.array(mol_dict['h_x_connectivity'])
 
     #save the paramenters
-    folder = os.getcwd()
+    # This file is only an intermediate for the inference loader and is deleted
+    # by main_execute, so keep it in the temp dir: writing it to the caller's
+    # working directory leaves stray sample_*.npz files in the repository
+    # whenever a batch raises before the cleanup lines run.
+    folder = tempfile.gettempdir()
     rand_num = random.randint(0,100000)
     name = f"sample_{rand_num}_{target}.npz"
     save_path = os.path.join(folder, name)
-    np.savez_compressed(f'./{name}', data = [mol_dict])
+    np.savez_compressed(save_path, data = [mol_dict])
     return save_path, x_h_connectivity_dict_list
     #save_path = os.path.join(folder, "sample_%s.npz"%(target))
     #np.savez_compressed('./sample_%s.npz'%(target), data = [mol_dict])

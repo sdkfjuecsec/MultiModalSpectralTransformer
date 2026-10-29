@@ -332,7 +332,11 @@ def initialize_configs():
     config = parse_arguments(hyperparameters)
     
     # Save IR config
-    ir_config_path = os.path.join(project_root, 'utils_MMT/ir_config_V8.json')
+    # Output goes to the run folder: utils_MMT/*_V8.json are tracked reference
+    # copies and must not be overwritten with machine-specific paths.
+    config_output_dir = os.path.join(project_root, 'experiments/exp_1')
+    os.makedirs(config_output_dir, exist_ok=True)
+    ir_config_path = os.path.join(config_output_dir, 'ir_config_V8.json')
     save_config(IR_config_dict, ir_config_path)
     IR_config_dict_loaded = load_config(ir_config_path)
     IR_config = parse_arguments(IR_config_dict_loaded)
@@ -344,7 +348,7 @@ def initialize_configs():
         print("Warning: irs module not available, skipping IR config modification")
     
     # Save main config
-    config_path = os.path.join(project_root, 'utils_MMT/config_V8.json')
+    config_path = os.path.join(config_output_dir, 'config_V8.json')
     save_config(hyperparameters, config_path)
     config_dict = load_config(config_path)
     config = parse_arguments(config_dict)

@@ -365,14 +365,19 @@ def parse_arguments(hyperparameters):
 
 
 config = parse_arguments(hyperparameters)
-ir_config_path = '/projects/cc/knlr326/1_NMR_project/2_Notebooks/MultiModalTransformer/utils_MMT/ir_config_V8.json'
+# Write the generated configs into the run folder: utils_MMT/*_V8.json are
+# tracked reference copies and must not be overwritten with machine paths.
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+config_output_dir = os.path.join(project_root, 'experiments/exp_1')
+os.makedirs(config_output_dir, exist_ok=True)
+ir_config_path = os.path.join(config_output_dir, 'ir_config_V8.json')
 save_config(IR_config_dict, ir_config_path)
 IR_config_dict = load_config(ir_config_path)
 IR_config = parse_arguments(IR_config_dict)
 irs.modify_predict_args(IR_config)
 
 
-config_path = '/projects/cc/knlr326/1_NMR_project/2_Notebooks/MultiModalTransformer/utils_MMT/config_V8.json'
+config_path = os.path.join(config_output_dir, 'config_V8.json')
 save_config(hyperparameters, config_path)
 config_dict = load_config(config_path)
 config = parse_arguments(config_dict)
