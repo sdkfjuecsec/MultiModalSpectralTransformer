@@ -33,6 +33,18 @@ pip install six==1.16.0
 pip install setuptools==59.5.0
 pip install dgl-cu111==0.6.1
 
+# dgl's shared library links against libcublas / libcudnn, which pip ships under
+# site-packages/nvidia/*/lib rather than in a system path. Any machine without a
+# CUDA toolkit (e.g. a CPU-only instance used to read the code) fails at import:
+#   OSError: libcublas.so.11: cannot open shared object file
+# A conda activate.d hook makes every shell and every Jupyter kernel inherit the
+# right LD_LIBRARY_PATH, no manual export needed.
+SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+mkdir -p "$CONDA_PREFIX/etc/conda/activate.d"
+cat > "$CONDA_PREFIX/etc/conda/activate.d/dgl_cuda_libs.sh" <<EOF
+export LD_LIBRARY_PATH=\$(ls -d $SITE_PACKAGES/nvidia/*/lib 2>/dev/null | tr '\n' ':')$SITE_PACKAGES/torch/lib:\$LD_LIBRARY_PATH
+EOF
+
 pip install svgwrite
 pip install wandb==0.15.4
 pip install tqdm
