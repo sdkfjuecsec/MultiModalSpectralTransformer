@@ -234,6 +234,7 @@ def getActivation(name):
     """
     # the hook signature
     def hook(model, input, output):
+        """Store a detached copy of the module output under ``activation[name]``."""
         activation[name] = output.detach()
     return hook
 

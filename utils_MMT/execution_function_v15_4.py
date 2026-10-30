@@ -443,6 +443,7 @@ def filter_invalid_criteria(file_path):
 
     # Function to canonicalize SMILES strings
     def canonicalize_smiles(smiles):
+        """Return the canonical SMILES, or ``None`` if RDKit cannot parse it."""
         try:
             mol = Chem.MolFromSmiles(smiles)
             if mol:
@@ -475,6 +476,7 @@ def filter_invalid_criteria(file_path):
     df_filtered = df_filtered[~df_filtered['SMILES'].str.contains(r'\[.*?\+.*?\]', regex=True)]
 
     def remove_stereo(smiles):
+        """Strip the common tetrahedral stereo markers (``[C@@H]``, ``[C@H]``, ...)."""
         smiles = smiles.replace('[C@@H]', 'C').replace('[C@H]', 'C')
         smiles = smiles.replace('[C@@]', 'C').replace('[C@]', 'C')
         return smiles
@@ -524,6 +526,7 @@ def clean_dataset(config):
 
     # Function to remove stereochemistry information from a SMILES string
     def remove_stereo(smiles):
+        """Strip the common tetrahedral stereo markers (``[C@@H]``, ``[C@H]``, ...)."""
         smiles = smiles.replace('[C@@H]', 'C').replace('[C@H]', 'C')
         smiles = smiles.replace('[C@@]', 'C').replace('[C@]', 'C')
         return smiles

@@ -61,10 +61,12 @@ class SmilesEnumerator(object):
 
     @property
     def charset(self):
+        """Current character set used for one-hot encoding."""
         return self._charset
         
     @charset.setter
     def charset(self, charset):
+        """Store the character set and rebuild the char<->int lookup tables."""
         self._charset = charset
         self._charlen = len(charset)
         self._char_to_int = dict((c,i) for i,c in enumerate(charset))
@@ -494,6 +496,13 @@ class MultimodalData(Dataset):
 
 
     def _encode_MF(self, stoi_MF, MF):
+        """Tokenise a molecular formula into element/count sub-tokens.
+
+        ``C6H6O`` -> ``['C','6','H','6','O']``; counts are only emitted when
+        present. Element symbols and multi-digit counts are matched by the
+        regex ``([A-Z][a-z]*)(\\d{1,2})?``. Unknown tokens fall back to
+        ``stoi_MF.get('<UNK>')`` (see the NOTE below).
+        """
          # Use a regular expression to capture element symbols and their counts
         # Elements start with an uppercase letter followed by zero or more lowercase letters.
         # Counts are one or more digits.

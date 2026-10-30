@@ -388,9 +388,11 @@ class AvgMeter:
         self.reset()
 
     def reset(self):
+        """Reset the running average, sum and count."""
         self.avg, self.sum, self.count = [0] * 3
 
     def update(self, val, count=1):
+        """Add one observation (``val`` repeated ``count`` times) to the average."""
         self.count += count
         self.sum += val * count
         self.avg = self.sum / self.count

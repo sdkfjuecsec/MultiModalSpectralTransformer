@@ -180,6 +180,7 @@ def getActivation(name):
     """Return a forward hook that stores the module output under ``activation[name]``."""
     # the hook signature
     def hook(model, input, output):
+        """Store a detached copy of the module output under ``activation[name]``."""
         activation[name] = output.detach()
     return hook
 
@@ -228,6 +229,7 @@ class ChembertaFingerprint(nn.Module):
         self.sig_fn = nn.Sigmoid()  
 
     def forward(self, x, mask):
+        """Return ``(logits, detached_LL1_features)`` for the CLIP projection."""
 
         # Generate embeddings
         embeddings = self.chemberta.embeddings(x) 
@@ -497,6 +499,7 @@ class ProjectionHead(nn.Module):
         self.layer_norm = nn.LayerNorm(self.projection_dim)
     
     def forward(self, x):
+        """Run the two-layer MLP and return the projected embedding."""
         projected = self.projection(x)
         x = self.gelu(projected)
         x = self.fc(x)
