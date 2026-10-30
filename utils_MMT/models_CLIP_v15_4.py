@@ -1,3 +1,17 @@
+"""CLIP-style contrastive model tying spectra to molecular fingerprints.
+
+Two towers are aligned in a shared embedding space:
+  * ``ChembertaFingerprint`` -- ChemBERTa encoder + linear head producing a
+    molecular fingerprint (optionally PCA-reduced).
+  * ``MultimodalTransformer`` -- the MMT encoder over NMR/IR/MF/MS spectra.
+
+``CLIPModel`` projects both towers with a :class:`ProjectionHead` and computes
+the symmetric InfoNCE-style loss used for retrieval (Tanimoto evaluation).
+
+Note on tensor orientation: MMT targets are stored transposed as
+``(seq_len, batch)``, hence the ``.T`` transposes before the similarity matrix.
+"""
+
 import argparse
 import math
 import os
@@ -44,6 +58,13 @@ if base_path not in sys.path:
     sys.path.append(base_path)
     
 def CLIP_make(config, stoi, stoi_MF, itos):
+    """Build the CLIP model and its optimizer from pretrained checkpoints.
+
+    Loads the ChemBERTa weights (``config.CB_model_path``) and the MMT weights
+    (``config.MT_model_path``), freezes all ChemBERTa parameters except the
+    ``LL1`` projection layer, and returns ``(CLIP_model, optimizer)`` with three
+    parameter groups (CB / MT / projection heads) and different learning rates.
+    """
     # Select device
     device = config.device
 
@@ -156,6 +177,7 @@ def get_extended_attention_mask(attention_mask, input_shape):
 # a dict to store the activations
 activation = {}
 def getActivation(name):
+    """Return a forward hook that stores the module output under ``activation[name]``."""
     # the hook signature
     def hook(model, input, output):
         activation[name] = output.detach()
@@ -163,6 +185,18 @@ def getActivation(name):
 
 
 class ChembertaFingerprint(nn.Module):
+    """ChemBERTa encoder followed by a fingerprint head.
+
+    Args:
+        chemberta: pretrained ``RobertaModel``.
+        config: needs ``fp_dim_reduction``, ``num_linear_layers``, ``use_relu``,
+            ``use_dropout``, ``num_class`` and ``pca_components``.
+        sigmoid: apply a sigmoid to the returned logits (multi-label fingerprints).
+
+    ``forward`` returns ``(logits, features)`` where ``features`` is the output
+    of ``LL1`` **detached** so the CLIP projection cannot push gradients back
+    into the frozen encoder.
+    """
     def __init__(self, chemberta, config, sigmoid=False):
         super(ChembertaFingerprint, self).__init__()
         self.sigmoid = sigmoid
@@ -222,6 +256,12 @@ class ChembertaFingerprint(nn.Module):
 
 
 class CLIPModel(nn.Module):
+    """Contrastive wrapper around the ChemBERTa and MMT towers.
+
+    ``forward`` returns ``(mean_loss, per_sample_losses)`` and is used for
+    training. ``inference`` runs under ``no_grad`` against externally supplied
+    generated SMILES and returns additional similarity matrices.
+    """
     def __init__(
         self,
         CB_model,
@@ -241,6 +281,20 @@ class CLIPModel(nn.Module):
         self.temperature = config.CLIP_temperature
 
     def forward(self, x):
+        """Compute the symmetric contrastive loss for one batch.
+
+        Only spectra enabled in ``config.training_mode`` are moved to the device;
+        the others stay ``None`` and are ignored by the MMT encoder. The target
+        SMILES are decoded back to strings and re-tokenised by ChemBERTa.
+
+        Returns:
+            ``(loss.mean(), loss)`` -- the per-sample loss vector is also
+            returned for logging.
+
+        NOTE (known issue, left unchanged): ``trg_FP`` is moved to the device but
+        never used (the fingerprint tower works from SMILES), so it is dead
+        weight in every batch.
+        """
         # Getting Image and Text Features
         #smi_input_ids, smi_attention_mask, spectra_padded, spectra_mask = batch
 
@@ -302,6 +356,20 @@ class CLIPModel(nn.Module):
         return loss.mean(), loss
 
     def inference(self, x, gen_enc_SMI_list):
+        """Score a batch of generated SMILES against the spectra in ``x``.
+
+        Unlike :meth:`forward`, the fingerprint tower is fed the *generated*
+        SMILES (``gen_enc_SMI_list``) so the returned ``dot_similarity`` is the
+        retrieval score used by the evaluation code.
+
+        Returns:
+            ``(mean_loss, losses, logits, targets, dot_similarity[:, 0])``.
+
+        NOTE (known issue, left unchanged): the method unconditionally switches
+        all four sub-modules to ``train()`` mode on exit, so calling it during a
+        validation pass leaves the model in training mode afterwards (dropout /
+        batchnorm behave differently on the next call).
+        """
         # Getting Image and Text Features
         #smi_input_ids, smi_attention_mask, spectra_padded, spectra_mask = batch
         self.CB_model.eval()  # Set ChemBerta to evaluation mode
@@ -388,6 +456,13 @@ return  losses.mean(), losses, logits, targets, dot_similarity[:,0]"""
     ######################generate me the cosine similarity of every  output to every input..
 
 def cross_entropy(preds, targets, reduction='none'):
+    """Soft-target cross entropy ``-sum(targets * log_softmax(preds))`` per row.
+
+    ``reduction='none'`` returns the per-sample vector, ``'mean'`` its mean.
+
+    NOTE (known issue, left unchanged): any other ``reduction`` value makes the
+    function fall through and return ``None``.
+    """
     log_softmax = nn.LogSoftmax(dim=-1)
     loss = (-targets * log_softmax(preds)).sum(1)
     if reduction == "none":
@@ -401,6 +476,11 @@ def cross_entropy(preds, targets, reduction='none'):
 ####################################################################################
 
 class ProjectionHead(nn.Module):
+    """Two-layer MLP projection with a residual connection and LayerNorm.
+
+    ``embedding_type`` selects the input dimension from ``config.CB_embedding``
+    or ``config.MT_embedding``.
+    """
     def __init__(self, config, embedding_type=["CB","MT"]):
         super().__init__()
         if embedding_type=="CB":
@@ -433,6 +513,12 @@ class ProjectionHead(nn.Module):
 
 
 class CLIPMultiGPU(pl.LightningModule):
+    """PyTorch-Lightning wrapper running the CLIP model on one or more GPUs.
+
+    Checkpoints are written both as raw ``state_dict`` (``.pth``) and as Lightning
+    ``.ckpt`` files, using the current epoch/loss in the file name. A time-based
+    checkpoint is also saved every ``config.model_save_interval`` seconds.
+    """
     
     def __init__(self, config):
         super(CLIPMultiGPU, self).__init__()
@@ -448,12 +534,14 @@ class CLIPMultiGPU(pl.LightningModule):
             
     
     def forward(self, x):
+        """Return only the scalar training loss (used by the Lightning steps)."""
         # Your forward logic
         loss, losses = self.CLIP_model(x)
         return loss
 
     
     def training_step(self, batch, batch_idx):
+        """Log and return the training loss."""
         loss = self.forward(batch)
         #### update this part
         tensorboard_logs = {'train_loss': loss}   
@@ -462,6 +550,7 @@ class CLIPMultiGPU(pl.LightningModule):
 
     
     def validation_step(self, batch, batch_idx):
+        """Log and return the validation loss."""
         #import IPython; IPython.embed();
         loss = self.forward(batch)
         tensorboard_logs = {'test_loss': loss}   
@@ -470,14 +559,19 @@ class CLIPMultiGPU(pl.LightningModule):
 
 
     def on_epoch_end(self):
+        """Save a per-epoch ``.pth`` state dict and a Lightning ``.ckpt``."""
         epoch = self.current_epoch
         loss = self.trainer.callback_metrics.get('train_loss', None)  
+        # NOTE (known issue, left unchanged): when no train_loss has been logged
+        # yet, ``loss`` is ``None`` and the ``{loss:.3f}`` format raises
+        # ``TypeError`` inside the checkpoint name.
         save_path = os.path.join(self.config.CLIP_model_save_dir, f"MultimodalCLIP_Epoch_{epoch}_Loss{loss:.3f}.pth")
         ckp_save_path = os.path.join(self.config.CLIP_model_save_dir, f"MultimodalCLIP_Epoch_{epoch}_Loss{loss:.3f}.ckpt")
         self.trainer.save_checkpoint(ckp_save_path)
         torch.save(self.CLIP_model.state_dict(), save_path)
         
     def on_batch_end(self):
+        """Save a time-stamped checkpoint once the save interval has elapsed."""
         elapsed_time = time.time() - self.start_time
         time_obj = datetime.timedelta(seconds=elapsed_time)
         time_str = str(time_obj).split('.')[0]  # This will give you a string formatted as 'H:M:S'
@@ -494,6 +588,7 @@ class CLIPMultiGPU(pl.LightningModule):
             self.start_time = time.time()
     
     def configure_optimizers(self):
+        """Reuse the optimizer built in ``CLIP_make`` with a plateau LR scheduler."""
         optimizer = self.optimizer #torch.optim.AdamW(self.parameters(), lr=self.config.lr)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
         return {

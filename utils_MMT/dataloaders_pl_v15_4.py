@@ -1,3 +1,18 @@
+"""PyTorch datasets / collate functions for the multimodal MMT training.
+
+``MultimodalData`` loads the per-spectrum CSVs (1H, 13C, HSQC, COSY, IR) plus
+SMILES, caches them in a pickle dict, and builds one sample dict per molecule
+containing padded tensors and their validity masks. Optional random blanking
+(``config.blank_percentage``) implements the modality-dropout ablation.
+
+Tensor conventions:
+  * masks are 0 for valid positions and 1 for padding;
+  * 2-D spectra are stored as ``(n_peaks, 2)`` (F2/F1); HSQC also carries a
+    ``direction`` column when 3 dimensions are requested;
+  * shifts are min-max normalised: 1H /10, 13C /200, HSQC (H/10, C/200),
+    COSY (both /10).
+"""
+
 ##### before modifying collate_fn function
 # Standard library imports
 import ast
@@ -29,6 +44,11 @@ from torch.nn.utils.rnn import pad_sequence
 
 # SmilesEnumerator class for SMILES generation, vectorization and devectorization
 class SmilesEnumerator(object):
+    """Character-level SMILES one-hot encoder / randomiser (legacy helper).
+
+    Kept for compatibility with older checkpoints; the live pipeline uses
+    :class:`smi_augmenter_v15_4.SMILESAugmenter` instead.
+    """
     def __init__(self, charset='@C)(=cOn1S2/H[N]\\', pad=120, leftpad=True, isomericSmiles=True, enum=True, canonical=False):
         self._charset = None
         self.charset = charset
@@ -124,6 +144,10 @@ def pollute_HSQC_data(HSQC_df, noise_peaks, noise_num_list):
 
     Returns:
     HSQC_df: updated pandas dataframe with added noise peaks.
+
+    NOTE (known issue, left unchanged): ``DataFrame.append`` was removed in
+    pandas 2.x, so this raises ``AttributeError`` on modern pandas. Appending
+    via ``pd.concat`` or pre-allocating the rows would be the fix.
     """
     # Select random peak number
     num_peaks = random.choice(noise_num_list)
@@ -141,6 +165,16 @@ def pollute_HSQC_data(HSQC_df, noise_peaks, noise_num_list):
 
 # DatasetSpectrumTransformer class for handling spectrum data
 class MultimodalData(Dataset):
+    """Dataset yielding one dict of padded spectra + SMILES tokens per molecule.
+
+    Data source is selected by ``config.data_type`` (currently only ``"sgnn"``
+    is implemented). ``mode`` is one of ``"train"``, ``"val"`` or ``"all"`` and
+    controls which split of ``ref_data`` is used.
+
+    The CSV/pickle cache is built lazily: if ``config.pickle_file_path`` exists
+    it is loaded, otherwise the individual spectrum CSVs are merged and a fresh
+    pickle is written (its path is stored back on ``config``).
+    """
     def __init__(self, config, stoi, stoi_MF, mode):
         self.config = config
         self.stoi = stoi
@@ -156,7 +190,10 @@ class MultimodalData(Dataset):
 
  
     def _calculate_min_max(self, ref_data):
-        
+        """Compute molecular-weight for each SMILES and store train min/max on config.
+
+        The min/max are later used to min-max normalise the MW regression target.
+        """
         if self.config.data_type=="sgnn":
             ref_data['MW'] = ref_data['SMILES'].progress_apply(hf.calculate_mol_weight)
 
@@ -166,6 +203,12 @@ class MultimodalData(Dataset):
             return ref_data
 
     def _save_pkl_dict(self, config, original_dict):
+        """Flatten the per-spectrum DataFrames into one dict keyed by sample id.
+
+        Each value is ``{'1H': [...], '13C': [...], ..., 'SMILES': str}``. The
+        result is pickled under a random suffix and ``config.pickle_file_path``
+        is updated so subsequent runs reuse the cache.
+        """
         print("Proecessing data to save as pkl file")
         reshuffled_dict = {}
 
@@ -208,6 +251,11 @@ class MultimodalData(Dataset):
         return reshuffled_dict
 
     def _load_sgnn_data(self):
+        """Load (or build and cache) the merged dataset and the reference table.
+
+        ``ref_data`` is truncated to ``config.data_size`` rows; for non-``all``
+        modes it is then split into train/test according to ``tr_te_split``.
+        """
 
         # Corresponding config paths
         config_paths = {
@@ -265,7 +313,16 @@ class MultimodalData(Dataset):
     
 
     def _zero_pad(self, data, pad_length, dimensions=1):
-        """Zero pad array data to pad_length and return a mask."""
+        """Zero pad array data to pad_length and return a mask.
+
+        Masks follow the "1 = padding, 0 = valid" convention used by the MMT
+        attention layers.
+
+        NOTE (known issue, left unchanged): in the ``dimensions == 1`` branch,
+        when ``len(data) >= pad_length`` the mask is left at all-ones, i.e. every
+        position is flagged as padding even though real data was kept
+        (truncated). The ``dimensions == 2`` branch correctly zeroes the mask.
+        """
         masks_list = []
         padded_spectra_list = []
 
@@ -299,7 +356,11 @@ class MultimodalData(Dataset):
         return torch.stack(padded_spectra_list).squeeze(0), torch.stack(masks_list).squeeze(0)
 
     def _load_and_split_data(self, data):
-        
+        """Split ``data`` into train/test by ``config.tr_te_split`` and pick this split.
+
+        ``mode == "train"`` returns the first fraction, any other mode returns
+        the remainder; indices are reset in both cases.
+        """
         # Split the data into train and test sets
 
         train_data = data.iloc[:int(self.config.tr_te_split * len(data))]
@@ -313,6 +374,14 @@ class MultimodalData(Dataset):
     
     # Function to search for a row with a given entry in the 'sample-id' column and return the 'shifts' value
     def _find_shifts_by_sample_id(self, df, idx):
+        """Return the ``shifts`` column at row ``idx`` parsed with ``ast.literal_eval``.
+
+        Returns ``None`` when the label is missing (mirrors the ``KeyError``
+        path of the commented-out lookup below).
+
+        NOTE (known issue, left unchanged): ``ast.literal_eval`` raises
+        ``ValueError``/``SyntaxError`` for non-literal text, which is not caught.
+        """
         #row = df[df['sample-id'] == sample_id]
         try:
             shifts_value = df.at[idx, 'shifts']
@@ -322,6 +391,17 @@ class MultimodalData(Dataset):
 
     
     def _load_IR_data(self, config, sample_id):
+        """Load and bin one IR spectrum from ``<IR_data_folder>/<sample_id>.csv``.
+
+        The raw spectrum is split into ``config.input_dim_IR`` equal bins,
+        averaged per bin and divided by the global maximum, so values lie in
+        ``[0, 1]``. The returned mask is all zeros (no padding for IR).
+
+        NOTE (known issue, left unchanged): when the raw length is not divisible
+        by ``input_dim_IR`` the rounding in ``round(start):round(end)`` can make
+        the last bin contain one fewer sample (harmless) but an empty bin
+        triggers a numpy "mean of empty slice" warning and yields ``NaN``.
+        """
         file_path = f"{config.IR_data_folder}/{sample_id}.csv"
         
         # Load the CSV file into a DataFrame
@@ -346,6 +426,11 @@ class MultimodalData(Dataset):
         return torch.tensor(binned_spectrum), torch.tensor(mask)
 
     def _normalize_shifts_2D_spectra(self, shifts_2D, mode):
+        """Scale 2-D peaks: HSQC -> (H/10, C/200), COSY -> (H/10, H/10).
+
+        The fixed divisors mirror the raw-shift maxima used during training
+        (1H up to 10 ppm, 13C up to 200 ppm).
+        """
         # Initialize an empty list to store the normalized shifts
         normalized_shifts = []
         
@@ -432,9 +517,22 @@ class MultimodalData(Dataset):
         return [stoi_MF.get(token, stoi_MF.get('<UNK>')) for token in tokens]
 
     def __len__(self):
+        """Number of molecules in the selected split."""
         return len(self.ref_data)
     
     def __getitem__(self, idx):
+        """Build the padded tensor dict for sample ``idx``.
+
+        The dict keys mirror the ``1H_13C_HSQC_COSY_IR_MF_MW`` training mode:
+        ``padded_src_*`` data tensors, ``src_*_mask`` masks, ``trg_enc_SMI``
+        token ids, ``trg_enc_FP`` molecular weight and ``MW`` its normalised
+        regression target.
+
+        Optional ablations:
+          * ``config.blank_percentage`` randomly empties spectra (modality dropout);
+          * ``config.noise_percentage`` adds random noise peaks to HSQC;
+          * ``config.random_shift`` jitters 1-D shifts and widths.
+        """
         item_dict = {}
         #import IPython; IPython.embed();
         if  self.config.data_type in ["sgnn"]:
@@ -680,6 +778,17 @@ class MultimodalData(Dataset):
 
 
 def collate_fn(batch):
+    """Stack per-sample dicts and right-pad SMILES tokens to a fixed width.
+
+    For every spectrum key ``src_<type>`` present in the batch, tensors are
+    stacked along a new batch axis and the ``mask_<type>`` tensors are stacked
+    the same way. Target SMILES tokens are padded to a 64-token window.
+
+    NOTE (known issue, left unchanged): ``padding_size = 64 - <longest token
+    sequence>``; when any SMILES exceeds 64 tokens it becomes negative and
+    ``F.pad`` raises ``RuntimeError``, so such a batch aborts instead of
+    truncating gracefully.
+    """
     collated_data = {}
     
     # List of all potential spectrum types
