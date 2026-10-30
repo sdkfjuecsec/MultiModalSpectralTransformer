@@ -1,3 +1,23 @@
+"""
+Baseline evaluation driver for the ZINC 250-350 Da test split.
+
+For every chunk of the input CSV (default
+`ML_NMR_5M_XL_1H_comb_test_V8_1000.csv`) the `run_base_model` loop simulates
+the missing spectra, loads the pre-trained Multimodal Transformer (V8i) and
+pickles the Tanimoto metrics of the MMT/CLIP evaluation helpers.
+
+The lower half of the file is the improvement-cycle code (Molformer SMILES
+generation, fine-tuning, evaluation on simulated/experimental/ACD data).
+It is kept for reference and is not reached from `run_base_model` or
+`__main__`.
+
+This file is the same driver as `script_PC_0_250.py` with the ZINC split
+hard-coded in `__main__`.
+
+Typical cluster use: `sbatch scripts/ZINC_0_250.sh` (the launcher name still
+refers to the 0-250 range although it runs this 250-350 script).
+"""
+
 import matplotlib.pyplot as plt
 # Core libraries
 import json
@@ -85,6 +105,11 @@ import utils_MMT.mmt_result_test_functions_15_4 as mrtf
 
 
 def load_json_dics():
+    """Load the SMILES and molecular-formula vocabularies.
+
+    Returns:
+        tuple: (itos, stoi, stoi_MF, itos_MF) as read from the JSON files.
+    """
     with open('/projects/cc/knlr326/1_NMR_project/2_Notebooks/MultiModalTransformer/itos.json', 'r') as f:
         itos = json.load(f)
     with open('/projects/cc/knlr326/1_NMR_project/2_Notebooks/MultiModalTransformer/stoi.json', 'r') as f:
@@ -96,9 +121,14 @@ def load_json_dics():
         itos_MF = json.load(f)    
     return itos, stoi, stoi_MF, itos_MF
     
+# Vocabulary load happens at import time; a missing file aborts the run here.
+# NOTE (known issue, left unchanged): load_json_dics() uses absolute paths on
+# the authors' HPC cluster, so the script cannot start on another machine.
 itos, stoi, stoi_MF, itos_MF = load_json_dics()
 rand_num = str(random.randint(1, 10000000))
 
+# Arguments of the Chemprop-IR predictor. Every value is wrapped in a list
+# so several settings can be declared side by side (index 0 is used).
 IR_config_dict = {
     "gpu": list(range(torch.cuda.device_count())),  # Default value is None, should be one of the available GPU indices
     "test_path": ["/projects/cc/knlr326/1_NMR_project/2_Notebooks/MultiModalTransformer/chemprop-IR/ir_models_data/solvation_example/solvation_spectra.csv"],  # Default value is None
@@ -121,6 +151,9 @@ IR_config_dict = {
     #"dataset_type":["spectra"]
     }
 
+# Every hyperparameter is a one-element list because parse_arguments() takes
+# element 0; that keeps alternative settings around as commented-out
+# siblings without touching the active code paths.
 hyperparameters = {
     # General project information
     "project": ["Improv_Cycle_v1"],  # Name of the project for wandb monitoring
@@ -348,10 +381,12 @@ hyperparameters = {
 
 
 def save_config(config, path):
+    """Write `config` (a dict of one-element lists) to `path` as JSON."""
     with open(path, 'w') as f:
         json.dump(config, f)
 
 def load_config(path):
+    """Read JSON from `path`; return None when the file does not exist."""
     try:
         with open(path, 'r') as f:
             return json.load(f)
@@ -359,6 +394,11 @@ def load_config(path):
         return None    
 
 def parse_arguments(hyperparameters):
+    """Turn the hyperparameter dict into an argparse.Namespace.
+
+    Each value is a one-element list so that alternative settings can be
+    declared side by side; `val[0]` selects the active one.
+    """
     # Using dictionary comprehension to simplify your code
     parsed_args = {key: val[0] for key, val in hyperparameters.items()}
     return Namespace(**parsed_args)
@@ -383,6 +423,8 @@ config_dict = load_config(config_path)
 config = parse_arguments(config_dict)
 
 import os
+# The analysis half of the file repeats the imports it needs, because the
+# original notebook flow was split into a single script here.
 from typing import List, Dict, Any, Union, Tuple
 import pandas as pd
 from datetime import datetime
@@ -393,12 +435,25 @@ import tempfile
 
 
 def process_pkl_files(folder_path, file_type, ranking_method):
+    """Collect the ranked molecules of a folder of result pickles.
+
+    Args:
+        folder_path: folder holding the `.pkl` result files.
+        file_type: substring that selects the files (e.g. "sim_data").
+        ranking_method: passed through to `rank_molecules_in_file`.
+
+    Returns:
+        dict: target SMILES -> list of ranked molecule records.
+    """
     pkl_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
                  if f.endswith('.pkl') and file_type in f]
     
     all_rankings = defaultdict(list)
     
     for file_path in pkl_files:
+        # NOTE (known issue, left unchanged): `load_data` and
+        # `rank_molecules_in_file` are not defined in this file, so calling
+        # this helper raises NameError.
         file_data = load_data(file_path)
         ranked_molecules = rank_molecules_in_file(file_data, ranking_method)
         
@@ -410,10 +465,12 @@ def process_pkl_files(folder_path, file_type, ranking_method):
 
 
 def split_dataset(config, chunk_size: int) -> List[pd.DataFrame]:
+    """Cut the generation CSV (`config.SGNN_csv_gen_smi`) into row chunks."""
     df = pd.read_csv(config.SGNN_csv_gen_smi)
     return [df[i:i+chunk_size] for i in range(0, len(df), chunk_size)]
 
 def create_chunk_folder(config, idx: int) -> str:
+    """Create `<model_save_dir>/chunk_<idx>_<timestamp>` and return it."""
     base_dir = config.model_save_dir
     current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
     chunk_folder_name = f"chunk_{idx:03d}_{current_datetime}"
@@ -425,6 +482,11 @@ def create_chunk_folder(config, idx: int) -> str:
     return chunk_folder_path
 
 def test_pretrained_model_on_sim_data_before(config, IR_config, stoi, itos, stoi_MF, itos_MF, chunk, idx):
+    """Evaluate the pre-trained checkpoint on simulated data for one chunk.
+
+    The spectra are simulated first, because the network consumes simulated
+    1H/13C/HSQC/COSY/IR views rather than the raw SMILES.
+    """
     MW_filter, greedy_full = True, False
     
     print("prepare_data")
@@ -445,6 +507,7 @@ def test_pretrained_model_on_sim_data_before(config, IR_config, stoi, itos, stoi
     return config
 
 def prepare_data(config: Any, chunk: pd.DataFrame) -> Any:
+    """Write the chunk to the pickle folder and point the config at it."""
     chunk_csv_path = os.path.join(config.pkl_save_folder, "SGNN_csv_gen_smi.csv")
     chunk.to_csv(chunk_csv_path)
     config.SGNN_csv_gen_smi = chunk_csv_path 
@@ -452,7 +515,11 @@ def prepare_data(config: Any, chunk: pd.DataFrame) -> Any:
     return config
 
 def generate_simulated_data(config: Any, IR_config: Any) -> Any:
+    """Run the SGNN simulation and back up the paths it overwrites."""
     config.execution_type = "data_generation"
+    # The flag is set just above, so this test always passes.
+    # NOTE (known issue, left unchanged): the guard is dead code and the branch
+    # runs unconditionally.
     if config.execution_type == "data_generation":
         print("\033[1m\033[31mThis is: data_generation\033[0m")
         #import IPython; IPython.embed();
@@ -462,6 +529,7 @@ def generate_simulated_data(config: Any, IR_config: Any) -> Any:
     return config
 
 def backup_config_paths(config: Any) -> None:
+    """Deep-copy the spectrum paths before generation mutates them."""
     config.csv_1H_path_SGNN_backup = copy.deepcopy(config.csv_1H_path_SGNN)
     config.csv_13C_path_SGNN_backup = copy.deepcopy(config.csv_13C_path_SGNN)
     config.csv_HSQC_path_SGNN_backup = copy.deepcopy(config.csv_HSQC_path_SGNN)
@@ -469,6 +537,7 @@ def backup_config_paths(config: Any) -> None:
     config.IR_data_folder_backup = copy.deepcopy(config.IR_data_folder)
 
 def save_results_before(results: Dict[str, Any], config: Any, idx: int) -> None:
+    """Pickle the baseline Tanimoto metrics of chunk `idx`."""
     variables_to_save = {
         'avg_tani_bl_ZINC': results['avg_tani_bl_ZINC_'],
         'results_dict_greedy_bl_ZINC': results.get('results_dict_greedy_bl_ZINC_'),
@@ -482,6 +551,10 @@ def save_results_before(results: Dict[str, Any], config: Any, idx: int) -> None:
     save_data_with_datetime_index(variables_to_save, config.pkl_save_folder, "before_sim_data", idx)
 
 def create_run_folder(chunk_folder, idx):
+    """Create `<chunk_folder>/run_<idx>_<timestamp>` and return it.
+
+    Only the (currently unused) improvement-cycle path calls this.
+    """
     current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_folder_name = f"run_{idx}_{current_datetime}"
     run_folder_path = os.path.join(chunk_folder, run_folder_name)
@@ -492,6 +565,12 @@ def create_run_folder(chunk_folder, idx):
     return run_folder_path
 
 def fine_tune_model_aug_mol(config, stoi, stoi_MF, chunk, idx):
+    """Improvement-cycle variant that starts from augmented molecules.
+
+    The chunk is relabelled so that `SMILES_regio_isomers` becomes the
+    generation target, and `n_samples` is set to the chunk size (one sample
+    per row, no extra sampling).
+    """
     #import IPython; IPython.embed();
     config, all_gen_smis, aug_mol_df = generate_augmented_molecules_from_aug_mol(config, chunk, idx)
     
@@ -510,6 +589,7 @@ def fine_tune_model_aug_mol(config, stoi, stoi_MF, chunk, idx):
 
 
 def generate_augmented_molecules_from_aug_mol(config, chunk, idx):
+    """Generate molecules from the regio-isomers, blend them and fine-tune."""
     #import IPython; IPython.embed();
 
     ############# THis is just relevant for the augmented molecules #############
@@ -543,6 +623,7 @@ def generate_augmented_molecules_from_aug_mol(config, chunk, idx):
     return config, all_gen_smis, aug_mol_df
 
 
+# Only used by the improvement cycle; `run_base_model` never calls this.
 def fine_tune_model(config, stoi, stoi_MF, chunk, idx):
     """
     Fine-tune the model on a chunk of data.
@@ -565,6 +646,12 @@ def fine_tune_model(config, stoi, stoi_MF, chunk, idx):
     return config, aug_mol_df, all_gen_smis
 
 def generate_augmented_molecules(config, chunk, idx):
+    """Turn one chunk of seed SMILES into new SMILES plus simulated spectra.
+
+    Steps: Molformer generation -> NaN cleanup -> removal of SMILES that
+    already exist in the validation set -> DataFrame in dataloader layout ->
+    blend with training data -> spectrum simulation.
+    """
     #import IPython; IPython.embed();
     script_dir = os.getcwd()
     
@@ -594,10 +681,16 @@ def generate_augmented_molecules(config, chunk, idx):
 
 
 def generate_smiles_mf(config):
+    """Run the Molformer ("MF") SMILES generator (`ex.SMI_generation_MF`)."""
     print("\033[1m\033[31mThis is: SMI_generation_MF\033[0m")
     return ex.SMI_generation_MF(config, stoi, stoi_MF, itos, itos_MF)
 
 def process_generated_smiles(results_dict_MF, config):
+    """Flatten the Molformer result dict into one SMILES list.
+
+    Entries whose value list is entirely NaN are dropped first;
+    `plot_cluster_MF` additionally draws the clustering figure.
+    """
     results_dict_MF = {key: value for key, value in results_dict_MF.items() if not hf.contains_only_nan(value)}
     for key, value in results_dict_MF.items():
         results_dict_MF[key] = hf.remove_nan_from_list(value)
@@ -606,6 +699,11 @@ def process_generated_smiles(results_dict_MF, config):
     return combined_list_MF
 
 def filter_and_combine_smiles(combined_list_MF):
+    """Drop "NAN" placeholders and SMILES already present in the val set.
+
+    `config` is the module-level Namespace created above, which is why this
+    helper takes only the SMILES list as an argument.
+    """
     print("\033[1m\033[31mThis is: combine_MMT_MF\033[0m")
     all_gen_smis = combined_list_MF
     all_gen_smis = [smiles for smiles in all_gen_smis if smiles != 'NAN']
@@ -615,11 +713,13 @@ def filter_and_combine_smiles(combined_list_MF):
     return all_gen_smis
 
 def create_augmented_dataframe(all_gen_smis):
+    """Wrap generated SMILES in the (SMILES, sample-id) loader layout."""
     length_of_list = len(all_gen_smis)
     random_number_strings = [f"GT_{str(i).zfill(7)}" for i in range(1, length_of_list + 1)]
     return pd.DataFrame({'SMILES': all_gen_smis, 'sample-id': random_number_strings})
 
 def setup_data_paths(config):
+    """Attach the hard-coded ACD and experimental dataset paths to the config."""
     base_path_acd = "/projects/cc/knlr326/1_NMR_project/1_NMR_data_AZ/37_Richard_ACD_sim_data/"
     config.csv_1H_path_ACD = f"{base_path_acd}ACD_1H_with_SN_filtered_v3.csv"
     config.csv_13C_path_ACD = f"{base_path_acd}ACD_13C_with_SN_filtered_v3.csv"
@@ -636,6 +736,7 @@ def setup_data_paths(config):
     return config
 
 def test_model_on_datasets(config, IR_config, stoi, itos, stoi_MF, itos_MF, chunk, composite_idx, aug_mol_df, all_gen_smis):
+    """Evaluate the fine-tuned checkpoint on simulated, experimental and ACD data."""
     checkpoint_path_backup = config.checkpoint_path    
     for data_type in ['exp', 'sim', 'ACD', ]:
         print(f"Testing on {data_type} data")
@@ -646,6 +747,12 @@ def test_model_on_datasets(config, IR_config, stoi, itos, stoi_MF, itos_MF, chun
     return config
 
 def test_on_data(config, IR_config, stoi, itos, stoi_MF, itos_MF, chunk, composite_idx, data_type, aug_mol_df, all_gen_smis):
+    """Evaluate one dataset type for one chunk.
+
+    For "sim" the original simulated files are reused; for the other types
+    the spectra are reduced to the chunk's sample ids and written to temp
+    files first.
+    """
     if data_type == 'sim':
         restore_backup_configs(config)
     else:
@@ -672,6 +779,7 @@ def test_on_data(config, IR_config, stoi, itos, stoi_MF, itos_MF, chunk, composi
     return config
 
 def restore_backup_configs(config):
+    """Restore the training-data paths saved by `backup_config_paths`."""
     config.csv_1H_path_SGNN = config.csv_1H_path_SGNN_backup
     config.csv_13C_path_SGNN = config.csv_13C_path_SGNN_backup
     config.csv_HSQC_path_SGNN = config.csv_HSQC_path_SGNN_backup
@@ -681,6 +789,11 @@ def restore_backup_configs(config):
     config.pickle_file_path = ""
 
 def process_spectrum_data(config: Any, sample_ids: List[str], data_type: str) -> None:
+    """Write per-spectrum subsets of the chosen dataset to temporary CSVs.
+
+    The files live in `tempfile.mkdtemp()` folders, so they are not removed
+    when the run ends.
+    """
     spectrum_types = ['1H', '13C', 'HSQC', 'COSY']
     for spectrum in spectrum_types:
         csv_path = getattr(config, f'csv_{spectrum}_path_{data_type}')
@@ -697,9 +810,11 @@ def process_spectrum_data(config: Any, sample_ids: List[str], data_type: str) ->
     
     
 def select_relevant_samples(df: pd.DataFrame, sample_ids: List[str]) -> pd.DataFrame:
+    """Keep only the rows of `df` whose sample-id is in `sample_ids`."""
     return df[df['sample-id'].isin(sample_ids)]
 
 def save_and_update_config(config, data_type: str, spectrum_type: str, data: pd.DataFrame) -> Tuple[str, Any]:
+    """Store the selected spectra as a temp CSV and point the config at it."""
     temp_dir = tempfile.mkdtemp()
     dummy_path = os.path.join(temp_dir, f"{data_type}_{spectrum_type}_selected_samples.csv")
     
@@ -711,10 +826,12 @@ def save_and_update_config(config, data_type: str, spectrum_type: str, data: pd.
     return dummy_path, config
 
 def update_config_settings(config: Any) -> None:
+    """Align `csv_path_val` with the 1H data and disable the pickle shortcut."""
     config.csv_path_val = config.csv_1H_path_SGNN
     config.pickle_file_path = ""
 
 def get_last_checkpoint(model_folder: str) -> str:
+    """Return the newest `.ckpt` file inside `model_folder`."""
     checkpoints = [f for f in os.listdir(model_folder) if f.endswith('.ckpt')]
     if not checkpoints:
         raise ValueError(f"No checkpoints found in {model_folder}")
@@ -723,6 +840,7 @@ def get_last_checkpoint(model_folder: str) -> str:
     return os.path.join(model_folder, last_checkpoint)
 
 def load_model_and_data(config: Any, stoi: Dict, stoi_MF: Dict) -> Tuple[Any, Any, Any]:
+    """Load the validation loaders (single- and multi-sample) and the MMT model."""
     #import IPython; IPython.embed();
 
     val_dataloader = mrtf.load_data(config, stoi, stoi_MF, single=True, mode="val")
@@ -732,6 +850,12 @@ def load_model_and_data(config: Any, stoi: Dict, stoi_MF: Dict) -> Tuple[Any, An
 
 def test_model_performance(config: Any, model_MMT: Any, val_dataloader: Any, val_dataloader_multi: Any, 
                            stoi: Dict, itos: Dict, stoi_MF: Dict, itos_MF: Dict) -> Dict[str, Any]:
+    """Score the checkpoint with the CLIP-based test helpers.
+
+    Computes the multi-sample Tanimoto statistics, a greedy-sampling
+    baseline and the multiplication-corrected statistics, then draws the
+    result histograms.
+    """
     print("\033[1m\033[31mThis is: test_performance\033[0m")
     
     MW_filter = True
@@ -769,6 +893,7 @@ def test_model_performance(config: Any, model_MMT: Any, val_dataloader: Any, val
     return results
 
 def save_results_acd_exp(results: Dict[str, Any], config: Any, data_type: str, composite_idx: str) -> None:
+    """Pickle the metrics of one (dataset type, chunk) evaluation."""
     variables_to_save = {
         'avg_tani_bl_ZINC': results['avg_tani_bl_ZINC_'],
         'results_dict_greedy_bl_ZINC': results.get('results_dict_greedy_bl_ZINC_'),
@@ -793,6 +918,7 @@ def save_results_acd_exp(results: Dict[str, Any], config: Any, data_type: str, c
     )
 
 def save_data_with_datetime_index(data: Any, base_folder: str, name: str, idx: Union[int, str]) -> None:
+    """Pickle `data` as `<timestamp>_<name>_<idx>.pkl` under `base_folder`."""
     current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{current_datetime}_{name}_{idx}.pkl"
     os.makedirs(base_folder, exist_ok=True)
@@ -812,7 +938,11 @@ import pickle
 import re
 import tempfile
 
+# NOTE (known issue, left unchanged): `load_model_and_data` is defined a second
+# time here with an identical body. Python keeps the last definition, so the
+# two copies are harmless but easy to edit inconsistently.
 def load_model_and_data(config: Any, stoi: Dict, stoi_MF: Dict) -> Tuple[Any, Any, Any]:
+    """Load the validation loaders (single- and multi-sample) and the MMT model."""
     #import IPython; IPython.embed();
 
     val_dataloader = mrtf.load_data(config, stoi, stoi_MF, single=True, mode="val")
@@ -821,8 +951,11 @@ def load_model_and_data(config: Any, stoi: Dict, stoi_MF: Dict) -> Tuple[Any, An
     return model_MMT, val_dataloader, val_dataloader_multi
 
 def run_base_model(chunk_size, config, IR_config, stoi, itos, stoi_MF, itos_MF):
+    """Iterate over the chunks of the input CSV and evaluate the base model."""
     chunks = split_dataset(config, chunk_size)
     config.model_save_dir = config.pkl_save_folder
+    # Reference copies only: nothing restores the checkpoint path after the
+    # chunk loop, and these two values are never read again.
     model_save_dir_backup = config.model_save_dir
     original_checkpoint_path = config.checkpoint_path  # Store the original checkpoint path
 
@@ -839,6 +972,8 @@ def run_base_model(chunk_size, config, IR_config, stoi, itos, stoi_MF, itos_MF):
 
 
 
+# Entry point: override the data/checkpoint paths for this split, then run
+# one evaluation pass per chunk (`chunk_size = 1` -> one molecule per chunk).
 if __name__ == "__main__":
         
     config.SGNN_csv_gen_smi = '/projects/cc/knlr326/1_NMR_project/1_NMR_data_AZ/15_ZINC270M/ML_NMR_5M_XL_1H_comb_test_V8_1000.csv'

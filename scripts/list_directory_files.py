@@ -114,6 +114,11 @@ def render_report(directory: Path, entries: list[dict], directory_count: int) ->
 
 
 def main() -> int:
+    """Parse the arguments, build the report and write it to the output file.
+
+    Returns:
+        int: 0 on success, 1 when the given path is not a directory.
+    """
     parser = argparse.ArgumentParser(
         description="List all files below a directory and write a text report."
     )
