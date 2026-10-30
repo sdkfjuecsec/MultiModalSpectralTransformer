@@ -1,3 +1,28 @@
+"""HSQC peak-splitting / symmetry analysis for NMR shift reconstruction.
+
+Given a molecule (SMILES, SDF or RDKit ``Mol``) this module works out which
+carbons would show a split HSQC signal because they sit near a chiral centre,
+and which carbons are symmetry-equivalent (so their peaks collapse into one).
+
+The entry point is :func:`run_chiral_and_symmetry_finder`, which chains the
+following steps:
+  1. :func:`get_HSQC_info_data`   -- C-H connectivity + stereo SMILES
+  2. :func:`get_chiral_carbons`   -- locate stereo centres in the SMILES string
+  3. :func:`chiral_center_type`   -- terminal vs internal chiral centres
+  4. :func:`get_exclude_second_degree_list` -- ring-adjacent exceptions
+  5. :func:`get_second_degree_neighbor` / :func:`get_all_chiral_split_positions`
+  6. :func:`check_for_symmetric_substituents` / :func:`remove_symmetric_centers`
+     / :func:`check_for_two_H` -- prune centres that cannot split
+  7. :func:`find_symmetric_positions` -- RDKit canonical ranks for duplicates
+
+Downstream, :func:`selecting_shifts` and
+:func:`perform_deduplication_if_symmetric` turn predicted shifts into the final
+HSQC peak list (including DEPT-style directions).
+
+Atom indices are 0-based and include explicit hydrogens, so they line up with
+the ``AddHs`` molecule used throughout.
+"""
+
 # Standard library imports
 import collections
 from collections import defaultdict
@@ -11,6 +36,24 @@ from rdkit.Chem import MolFromSmiles, MolToSmiles, rdmolops, rdmolfiles
 from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, GetStereoisomerCount
 
 def run_chiral_and_symmetry_finder(smiles="", compound_path="", extra_info=False):
+    """Full pipeline: identify split positions and symmetry duplicates.
+
+    Args:
+        smiles: SMILES string (used when ``compound_path`` is empty).
+        compound_path: path to an SDF/MOL file; takes precedence over ``smiles``.
+        extra_info: print intermediate results for debugging.
+
+    Returns:
+        ``(sym_dupl_lists, all_split_positions, mol, compound_path)`` where
+        ``sym_dupl_lists`` are groups of symmetry-equivalent atom indices and
+        ``all_split_positions`` are carbon indices whose HSQC signal splits.
+        ``compound_path`` is only filled for the SMILES branch (see note).
+
+    NOTE (known issue, left unchanged): the SMILES branch calls ``smile2SDF``,
+    which is defined in ``helper_functions_pl_v15_4`` but never imported here,
+    so passing a SMILES string raises ``NameError``. Callers currently pass a
+    ``Mol``/path instead.
+    """
 
     if compound_path != "":
         mol = Chem.MolFromMolFile(compound_path)
@@ -69,6 +112,14 @@ def get_HSQC_info_data(mol=None, smiles="", file_path="", extra_info = False):
     has the labels of the C with connections to which H
     does not consider chiral compound peak splits yet
     it just takes SMILES or the path to an SDF file
+
+    Returns:
+        ``(count_list, m, stereo_smi, am, elements)`` where ``count_list`` maps
+        a carbon atom index to the list of attached hydrogen indices.
+
+    NOTE (known issue, left unchanged): ``display(m)`` in the ``extra_info``
+    branch is an IPython builtin that is not imported, so enabling ``extra_info``
+    raises ``NameError``.
     """
     if mol!=None:
         m = mol_with_atom_index(mol,True)
@@ -119,7 +170,16 @@ def get_HSQC_info_data(mol=None, smiles="", file_path="", extra_info = False):
 
 def chiral_center_type(chiral_centers, elements, am):
     """This function checks if the chiral center is at the end of a chain (terminal)
-    or somewhere in the middle of the molecule"""
+    or somewhere in the middle of the molecule
+
+    Returns ``(direct_neighbor_list, direct_neighbor_dict,
+    terminal_neighbor_list, terminal_neighbor_dict)``. The dicts map the chiral
+    carbon index to its carbon neighbours.
+
+    NOTE (known issue, left unchanged): this function is defined twice in this
+    module with an identical body, so the later definition shadows the earlier
+    one; one copy should be removed if the module is ever refactored.
+    """
     direct_neighbor_dict = defaultdict(list)
     terminal_neighbor_dict = defaultdict(list)
     direct_neighbor_list = []
@@ -149,7 +209,13 @@ def chiral_center_type(chiral_centers, elements, am):
 
 
 def get_bond_type(idx,ring_bound_list):
-    """ As the function name implies"""
+    """Return the bond type ("AROMATIC"/"SINGLE") of ``idx`` in ``ring_bound_list``.
+
+    NOTE (known issue, left unchanged): the ``for`` loop unconditionally
+    ``break``s after the first entry, so only the first ring bond is inspected;
+    and an empty ``ring_bound_list`` leaves ``bond_type`` undefined
+    (``UnboundLocalError``).
+    """
     for i in ring_bound_list:
         if idx in i and i[2] == "AROMATIC":
             bond_type = "AROMATIC"
@@ -163,7 +229,11 @@ def get_bond_type(idx,ring_bound_list):
 # because if chiral center is next to aromatic ring the second layer doesn't split
 def get_exclude_second_degree_list(mol, chiral_centers, elements, am):
     """This function checks if chiral centers are next to aromatic rings
-    in that case no second layer gets split"""
+    in that case no second layer gets split
+
+    Returns ``(exclude_second_degree_list, ring_bound_list)``; the latter is a
+    list of ``[atom_a, atom_b, bond_type]`` triples for consecutive ring atoms.
+    """
     ringinfo = mol.GetRingInfo()
     rings = ringinfo.AtomRings()
     ring_atoms = [i for ring in rings for i in ring]
@@ -189,7 +259,12 @@ def get_exclude_second_degree_list(mol, chiral_centers, elements, am):
 # remove the reference that is from the chiral center that is next to the ring
 def get_second_degree_neighbor(direct_neighbor_dict, exclude_second_degree_list, am, elements, direct_neighbor_list, chiral_centers, terminal_neighbor_list):
     """This function removes the chiral centers next to aromatic rings and addes the positions that
-    with a distance of two to the list"""
+    with a distance of two to the list
+
+    The input dict is deep-copied before ring-adjacent centres are deleted, so
+    the returned ``direct_neighbor_dict`` is a new object while
+    ``direct_neighbor_dict_`` is only a local working copy.
+    """
     import copy
     direct_neighbor_dict_ = copy.deepcopy(direct_neighbor_dict)
 
@@ -213,7 +288,7 @@ def get_second_degree_neighbor(direct_neighbor_dict, exclude_second_degree_list,
 
 
 def get_all_chiral_split_positions(direct_neighbor_dict, terminal_neighbor_dict):
-    """As the function says"""
+    """Flatten the internal and terminal neighbour dicts into one atom-index list."""
     all_split_positions = []
     for k,v in direct_neighbor_dict.items():
         for i in v:
@@ -227,7 +302,12 @@ def get_all_chiral_split_positions(direct_neighbor_dict, terminal_neighbor_dict)
 
 # Check if those neighbors have symmetric substitutes - if so pop them because will not be duplicated
 def check_for_symmetric_substituents(all_split_positions, chiral_centers, elements, am):
-    """As the function says"""
+    """Drop split candidates whose three substituents are identical (e.g. CH3).
+
+    The candidate is removed from ``all_split_positions`` in place and its
+    index is appended to ``remove_neighbor_list`` (unless the surrounding list
+    has length 2, the ring-linker exception).
+    """
     remove_neighbor_list = []
     for i in all_split_positions:
         surrounding_list=[]
@@ -255,7 +335,11 @@ def check_for_symmetric_substituents(all_split_positions, chiral_centers, elemen
 # # the second last C in the chain is also not split for some reason in ACD labs?!
 # # this has to do with the electronegativity next to the chiral center if polar F or benzo ring then no split
 def remove_symmetric_centers(all_split_positions, remove_neighbor_list, sec_direct_neighbor, elements, am):
-    """Just if it is e.g. CH3"""
+    """Remove the carbon next to a symmetric centre from the split list.
+
+    Only applied when the candidate is a second-degree neighbour and is still
+    present in ``all_split_positions``; the list is mutated in place.
+    """
     for i in remove_neighbor_list:
         if (i in sec_direct_neighbor) and (i in all_split_positions):
             for idx, j in enumerate(am[i]):
@@ -272,7 +356,11 @@ def remove_symmetric_centers(all_split_positions, remove_neighbor_list, sec_dire
 # if not pop them as well
 # need to do a copy otherwise it doesn't loop over everything
 def check_for_two_H(all_split_positions, elements, am):
-    """ remove position if there is just one hydrogen connected to the carbon """
+    """ remove position if there is just one hydrogen connected to the carbon 
+
+    A carbon can only show a split HSQC signal when exactly two hydrogens are
+    attached (the two diastereotopic protons resolve separately).
+    """
     all_split_positions_ = all_split_positions.copy()
     for i in all_split_positions_:
         num_h = 0
@@ -287,7 +375,12 @@ def check_for_two_H(all_split_positions, elements, am):
 
 
 def find_symmetric_positions(stereo_smi):
-    """https://github.com/rdkit/rdkit/issues/1411"""
+    """https://github.com/rdkit/rdkit/issues/1411
+
+    Uses canonical atom ranks (with ties left unbroken) to find groups of
+    symmetry-equivalent atoms; each group is mapped to the atom indices of the
+    first full substructure match. Returns ``[]`` when no duplicates exist.
+    """
 
     mol = Chem.MolFromSmiles(stereo_smi)
     z=list(rdmolfiles.CanonicalRankAtoms(mol, breakTies=False))
@@ -327,6 +420,9 @@ def mol_with_atom_index(mol, include_H=True):
     Takes a mol as input and adds H to them
     Visualizes the number which is assigned to which atom as a mol
     if include_H is True then H will be added and also labeled in the mol file
+
+    The atom map number is set equal to the RDKit atom index so that indices
+    shown in a drawing match the 0-based indices used in the analysis.
     """
     # mol = MolFromSmiles(smiles)
     if include_H:
@@ -341,7 +437,16 @@ def mol_with_atom_index(mol, include_H=True):
 ### Get the chiral carbons from the compound
 def get_chiral_carbons(stereo_smi):
     """ this function gives the chiral carbons based on the stereo-smiles provided and returns the number of the chiral carbon
-    based on the occurence of that hetero-atom within the smiles string"""
+    based on the occurence of that hetero-atom within the smiles string
+
+    The returned values are *counts of heavy symbols* seen so far in the SMILES
+    string (not RDKit atom indices). ``@``/``+``/``-``, brackets, explicit H and
+    ring digits are not counted.
+
+    NOTE (known issue, left unchanged): the index accesses are wrapped in a
+    ``try/except`` that also swallows ``IndexError`` at the end of the string,
+    so the final character is never evaluated.
+    """
     chiral_centers = []
     heteroatom_count = 0
     for idx, atom in enumerate(stereo_smi):
@@ -361,7 +466,12 @@ def get_chiral_carbons(stereo_smi):
 
 
 def check_terminal_chiral_center(chiral_C, am, elements):
-    """ This function checks if a given C atom has 3 different distinct neighbors"""
+    """ This function checks if a given C atom has 3 different distinct neighbors
+
+    Terminal here means all three substituents are non-carbon atoms (e.g.
+    ``-CH(OH)(F)(Cl)``); if any non-self neighbour is a carbon the centre is
+    treated as internal.
+    """
     surrounding_list = []
     for idx, j in enumerate(am[chiral_C]):
         #not refering to itself and no C because otherwise it is not a terminal steroecenter
@@ -380,7 +490,16 @@ def check_terminal_chiral_center(chiral_C, am, elements):
 from collections import defaultdict
 def chiral_center_type(chiral_centers, elements, am):
     """This function checks if the chiral center is at the end of a chain (terminal)
-    or somewhere in the middle of the molecule"""
+    or somewhere in the middle of the molecule
+
+    Returns ``(direct_neighbor_list, direct_neighbor_dict,
+    terminal_neighbor_list, terminal_neighbor_dict)``. The dicts map the chiral
+    carbon index to its carbon neighbours.
+
+    NOTE (known issue, left unchanged): this function is defined twice in this
+    module with an identical body, so the later definition shadows the earlier
+    one; one copy should be removed if the module is ever refactored.
+    """
     direct_neighbor_dict = defaultdict(list)
     terminal_neighbor_dict = defaultdict(list)
     direct_neighbor_list = []
@@ -414,7 +533,18 @@ def chiral_center_type(chiral_centers, elements, am):
 def get_molecule_data(compound_path):
     """ This function returns the list of atoms of the molecules
     and a list of strings with each line of the compound document as one string
-    because reading the SDF files with pandas causes an error"""
+    because reading the SDF files with pandas causes an error
+
+    Side effect: a ``.mol`` copy of the (truncated at ``M  END``) block is
+    written next to ``compound_path`` and re-parsed with RDKit.
+
+    Returns:
+        ``(atom_list, connectivity_list, docline_list, name, mol)``.
+
+    NOTE (known issue, left unchanged): the SDF "counts" line is skipped by
+    testing whether its first token is a digit and only 3-token bond lines are
+    re-split, which is fragile for files with >99 bonds.
+    """
 
     ################ atom_list ################
     index_list_C =[]
@@ -495,7 +625,11 @@ def get_molecule_data(compound_path):
 # Get C-H connectivity dict with index starting from 0 to correct it to python convention
 def get_c_h_connectivity(connectivity_list, atom_list):
     """ This function checks the connectifity list and creates a dictionary with all the
-    carbons that are connected to hydrogens with their labelled numbers"""
+    carbons that are connected to hydrogens with their labelled numbers
+
+    Both bond orientations (C->H and H->C) are inspected so that a single C-H
+    bond is recorded exactly once; the value is a list of hydrogen indices.
+    """
     c_h_connectivity_dict = {}
     # print(connectivity_list)
     for i in connectivity_list:
@@ -533,7 +667,14 @@ def get_c_h_connectivity(connectivity_list, atom_list):
 def selecting_shifts(c_h_connectivity_dict, all_split_positions, boltzman_avg_shifts_corr_2):
     """This functions takes the connectifity list and the symmetry and chirality information and
     reconstructs the shifts including their splittings and returns it as a final list
-    including the direction of the peak based on the number of H bound to C"""
+    including the direction of the peak based on the number of H bound to C
+
+    Hydrogen shifts are averaged for CH3 groups and for CH2 groups that do *not*
+    split; split CH2 groups yield one peak per proton. ``direction`` follows
+    HSQC-DEPT convention: odd H count -> +1, even -> -1.
+
+    Each returned row is ``[C_shift, H_shift, direction, C_index, H_index_list]``.
+    """
     shifts = []
     # iterate over all items of dict
     for cab_pos,hyd_pos_list in c_h_connectivity_dict.items():
@@ -561,7 +702,11 @@ def selecting_shifts(c_h_connectivity_dict, all_split_positions, boltzman_avg_sh
 
 
 def perform_deduplication_if_symmetric(shifts, sym_dupl_lists):
-    """ This function performs deduplication based on the symmetries found in the compound and returns the new corrected shifts"""
+    """ This function performs deduplication based on the symmetries found in the compound and returns the new corrected shifts
+
+    Symmetry-equivalent carbons are replaced by one averaged peak; remaining
+    peaks are averaged per carbon index (``row[-2]``) before being appended.
+    """
     shifts_arr = np.array(shifts, dtype=object) 
     C_nums = shifts_arr[:,3]
     if len(sym_dupl_lists) != 0:
@@ -625,6 +770,7 @@ def perform_deduplication_if_symmetric(shifts, sym_dupl_lists):
 
 
 def generate_dft_dataframe(shifts):
+    """Convert the shift rows into a DataFrame with HSQC column names."""
     # save shifts as dataframe
     df_dft = pd.DataFrame()
     c_shifts = np.array(shifts, dtype=object)[:,0] 
