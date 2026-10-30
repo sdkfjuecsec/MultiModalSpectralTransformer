@@ -1,5 +1,38 @@
 #Source: https://bitbucket.astrazeneca.net/projects/COM/repos/pysmilesutils/browse 
 
+"""SMILES augmentation utilities (a trimmed copy of AstraZeneca's ``pysmilesutils``).
+
+Why augmentation is needed here
+-------------------------------
+The MMST model is trained on *non-canonical* SMILES so that the same molecule
+appears with many different atom orders / ring-closure notations. That random
+enumeration acts as data augmentation and prevents the decoder from memorising
+one fixed canonical string per molecule.
+
+Class hierarchy
+---------------
+``Augmenter``
+    Abstract base; ``__call__`` normalises a single item into a list and
+    dispatches to ``augment`` (which honours the ``active`` / ``augment_prob``
+    switches).
+``MolAugmenter``
+    Works on :class:`rdkit.Chem.Mol` objects by renumbering atoms.
+``SMILESAugmenter``
+    String-level API used by the dataset code
+    (``SMILESAugmenter(restricted=False)`` for unrestricted RDKit
+    ``doRandom`` enumeration, the default restricted mode for atom-order
+    renumbering).
+
+Randomness
+----------
+``np.random`` is used (not the ``random`` module), so seeds set through
+``numpy.random.seed`` control reproducibility.
+
+NOTE (known issue, left unchanged)
+    这个文件是从 ``pysmilesutils`` 复制并修改的 vendored 代码（相对上游增加了
+    3 次重试 + 打印）。按约定只做注解，不改实现。
+"""
+
 from abc import abstractmethod
 from random import shuffle
 from typing import Any
@@ -45,6 +78,11 @@ class Augmenter:
 
     @abstractmethod
     def _augment(self, data: Iterable[Any]) -> List[Any]:
+        """Subclass hook: perform the actual augmentation.
+
+        :param data: already normalised list of items.
+        :return: augmented list.
+        """
         raise NotImplementedError()
 
     def augment(self, data: Iterable[Any]) -> List[Any]:
@@ -54,6 +92,9 @@ class Augmenter:
         :param data: a list of molecules to be augmented.
         :return: A list of augmented molecules.
         """
+        # ``active=False`` is the escape hatch used at evaluation time: the
+        # identity mapping keeps the string the same, so predictions stay
+        # comparable across runs.
         if self.active:
             return self._augment(data)
         return list(data)
@@ -79,10 +120,17 @@ class MolAugmenter(Augmenter):
         :return: RDKit molecule object with a randomized atom-order.
         """
         # Standard shuffle surprisingly leads to 35% slower code.
+        # (i.e. shuffling a Python list of atom indices then RenumberAtoms is
+        #  faster than using randomSMILES or MolToSmiles(doRandom=True) here)
+        # Per-molecule skip switch: the condition is true with probability
+        # (1 - augment_prob), so ``augment_prob=1.0`` always augments.
         if self.augment_prob < np.random.rand():
             return mol
         atom_order: List[int] = list(range(mol.GetNumAtoms()))
         np.random.shuffle(atom_order)
+        # RenumberAtoms returns a *new* molecule with the same chemistry but
+        # a permuted atom index order; MolToSmiles(canonical=False) on it
+        # then yields a non-canonical SMILES reflecting that order.
         return Chem.RenumberAtoms(mol, atom_order)
 
     def _augment(self, data: Iterable[Mol]) -> List[Mol]:
@@ -126,11 +174,17 @@ class SMILESAugmenter(MolAugmenter):
         """
         smiles_aug: List[str] = []
         for smi in smiles:
+            # Per-molecule skip (same probability rule as in MolAugmenter).
             if self.augment_prob < np.random.rand():
                 smiles_aug.append(smi)
                 continue
 
+            # Multi-fragment SMILES ("A.B") are augmented fragment-by-fragment
+            # and then re-shuffled, so the fragment order also varies.
             mols: List[Mol] = list(map(Chem.MolFromSmiles, smi.split(".")))
+            # Up to 3 attempts: RDKit's random writer can occasionally raise on
+            # pathological inputs; after 3 failures the original string is kept
+            # (so the batch length is always preserved).
             for _ in range(3):
                 try:
                     smi_new: List[str] = [Chem.MolToSmiles(mol, doRandom=True) for mol in mols]
@@ -140,6 +194,8 @@ class SMILESAugmenter(MolAugmenter):
                 except Exception as e:
                     print(f"Augmentation failed for {smi} with error: {e}")
             else:
+                # NOTE: ``for ... else`` runs only when the loop finished without
+                # ``break``, i.e. all three attempts failed.
                 smiles_aug.append(smi)
                 print(f"Augmentation failed three times for {smi}, returning unaugmented original")
                 
@@ -160,13 +216,21 @@ class SMILESAugmenter(MolAugmenter):
         smiles_aug: List[str] = []
 
         augment_prob = self.augment_prob
+        # Force 1.0 on ``self`` so the inner ``randomize_mol_restricted`` does
+        # not apply the skip chance a second time (which would compound to
+        # augment_prob**2). Restored at the end of the method.
         self.augment_prob = 1.0  # To avoid double application
 
         for smi in smiles:
+            # Single skip decision for the whole molecule.
             if augment_prob < np.random.rand():
                 smiles_aug.append(smi)
                 continue
             
+            # NOTE: ``MolFromSmiles`` may return ``None`` for an invalid string;
+            #       ``randomize_mol_restricted(None)`` then raises inside the
+            #       ``try`` below and the 3-retry/fallback path returns the
+            #       original SMILES. Behaviour is correct, just indirect.
             mol: Mol = Chem.MolFromSmiles(smi)
             for _ in range(3):
                 try:
@@ -178,8 +242,11 @@ class SMILESAugmenter(MolAugmenter):
             else:
                 smiles_aug.append(smi)
                 print(f"Augmentation failed three times for {smi}, returning unaugmented original")
-
+        
         self.augment_prob = augment_prob
+        # NOTE (known issue, left unchanged): if the code above ever raised
+        #       (it cannot today, everything is inside try/except) the original
+        #       ``augment_prob`` would not be restored. No try/finally guard.
         return smiles_aug
 
     def _augment(self, data: Iterable[str]) -> List[str]:
