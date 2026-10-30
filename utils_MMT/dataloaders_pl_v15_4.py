@@ -418,6 +418,17 @@ class MultimodalData(Dataset):
             tokens.append(element)
             if count:  # Only add the count if it's present (i.e., not None and not an empty string)
                 tokens.append(count)
+        # NOTE (known issues, left unchanged):
+        # 1. `stoi_MF` has no '<UNK>' token, so `.get('<UNK>')` returns None and
+        #    an element outside the vocabulary (e.g. 'Si', 'Uuo') yields None
+        #    instead of a valid id -- `torch.tensor()` later raises on it.
+        # 2. The regex allows at most two digits for a count (`\d{1,2}`), so
+        #    C100H202 is tokenised as ['C','10','H','20'] and the trailing
+        #    '0'/'2' are silently dropped.
+        # 3. Because of (2) the token '100' (id 212) can never be produced, yet
+        #    len(stoi_MF) == 212 only addresses ids 0..211: fixing (2) without
+        #    enlarging the vocabulary would trigger an index error in the
+        #    embedding table.
         return [stoi_MF.get(token, stoi_MF.get('<UNK>')) for token in tokens]
 
     def __len__(self):
@@ -640,6 +651,12 @@ class MultimodalData(Dataset):
             #trg_enc_SMI = trg_enc_SMI.permute(1,0)
 
             ### Load target MF
+            # NOTE (known issue, left unchanged): the molecular-formula sequence
+            # is wrapped with special tokens taken from the SMILES vocabulary
+            # (`self.stoi`) instead of `self.stoi_MF`. stoi['<SOS>'] == 3, but in
+            # stoi_MF id 3 is '<MASK>', so the formula sequence actually starts
+            # with a mask token. '<EOS>' happens to be 2 in both vocabularies,
+            # which is why the end token looks correct.
             src_enc_MF = self._encode_MF(self.stoi_MF, MF)
             src_MF = [self.stoi["<SOS>"]] + src_enc_MF + [self.stoi["<EOS>"]] 
             padd = [0 for i in range(self.config.padding_points_number-len(src_MF))]

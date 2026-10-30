@@ -148,6 +148,12 @@ def output_to_smiles(outputs, itos):
     #for output in outputs:
         _, predicted_indices = torch.max(sub_tensor, dim=-1)
 
+        # NOTE (known issue, left unchanged): `[:-5]` blindly chops the last five
+        # characters, which assumes every sequence ends with '<EOS>' (exactly
+        # five characters). When the generation stops on '<PAD>' or hits the
+        # length limit, five real SMILES characters are removed and the decoded
+        # molecule is truncated. Truncating at the '<EOS>' position (as done in
+        # tensor_to_smiles below) would be the correct approach.
         smiles = ''.join([itos[str(int(i))] for i in predicted_indices])[:-5]
         smi_list.append(smiles)
     return smi_list

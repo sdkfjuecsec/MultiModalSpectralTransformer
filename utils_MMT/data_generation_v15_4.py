@@ -656,6 +656,17 @@ def calculate_couplings_constants(nmr_data: List[Dict[str, Any]]
     # Walk every proton record; symmetric protons appear several times and are
     # filtered by the `label not in atoms_done` checks below.
     for atom_data in nmr_data:
+        # NOTE (known issue, left unchanged): `coupling_pattern` is not reset at
+        # the start of each iteration, so a proton whose (hydrogen_counts,
+        # bond_types) combination has no rule below inherits the pattern of the
+        # PREVIOUS proton instead of being skipped -- and nothing is printed.
+        # Measured examples:
+        #   propene   CC=C    -> the vinylic CH (key [3, 2] + mixed bonds) reuses
+        #                        the methyl doublet [(-3.05, 1.5), (3.05, 1.5)]; the
+        #                        terminal CH2 does match the CH=CH2 rule.
+        #   isobutane CC(C)C  -> the central CH (key [3, 3, 3], no rule) reuses
+        #                        the same methyl doublet.
+        # Fixing this changes the generated data, hence it is only documented.
         # Heteroatom-bound protons (N-H, O-H) are not simulated: their exchange
         # rate makes them unreliable, and the model was trained without them.
         # Example: ethanol's OH has label "O1H1" -> skipped, CH2/CH3 are kept.
@@ -664,8 +675,12 @@ def calculate_couplings_constants(nmr_data: List[Dict[str, Any]]
         # The single neighbour of an explicit H is the heavy atom carrying it.
         parent_atom: Chem.Atom = atom_data['atom'].GetNeighbors()[0]
         # ---- Aromatic protons ------------------------------------------------
-        # The label check de-duplicates symmetric protons: benzene yields six
-        # "C0H1"/"C1H1"... labels but each label is processed once.
+        # The label check de-duplicates symmetric protons of the SAME carbon:
+        # a CH3 appears three times but is processed once.
+        # NOTE (known issue, left unchanged): chemical equivalence across carbons
+        # is NOT merged here -- find_symmetric_positions is never called on this
+        # path, and labels differ per atom, so benzene yields six independent
+        # triplets instead of the single line a real spectrum shows.
         if (atom_data['aromatic'] and atom_data['label'] not in atoms_done):
             # Number of other protons on the same carbon (0 for aromatic CH).
             n_neighbors: int = atom_data['neighbors']
@@ -1002,6 +1017,12 @@ def calculate_couplings_constants(nmr_data: List[Dict[str, Any]]
                                   (2*J_septet, 2/16),
                                   (3*J_septet, 1/16)]            
 
+            # NOTE (known rules gaps, left unchanged): the table has no branch for
+            #   [3, 3, 3]                    -> isobutane central CH (septet expected)
+            #   [3, 2] / [2, 3] + mixed bond -> vinylic protons of a terminal alkene
+            #                                  (the CH=CH2 roof effect 16/10 Hz)
+            # so those protons fall through to the stale-pattern issue documented
+            # at the top of the loop.
             try:
                 # `hydrogen_counts` is only None before the first assignment, so in
                 # practice this always appends -- unless no rule matched, in which
@@ -1558,6 +1579,9 @@ def extract_symmetric_hydrogen_shifts(shifts, heavy_atom_dict):
     return carbon_hydrogen_shifts_dict
 
 
+# NOTE (known issue, left unchanged): find_symmetric_positions is defined twice
+# in this module (here and ~250 lines above). The later definition silently
+# overrides the earlier one at import time, so the first copy is dead code.
 def find_symmetric_positions(stereo_smi: str) -> List[List[int]]:
     """Find groups of symmetry-equivalent atoms in a molecule.
 
