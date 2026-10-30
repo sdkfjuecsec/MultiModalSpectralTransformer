@@ -1,3 +1,21 @@
+"""SGNN feedback helpers used during MMT training / testing.
+
+The active part of this module re-scores generated SMILES by running them
+through the SGNN (spectrum graph neural network) simulator and comparing the
+predicted HSQC/COSY spectra with the ground-truth spectra of the batch.
+
+Most of the original file is dead code (loss aggregation and tensor->SMILES
+decoding utilities) that is kept as commented-out blocks for reference; only
+``run_sgnn_sim_calculations_if_possible`` and its ``*_return_spectra`` variant
+are called from the training loop.
+
+Conventions used below:
+  * ``df_succ_smis``  -- DataFrame with columns ``SMILES`` and ``sample-id``
+    (sample ids look like ``"<index>_<suffix>"``).
+  * ``tensor_HSQC`` / ``tensor_COSY`` -- per-sample numpy-able tensors whose
+    index matches the leading integer of ``sample-id``.
+"""
+
 # Standard libraries
 import sys
 import json
@@ -35,6 +53,12 @@ import utils_MMT.similarity_functions_v15_4 as sf
 import torch.autograd.profiler as profiler
 import time
 
+# ------------------------------------------------------------------------------
+# Legacy (disabled) loss aggregation used by the old training loop.
+# Kept for reference: it combined SMILES cross-entropy, MW, fingerprint, SGNN
+# feedback and Tanimoto/validity terms into a single weighted loss. The live
+# training code now computes the loss inline in models_MMT_v15_4.py.
+# ------------------------------------------------------------------------------
 # def calculate_total_loss(gen_output, 
 #                          trg_enc_SMI, 
 #                         gen_FP, trg_FP, 
@@ -195,14 +219,30 @@ import time
     
 
 def run_sgnn_sim_calculations_if_possible(df_succ_smis, tensor_HSQC, sgnn_means_stds, config):
+    """Average HSQC similarity error between generated and target spectra.
+
+    The SGNN simulation is attempted three times with decreasing batch sizes
+    (``batch_size/gpu_num`` -> 10 -> 1) so that molecules which fail in a large
+    batch still get a chance to produce an SDF file.
+
+    Returns:
+        ``(avg_sim_error, sim_error_list)`` on success, or ``(None, None)`` when
+        a simulation call raises or no sample could be scored.
+
+    NOTE (known issue, left unchanged): early-exit branches return 3 values
+    (``None, None, None``) while the success branch returns 2, so callers that
+    unpack exactly two values would break on the error path.
+    """
     #import IPython; IPython.embed();
     try:
+        # First attempt: full batch (fractional GPU split is truncated to int)
         batch_data, failed_ids = sc.main_execute(df_succ_smis, sgnn_means_stds, config.ML_dump_folder, int(config.batch_size / config.gpu_num))
     except Exception as e:
         # Handle exceptions from batch data execution
         return None, None, None
 
     ### run the single generations 
+    # Retry the failed subset with batch size 10 ...
     df_failed = df_succ_smis[df_succ_smis['sample-id'].isin(failed_ids)]   
     try:
          batch_data_add_1, failed_ids = sc.main_execute(df_failed, sgnn_means_stds, config.ML_dump_folder, 10)
@@ -211,6 +251,7 @@ def run_sgnn_sim_calculations_if_possible(df_succ_smis, tensor_HSQC, sgnn_means_
         return None, None, None
 
     ### run the single generations 
+    # ... and finally one-by-one, so partial failures do not abort the batch.
     df_failed = df_succ_smis[df_succ_smis['sample-id'].isin(failed_ids)]   
     try:
          batch_data_add_2, failed_ids = sc.main_execute(df_failed, sgnn_means_stds, config.ML_dump_folder, 1)
@@ -218,19 +259,26 @@ def run_sgnn_sim_calculations_if_possible(df_succ_smis, tensor_HSQC, sgnn_means_
         # Handle exceptions from batch data execution
         return None, None, None
 
+    # Merge all simulations that produced an SDF file.
     batch_data = pd.concat([batch_data, batch_data_add_1, batch_data_add_2], ignore_index=True)
     ### calculate error of spectra with HungDist method
+    # Similarity mode is encoded as "<matching>_<padding>" and mapped to a fixed
+    # index used to pick the corresponding column of the similarity result.
     matching_technique = config.matching
     padding_technique = config.padding
     mode = matching_technique+"_"+padding_technique
     
     mode_dict = {"MinSum_Zero":0, "EucDis_Zero":1, "HungDist_Zero":2, "MinSum_Trunc":3,   "EucDis_Trunc":4, "HungDist_Trunc":5, "MinSum_NN":6, "EucDis_NN":7, "HungDist_NN":8}
 
+    # NOTE (known issue, left unchanged): a config combination missing from
+    # ``mode_dict`` raises ``KeyError`` here (the *_return_spectra variant below
+    # uses ``.get(mode, -1)`` instead).
     mode_index = mode_dict[mode]
     sim_error_list = []
     count = 0
     
     for sample_id, sdf_path in zip(batch_data["sample-id"],batch_data["sdf_path"]):
+        # The leading integer of the sample id indexes the ground-truth tensor.
         idx = sample_id.split("_")[0]
         
         #try: ### Because some of the data will be blanked out from the dataloader if selected which would cause an error when this index is selected.
@@ -240,6 +288,7 @@ def run_sgnn_sim_calculations_if_possible(df_succ_smis, tensor_HSQC, sgnn_means_
         # Convert tensor to numpy array
             numpy_HSQC = tensor_HSQC[int(idx)].cpu().numpy()
             # Convert numpy array to DataFrame
+            # 2 columns => (F2, F1); 3 columns additionally carry peak direction.
             if numpy_HSQC.shape[-1]==3:
                 pd_df_HSQC = pd.DataFrame(numpy_HSQC, columns=['F2 (ppm)', 'F1 (ppm)', "direction"])
             elif numpy_HSQC.shape[-1]==2:
@@ -249,6 +298,8 @@ def run_sgnn_sim_calculations_if_possible(df_succ_smis, tensor_HSQC, sgnn_means_
             sim_error_list.append(sim_error[mode_index])
             count +=1
         except:
+            # Samples whose ground-truth spectrum was masked out are silently
+            # skipped; they do not contribute to the average.
             #print("tensor_HSQC blanked out")
             #print(tensor_HSQC[int(idx)])
             #print(sdf_path)
@@ -258,6 +309,7 @@ def run_sgnn_sim_calculations_if_possible(df_succ_smis, tensor_HSQC, sgnn_means_
         #print(len(batch_data))
         #print(len(sim_error_list))
         avg_sim_error = sum(sim_error_list)/count
+        # Cast numpy scalars to plain floats for pickling / logging.
         sim_error_list = [float(x) for x in sim_error_list]
 
         return avg_sim_error, sim_error_list
@@ -268,29 +320,45 @@ def run_sgnn_sim_calculations_if_possible_return_spectra(df_succ_smis, tensor_HS
     """
     Perform sgnn similarity calculations if possible.
 
+    Same retry ladder as :func:`run_sgnn_sim_calculations_if_possible`, but the
+    SGNN SDF files are written into a freshly derived per-run dump folder and
+    both HSQC and COSY errors are returned together with the simulated batch.
+
     Args:
         df_succ_smis (pd.DataFrame): DataFrame of successful SMILES.
         tensor_HSQC (Tensor): Tensor of HSQC data.
+        tensor_COSY (Tensor): Tensor of COSY data (must match ``tensor_HSQC``
+            sample ordering).
         sgnn_means_stds (dict): Dictionary of means and standard deviations for sgnn.
         config (object): Configuration object containing various settings.
 
     Returns:
-        tuple: Average similarity error and a list of similarity errors, or None if not applicable.
+        tuple: ``(avg_HSQC_error, avg_COSY_error, HSQC_error_list,
+        COSY_error_list, batch_data)``; ``(None,)*5`` when simulation fails or
+        nothing could be scored.
+
+    NOTE (known issue, left unchanged): failed samples append the sentinel value
+    ``9`` to the error lists (see the two ``except`` blocks), which inflates the
+    reported averages. The HSQC and COSY lists are also averaged using a shared
+    ``count`` that is incremented twice per sample.
     """
 
     try:
         print("run_sgnn_sim_calculations_if_possible_return_spectra")
         # import IPython; IPython.embed();
+        # Derive "<...>/SGNN_gen_folder_<ran_num>/sdf_<ran_num>" from the ML dump folder.
         parent_dir = os.path.dirname(config.ML_dump_folder)  # This gives you the 'exp_1' directory
         # Set the new dump folder path
         dump_folder = os.path.join(parent_dir, f"SGNN_gen_folder_{config.ran_num}", f"sdf_{config.ran_num}")
 
+        # First attempt: full batch (fractional GPU split is truncated to int)
         batch_data, failed_ids = sc.main_execute(df_succ_smis, sgnn_means_stds, dump_folder, int(config.batch_size / config.gpu_num))
     except Exception as e:
         # Handle exceptions from batch data execution
         return None, None, None, None, None
 
     ### run the single generations 
+    # Retry the failed subset with batch size 10 ...
     df_failed = df_succ_smis[df_succ_smis['sample-id'].isin(failed_ids)]   
     try:
          batch_data_add_1, failed_ids = sc.main_execute(df_failed, sgnn_means_stds, dump_folder, 10)
@@ -299,6 +367,7 @@ def run_sgnn_sim_calculations_if_possible_return_spectra(df_succ_smis, tensor_HS
         return None, None, None, None, None
 
     ### run the single generations 
+    # ... and finally one-by-one.
     df_failed = df_succ_smis[df_succ_smis['sample-id'].isin(failed_ids)]   
     try:
          batch_data_add_2, failed_ids = sc.main_execute(df_failed, sgnn_means_stds, dump_folder, 1)
@@ -306,9 +375,11 @@ def run_sgnn_sim_calculations_if_possible_return_spectra(df_succ_smis, tensor_HS
         # Handle exceptions from batch data execution
         return None, None, None, None, None
 
+    # Merge all simulations that produced an SDF file.
     batch_data = pd.concat([batch_data, batch_data_add_1, batch_data_add_2], ignore_index=True)
     mode = f"{config.matching}_{config.padding}"
 
+    # Unknown modes fall back to index -1 (last column) instead of raising.
     mode_dict = {
         "MinSum_Zero": 0, "EucDis_Zero": 1, "HungDist_Zero": 2,
         "MinSum_Trunc": 3, "EucDis_Trunc": 4, "HungDist_Trunc": 5,
@@ -320,12 +391,15 @@ def run_sgnn_sim_calculations_if_possible_return_spectra(df_succ_smis, tensor_HS
     sim_error_list_COSY = []
     count = 0
 
+    # --- HSQC pass -------------------------------------------------------
     for sample_id, sdf_path in zip(batch_data["sample-id"],batch_data["sdf_path"]):
+        # The leading integer of the sample id indexes the ground-truth tensor.
         idx = sample_id.split("_")[0]
 
         try:
             sgnn_sim_df = sf.load_HSQC_dataframe_from_file(sdf_path)
             numpy_HSQC = tensor_HSQC[int(idx)].cpu().numpy()
+            # 2 columns => (F2, F1); 3 columns additionally carry peak direction.
             columns = ['F2 (ppm)', 'F1 (ppm)'] + (["direction"] if numpy_HSQC.shape[-1] == 3 else [])
             pd_df_HSQC = pd.DataFrame(numpy_HSQC, columns=columns)
 
@@ -339,7 +413,9 @@ def run_sgnn_sim_calculations_if_possible_return_spectra(df_succ_smis, tensor_HS
             #import IPython; IPython.embed();
 
 
+    # --- COSY pass -------------------------------------------------------
     for sample_id, sdf_path in zip(batch_data["sample-id"],batch_data["sdf_path"]):
+        # The leading integer of the sample id indexes the ground-truth tensor.
         idx = sample_id.split("_")[0]
 
         try:
@@ -359,6 +435,8 @@ def run_sgnn_sim_calculations_if_possible_return_spectra(df_succ_smis, tensor_HS
 
     if count == 0:
         return None, None, None, None, None
+    # ``count`` counts successful comparisons across both passes, so each
+    # average is effectively halved relative to a per-spectrum mean.
     avg_sim_error_HSQC = sum(sim_error_list_HSQC)/count
     sim_error_list_HSQC = [float(x) for x in sim_error_list_HSQC]
     
@@ -367,6 +445,10 @@ def run_sgnn_sim_calculations_if_possible_return_spectra(df_succ_smis, tensor_HS
 
     return avg_sim_error_HSQC, avg_sim_error_COSY, sim_error_list_HSQC, sim_error_list_COSY, batch_data
 
+# ------------------------------------------------------------------------------
+# Legacy (disabled) helpers below: create_metric() and the tensor->SMILES
+# decoders. They are not imported anywhere in the current code base.
+# ------------------------------------------------------------------------------
 '''
 def create_metric(gen_smis, trg_smis):
     """

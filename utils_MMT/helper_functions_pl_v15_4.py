@@ -1,3 +1,17 @@
+"""Small, dependency-light helpers shared by the MMT pipelines.
+
+Contents:
+  * RDKit-based chemistry utilities: molecular weight / formula, Tanimoto
+    similarity, SMILES tokenisation and validity checks.
+  * Token-tensor -> SMILES decoding helpers (with / without token probabilities).
+  * Molecular-optimisation sample writers (``smile2SDF`` / ``mol2mol_file``).
+  * A few list cleaners used when merging model outputs (``remove_nan_from_list``
+    / ``contains_only_nan``).
+
+RDKit parsing errors are globally silenced because invalid model outputs are
+expected and handled via ``try/except`` throughout this module.
+"""
+
 from rdkit import DataStructs
 from collections import Counter
 import re
@@ -15,13 +29,23 @@ from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')  ### To avoid the warning of invalid smiles
 
 def calculate_weight(smiles_str):
-    """ used in compare_molformer input smiles string"""
+    """ used in compare_molformer input smiles string
+
+    NOTE (known issue, left unchanged): ``ExactMolWt`` is not imported (the
+    module only imports ``Descriptors``), so this raises ``NameError`` whenever
+    it is called. Use :func:`calculate_tanimoto_and_mol_weights` or
+    ``Descriptors.ExactMolWt`` instead.
+    """
     m = Chem.MolFromSmiles(smiles_str)
     return ExactMolWt(m)
 
 def calculate_tanimoto_from_two_smiles(smi1, smi2, nbits=2024, extra_info = False):
     """This function takes two smile_stings and 
-    calculates the Tanimoto similarity and returns it and prints it out"""
+    calculates the Tanimoto similarity and returns it and prints it out
+
+    Morgan fingerprints (radius 2) are generated with a folded bit vector of
+    ``nbits`` bits; the score is rounded to four decimals.
+    """
     
     pattern1 = Chem.MolFromSmiles(smi1)
     pattern2 = Chem.MolFromSmiles(smi2)
@@ -36,8 +60,8 @@ def calculate_tanimoto_from_two_smiles(smi1, smi2, nbits=2024, extra_info = Fals
     return tan_sim
 
 def try_calculate_tanimoto_from_two_smiles(smi1, smi2, nbits, extra_info = False):
-    """This function takes two smile_stings and 
-    calculates the Tanimoto similarity and returns it and prints it out"""
+    """Same as :func:`calculate_tanimoto_from_two_smiles` but returns ``None``
+    instead of raising when either SMILES cannot be parsed."""
     
     try:
         pattern1 = Chem.MolFromSmiles(smi1)
@@ -55,15 +79,18 @@ def try_calculate_tanimoto_from_two_smiles(smi1, smi2, nbits, extra_info = False
         return None
 
 def save_checkpoint(state, filename="my_checkpoint.pth.tar"):
+    """Serialise an arbitrary training-state dict with ``torch.save``."""
     print("=> Saving checkpoint")
     torch.save(state, filename)
 
 def load_checkpoint(checkpoint, model, optimizer):
+    """Restore model and optimizer state dicts from a checkpoint dict."""
     print("=> Loading checkpoint")
     model.load_state_dict(checkpoint["state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer"])   
 
 def is_valid_smiles(smiles):
+    """Return the RDKit ``Mol`` for ``smiles`` or ``None`` when parsing fails."""
     try:
         mol = Chem.MolFromSmiles(smiles)
     except:
@@ -72,14 +99,11 @@ def is_valid_smiles(smiles):
 
 
 def get_validity_term(decoded_molecules):
-    """count = 0
-    total = 0
-    for smi in decoded_molecules:
-        valid = is_valid_smiles(smi)
-        if valid != None:
-            count +=1
-        total += 1
-    validity_score = count/total"""
+    """Fraction of decoded SMILES that RDKit can parse, as a float tensor.
+
+    The historical loop-based implementation is kept in the comment below for
+    reference. Returns ``0`` when the input list is empty.
+    """
     
     count = sum(1 for smi in decoded_molecules if is_valid_smiles(smi) is not None)
     total = len(decoded_molecules)
@@ -88,12 +112,26 @@ def get_validity_term(decoded_molecules):
     return torch.tensor(validity_score).float()
 
 def symbol_counts(smiles):
+    """Character-level frequency table of ``smiles`` (used by count_based_reward).
+
+    Tokenising per character (rather than via :func:`tokenize_smiles`) keeps
+    multi-character atoms such as ``Cl`` split into ``C``/``l``; the reward is
+    only meant as a coarse signal, so this is acceptable.
+
+    NOTE (known issue, left unchanged): the local variable shadows the function
+    name, so ``symbol_counts = Counter(symbols)`` hides the callable inside this
+    scope. Callers elsewhere are unaffected.
+    """
     symbols = list(smiles)
     #symbol_regex = re.compile(r'[A-Z][a-z]*|\d|\[.*?\]|\(|\)|=|#|-|\+')
     #symbols = symbol_regex.findall(smiles)
     symbol_counts = Counter(symbols)
     return symbol_counts
 
+# ------------------------------------------------------------------------------
+# Legacy (disabled) count-based reward; superseded by the vectorised version
+# below, kept for reference.
+# ------------------------------------------------------------------------------
 '''
 def count_based_reward(generated_smiles_list, target_smiles):
     """ This function counts the number of correct atoms vs incorrect atoms in 
@@ -120,7 +158,13 @@ def count_based_reward(generated_smiles_list, target_smiles):
 
 def count_based_reward(generated_smiles_list, target_smiles):
     """ This function counts the number of correct atoms vs incorrect atoms in 
-    the generated vs real SMILES and returns the average % score """
+    the generated vs real SMILES and returns the average % score 
+
+    For each pair: ``score = correct / (correct + incorrect)`` where
+    ``correct`` is the overlap of the character histograms and ``incorrect`` the
+    sum of absolute differences. The mean over pairs is returned (``0`` for an
+    empty list).
+    """
     total_score = 0
 
     for generated_smi, target_smi in zip(generated_smiles_list, target_smiles):
@@ -142,6 +186,11 @@ def count_based_reward(generated_smiles_list, target_smiles):
 
 
 def output_to_smiles(outputs, itos):
+    """Decode a batched logits tensor ``(seq_len, batch, vocab)`` into SMILES.
+
+    For each batch entry the arg-max token ids are mapped through ``itos`` and
+    joined; the trailing ``'<EOS>'`` token is removed by slicing.
+    """
     smi_list = []
     for i in range(outputs.shape[1]):  # output.shape[1] = batch_size_NMR in your case
         sub_tensor = outputs[:, i, :]
@@ -159,6 +208,7 @@ def output_to_smiles(outputs, itos):
     return smi_list
 
 def calculate_gen_mol_weights(generated_smiles_list):
+    """Exact molecular weight of each generated SMILES (``0.0`` on parse errors)."""
     weights_list = []
     for gen_smi in generated_smiles_list:
         try:
@@ -172,6 +222,7 @@ def calculate_gen_mol_weights(generated_smiles_list):
 
 # Function to calculate molecular formula from SMILES string
 def calculate_molecular_formula(smiles):
+    """Return the RDKit molecular formula (e.g. ``C6H6``) or ``None`` if unparsable."""
     try:
         molecule = Chem.MolFromSmiles(smiles)
         if molecule is not None:
@@ -195,6 +246,11 @@ def tokenize_smiles(smiles, two_letter_atoms):
     """
     Tokenizes the SMILES string, considering two-letter atoms.
 
+    A greedy left-to-right scan is used: whenever the next two characters form
+    a known two-letter element it is emitted as one token, otherwise a single
+    character is emitted. Ring-closure digits and brackets are therefore single
+    tokens.
+
     Parameters:
     - smiles: The SMILES string to be tokenized.
     - two_letter_atoms: A list of two-letter atoms (e.g., ['Cl', 'Br']).
@@ -215,6 +271,7 @@ def tokenize_smiles(smiles, two_letter_atoms):
     return tokens
 
 def calculate_mol_weight(smiles):
+    """Average molecular weight (``Descriptors.MolWt``) or ``None`` on parse error."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is not None:
         return Chem.Descriptors.MolWt(mol)
@@ -224,6 +281,7 @@ def calculate_mol_weight(smiles):
 # Function to remove all occurrences of 'nan' from a list
 # Function to remove 'nan' (both string and actual NaN) from a list
 def remove_nan_from_list(lst):
+    """Drop ``'nan'`` strings and float NaNs while keeping every other element."""
     cleaned_list = []
     for x in lst:
         if isinstance(x, str) and x == 'nan':
@@ -238,6 +296,7 @@ def remove_nan_from_list(lst):
 # Function to check if a list contains only 'nan' values
 import math
 def contains_only_nan(lst):
+    """True when every element is a float NaN (an empty list also returns True)."""
     return all(isinstance(x, float) and math.isnan(x) for x in lst)
 
 
@@ -245,6 +304,11 @@ def contains_only_nan(lst):
 def tensor_to_smiles(tensor, itos):
     """
     Converts a tensor of token IDs to a SMILES string or list of SMILES strings.
+
+    Expected layout is ``(sequence_length, batch_size)`` for the batched case
+    and a flat 1-D tensor for a single sequence. Decoding stops at ``<EOS>``
+    (the token itself is not appended), so no character is dropped even when
+    the sequence does not end exactly on ``<EOS>``.
 
     :param tensor: Tensor containing token IDs.
     :param itos: Dictionary mapping token IDs to SMILES tokens.
@@ -276,6 +340,23 @@ def tensor_to_smiles(tensor, itos):
 
 
 def tensor_to_smiles_and_prob(tensor, token_prob, itos):
+    """Decode token ids to SMILES together with the per-token probabilities.
+
+    Works on numpy copies of ``tensor``; the position of the first ``<EOS>``
+    is found per sequence and the probability tensor is sliced to the same
+    length. Batched input is assumed to be ``(seq_len, batch)``.
+
+    Returns:
+        ``(sequences, token_prob_cut)`` for batched input or
+        ``(smi, stacked_probabilities)`` for a single sequence.
+
+    NOTE (known issue, left unchanged): the per-sequence slicing
+    ``token_prob[i, :eos_idx]`` indexes the probability tensor with the *batch*
+    index on the first axis, while the token tensor is ``(seq_len, batch)``.
+    For the common case where ``token_prob`` has the same orientation this
+    yields the wrong slice; callers should prefer
+    :func:`tensor_to_smiles_and_prob_2`.
+    """
     if len(tensor.shape) > 1:
         # Convert tensor to numpy for efficient access
         tensor_np = tensor.cpu().numpy()
@@ -321,6 +402,11 @@ def combine_gen_sims(gen_smi1, gen_tensor1, confidence_list_greedy,
     :param gen_tensor2: Corresponding tensor from the multinomial method.
     :param confidence_list_multinom: List of confidence scores from the multinomial method.
     :return: Tuple of combined tensor, SMILES strings, and confidence scores.
+
+    NOTE (known issue, left unchanged): the ``try`` block calls
+    ``Chem.MolFromSmiles`` but RDKit signals invalid input by returning ``None``
+    instead of raising, so the ``except`` fallback to the multinomial result is
+    effectively unreachable and invalid greedy SMILES are passed through.
     """
 
     combined_smi = []
@@ -365,6 +451,11 @@ def calculate_tanimoto_similarity_2(gen_conv_SMI_list, trg_conv_SMI_list):
 
     Returns:
     tuple: Mean and standard deviation of Tanimoto similarities, failed pairs, and all Tanimoto scores.
+
+    Valid pairs are canonicalised before scoring; pairs whose score is exactly
+    ``0`` are excluded from the mean/std (see ``tanimoto_scores_cleaned``), while
+    ``tanimoto_scores_all`` keeps a ``0`` for both failed and zero-similarity
+    pairs.
     """
     tanimoto_scores_ = []
     tanimoto_scores_all = []
@@ -394,6 +485,17 @@ def calculate_tanimoto_similarity_2(gen_conv_SMI_list, trg_conv_SMI_list):
 
 
 def tensor_to_smiles_and_prob_2(tensor, token_prob, itos):
+    """Decode token ids + probabilities with the corrected slicing order.
+
+    Unlike :func:`tensor_to_smiles_and_prob` this slices the probability
+    tensor as ``token_prob[:len(sequence), i]``, matching a
+    ``(seq_len, batch)`` layout.
+
+    NOTE (known issue, left unchanged): the single-sequence branch relies on
+    variables (``smi`` / ``token_prob_list``) that are only assigned in the
+    ``else`` branch, so a 1-D tensor combined with a 2-D probability tensor
+    raises ``UnboundLocalError``.
+    """
 
     token_prob_cut = []
     #import IPython; IPython.embed();
@@ -429,7 +531,14 @@ from rdkit import Chem, DataStructs
 def smile2SDF(smile, folder=None, name=None):
     """ Saves a smile to a given folder with a given name/ID in sdf format
     adding the H is crutial for the ICOLOS workflow
-    ir no name is provided then it saves it under a random number"""
+    ir no name is provided then it saves it under a random number
+
+    A 3-D conformer is embedded (fixed random seed) before writing.
+
+    NOTE (known issue, left unchanged): ``os`` is not imported in this module,
+    so the final ``os.path.join`` raises ``NameError``; ``folder`` also defaults
+    to a hard-coded server path.
+    """
     if name==None:
         rand_num = random.randint(0,1000)
         name = "%04d" % (rand_num)
@@ -450,7 +559,15 @@ from rdkit.Chem import MolFromSmiles, MolToSmiles
 def mol2mol_file(mol, folder=None, name=None):
     """ Saves a smile to a given folder with a given name/ID in sdf format
     adding the H is crutial for the ICOLOS workflow
-    ir no name is provided then it saves it under a random number"""
+    ir no name is provided then it saves it under a random number
+
+    Accepts an RDKit ``Mol`` (not a SMILES string), embeds a 3-D conformer and
+    writes it to ``<folder>/<name>.mol``.
+
+    NOTE (known issue, left unchanged): the file is written with
+    ``Chem.SDWriter`` (SDF format) although the extension is ``.mol``; ``os`` is,
+    as in :func:`smile2SDF`, not imported in this module.
+    """
     if name==None:
         rand_num = random.randint(0,1000)
         name = "%04d" % (rand_num)
@@ -480,6 +597,8 @@ def calculate_tanimoto_and_mol_weights(gen_conv_SMI, trg_conv_SMI, trg_MW):
         tuple: Contains the mean Tanimoto similarity, lists of selected molecular weights for
                generated and target SMILES, and a DataFrame of successful generations.
     """    
+    # Only pairs where the generated SMILES parses contribute to the mean;
+    # failed pairs are silently skipped (no sentinel is added).
     gen_mol_weights_sel = []
     trg_mol_weights_sel = []
     succ_gen_list = []

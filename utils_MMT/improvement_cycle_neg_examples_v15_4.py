@@ -1,3 +1,25 @@
+"""Improvement-cycle driver for negative (non-hit) examples.
+
+This module implements one iteration of the "active improvement" loop used to
+mine additional candidate molecules from the pretrained MMT model:
+
+1. Split the generated SMILES table into fixed-size chunks.
+2. For each chunk, run the full inference / scoring pipeline on simulated
+   spectra to obtain a baseline snapshot ("before" results).
+3. Generate new molecules with the molecular-optimisation (MF) model, augment
+   the training data with them, re-generate simulated spectra and fine-tune
+   the MMT transformer on the augmented set.
+4. Re-run the same inference / scoring pipeline on the new checkpoint and store
+   the "after" results next to the "before" ones.
+
+All artefacts (configs, pickles, checkpoints) are written under
+``config.model_save_dir`` using timestamped chunk/run folder names.
+
+NOTE: this module contains a few pre-existing defects that are intentionally
+left unchanged (see the individual ``NOTE (known issue...)`` comments) because
+the current task only adds documentation.
+"""
+
 import os
 from typing import List, Dict, Any, Union, Tuple
 import pandas as pd
@@ -31,6 +53,17 @@ import utils_MMT.run_batch_gen_val_MMT_v15_4 as rbgvm
 
 
 def load_json_dics():
+    """Load the character<->index vocabularies used by the MMT tokenizer.
+
+    The four JSON files are expected in the current working directory:
+    ``itos.json`` / ``stoi.json`` (MMT) and ``itos_MF`` / ``stoi_MF``
+    (molecular-formula model).
+
+    NOTE (known issue, left unchanged): reading from ``./`` means the caller
+    must ``chdir`` to the folder that holds these vocabularies, otherwise an
+    ``FileNotFoundError`` is raised at import time (see the module-level call
+    below).
+    """
     with open('./itos.json', 'r') as f:
         itos = json.load(f)
     with open('./stoi.json', 'r') as f:
@@ -41,16 +74,20 @@ def load_json_dics():
         itos_MF = json.load(f)    
     return itos, stoi, stoi_MF, itos_MF
     
+# Vocabularies are loaded eagerly at import time; ``rand_num`` is a per-process
+# run tag that can be appended to generated file names to avoid collisions.
 itos, stoi, stoi_MF, itos_MF = load_json_dics()
 rand_num = str(random.randint(1, 10000000))
 
 
 def split_dataset(config, chunk_size: int) -> List[pd.DataFrame]:
+    """Split the generated-SMILES CSV into consecutive ``chunk_size`` row blocks."""
     df = pd.read_csv(config.SGNN_csv_gen_smi)
     return [df[i:i+chunk_size] for i in range(0, len(df), chunk_size)]
 
 
 def create_chunk_folder(config, idx: int) -> str:
+    """Create and return a timestamped folder that holds one chunk's artefacts."""
     base_dir = config.model_save_dir
     current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
     chunk_folder_name = f"chunk_{idx:03d}_{current_datetime}"
@@ -62,6 +99,17 @@ def create_chunk_folder(config, idx: int) -> str:
     return chunk_folder_path
 
 def test_pretrained_model_on_sim_data_before(config, IR_config, stoi, itos, stoi_MF, itos_MF, chunk, idx):
+    """Baseline evaluation of the pretrained model on simulated spectra.
+
+    Runs data preparation, IR/NMR simulation, inference and scoring for a single
+    data chunk and persists the metrics as the "before" snapshot. The function
+    returns the (mutated) ``config`` so callers can keep using the updated paths.
+
+    NOTE (known issue, left unchanged): ``MW_filter`` / ``greedy_full`` are
+    assigned but never used here; the equivalent flags in
+    :func:`test_model_performance` are hard-coded, so changing them here has no
+    effect.
+    """
     MW_filter, greedy_full = True, False
     
     print("prepare_data")
@@ -82,6 +130,12 @@ def test_pretrained_model_on_sim_data_before(config, IR_config, stoi, itos, stoi
     return config
 
 def prepare_data(config: Any, chunk: pd.DataFrame) -> Any:
+    """Write the chunk to disk and point the config at the new CSV.
+
+    The chunk is materialised inside ``config.pkl_save_folder`` so that all
+    downstream helpers (which only know the config object) read the subset
+    instead of the full generated table.
+    """
     chunk_csv_path = os.path.join(config.pkl_save_folder, "SGNN_csv_gen_smi.csv")
     chunk.to_csv(chunk_csv_path)
     config.SGNN_csv_gen_smi = chunk_csv_path 
@@ -89,6 +143,12 @@ def prepare_data(config: Any, chunk: pd.DataFrame) -> Any:
     return config
 
 def generate_simulated_data(config: Any, IR_config: Any) -> Any:
+    """Generate simulated NMR/IR data for the current chunk.
+
+    Sets ``execution_type`` to ``"data_generation"`` (used downstream to pick
+    generator branches), calls :func:`execution_function.gen_sim_aug_data` and
+    snapshots the original data paths so they can be restored later.
+    """
     config.execution_type = "data_generation"
     if config.execution_type == "data_generation":
         print("\033[1m\033[31mThis is: data_generation\033[0m")
@@ -99,6 +159,7 @@ def generate_simulated_data(config: Any, IR_config: Any) -> Any:
     return config
 
 def backup_config_paths(config: Any) -> None:
+    """Deep-copy the simulated-data paths into ``*_backup`` fields on the config."""
     config.csv_1H_path_SGNN_backup = copy.deepcopy(config.csv_1H_path_SGNN)
     config.csv_13C_path_SGNN_backup = copy.deepcopy(config.csv_13C_path_SGNN)
     config.csv_HSQC_path_SGNN_backup = copy.deepcopy(config.csv_HSQC_path_SGNN)
@@ -106,6 +167,7 @@ def backup_config_paths(config: Any) -> None:
     config.IR_data_folder_backup = copy.deepcopy(config.IR_data_folder)
 
 def save_results_before(results: Dict[str, Any], config: Any, idx: int) -> None:
+    """Persist the baseline metrics as a pickled dict named ``before_sim_data``."""
     variables_to_save = {
         'avg_tani_bl_ZINC': results['avg_tani_bl_ZINC_'],
         'results_dict_greedy_bl_ZINC': results.get('results_dict_greedy_bl_ZINC_'),
@@ -119,6 +181,7 @@ def save_results_before(results: Dict[str, Any], config: Any, idx: int) -> None:
     save_data_with_datetime_index(variables_to_save, config.pkl_save_folder, "before_sim_data", idx)
 
 def create_run_folder(chunk_folder, idx):
+    """Create and return a timestamped run folder inside ``chunk_folder``."""
     current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_folder_name = f"run_{idx}_{current_datetime}"
     run_folder_path = os.path.join(chunk_folder, run_folder_name)
@@ -129,6 +192,12 @@ def create_run_folder(chunk_folder, idx):
     return run_folder_path
 
 def fine_tune_model_aug_mol(config, IR_config, stoi, stoi_MF, chunk, idx):
+    """Augment with MF-generated molecules, then fine-tune the MMT model.
+
+    Saves new checkpoints into ``config.current_run_folder`` and restores the
+    previous ``model_save_dir`` before returning. Only runs training when
+    ``execution_type`` is ``"transformer_improvement"``.
+    """
     #import IPython; IPython.embed();
     config, all_gen_smis, aug_mol_df = generate_augmented_molecules_from_aug_mol(config, IR_config, chunk, idx)
     
@@ -147,6 +216,15 @@ def fine_tune_model_aug_mol(config, IR_config, stoi, stoi_MF, chunk, idx):
 
 
 def generate_augmented_molecules_from_aug_mol(config, IR_config, chunk, idx):
+    """Generate MF molecules, blend them into the training data, re-simulate spectra.
+
+    The chunk is written into the vendored ``deep-molecular-optimization``
+    working folder because the MF generator hard-codes that input path.
+
+    NOTE (known issue, left unchanged): ``final_df`` returned by
+    :func:`execution_function.blend_aug_with_train_data` is discarded; the
+    blended frame is only propagated through the config side effects.
+    """
     #import IPython; IPython.embed();
 
     ############# THis is just relevant for the augmented molecules #############
@@ -202,6 +280,16 @@ def fine_tune_model(config, stoi, stoi_MF, chunk, idx):
     return config, aug_mol_df, all_gen_smis
 
 def generate_augmented_molecules(config, chunk, idx):
+    """Augment a chunk with MF-generated molecules and re-simulate spectra.
+
+    NOTE (known issue, left unchanged): this function references the free
+    variable ``IR_config`` (line ``config = ex.gen_sim_aug_data(config, IR_config)``)
+    even though it is not a parameter, so calling it raises ``NameError``. It is
+    currently unused by the live pipeline (only the ``*_from_aug_mol`` variant
+    is called), hence the defect is left in place. Also note
+    ``create_model_save_dir`` used by :func:`fine_tune_model` does not exist in
+    this module, so that path would fail as well.
+    """
     #import IPython; IPython.embed();
     script_dir = os.getcwd()
     
@@ -231,10 +319,16 @@ def generate_augmented_molecules(config, chunk, idx):
 
 
 def generate_smiles_mf(config):
+    """Run the molecular-formula (MF) SMILES generator via the execution layer."""
     print("\033[1m\033[31mThis is: SMI_generation_MF\033[0m")
     return ex.SMI_generation_MF(config, stoi, stoi_MF, itos, itos_MF)
 
 def process_generated_smiles(results_dict_MF, config):
+    """Clean MF outputs and merge them into a single ranked SMILES list.
+
+    Drops keys whose lists contain only NaNs, strips NaN entries from the rest,
+    then lets the clustering visualiser pick/merge representatives.
+    """
     results_dict_MF = {key: value for key, value in results_dict_MF.items() if not hf.contains_only_nan(value)}
     for key, value in results_dict_MF.items():
         results_dict_MF[key] = hf.remove_nan_from_list(value)
@@ -243,6 +337,7 @@ def process_generated_smiles(results_dict_MF, config):
     return combined_list_MF
 
 def filter_and_combine_smiles(config, combined_list_MF):
+    """Remove ``'NAN'`` placeholders and drop molecules already in the val split."""
     print("\033[1m\033[31mThis is: combine_MMT_MF\033[0m")
     all_gen_smis = combined_list_MF
     all_gen_smis = [smiles for smiles in all_gen_smis if smiles != 'NAN']
@@ -252,11 +347,13 @@ def filter_and_combine_smiles(config, combined_list_MF):
     return all_gen_smis
 
 def create_augmented_dataframe(all_gen_smis):
+    """Wrap generated SMILES in a DataFrame with ``GT_0000001``-style sample ids."""
     length_of_list = len(all_gen_smis)
     random_number_strings = [f"GT_{str(i).zfill(7)}" for i in range(1, length_of_list + 1)]
     return pd.DataFrame({'SMILES': all_gen_smis, 'sample-id': random_number_strings})
 
 def setup_data_paths(config):
+    """Hard-coded ACD-simulated and experimental dataset paths (legacy server layout)."""
     base_path_acd = "/projects/cc/se_users/knlr326/1_NMR_project/1_NMR_data_AZ/37_Richard_ACD_sim_data/"
     config.csv_1H_path_ACD = f"{base_path_acd}ACD_1H_with_SN_filtered_v3.csv"
     config.csv_13C_path_ACD = f"{base_path_acd}ACD_13C_with_SN_filtered_v3.csv"
@@ -273,6 +370,11 @@ def setup_data_paths(config):
     return config
 
 def test_model_on_neg_dataset(config, IR_config, stoi, itos, stoi_MF, itos_MF, chunk, composite_idx, aug_mol_df, all_gen_smis):
+    """Evaluate the fine-tuned model on the negative/simulated chunk.
+
+    Temporarily clears ``pickle_file_path`` (forces a fresh dataset build) and
+    restores the original ``checkpoint_path`` afterwards.
+    """
     checkpoint_path_backup = config.checkpoint_path    
     config.pickle_file_path = ""
     config.training_mode = "1H_13C_HSQC_COSY_IR_MF_MW"
@@ -281,6 +383,13 @@ def test_model_on_neg_dataset(config, IR_config, stoi, itos, stoi_MF, itos_MF, c
     return config
 
 def test_on_data(config, IR_config, stoi, itos, stoi_MF, itos_MF, chunk, composite_idx, data_type, aug_mol_df, all_gen_smis):
+    """Run inference + scoring against the latest checkpoint of the current run.
+
+    ``data_type`` selects which dataset is evaluated: ``"sim"`` restores the
+    backed-up simulated paths; the commented-out branch would build temporary
+    CSVs for ACD/experimental data. Results (plus the augmented molecules for
+    ``"sim"``) are pickled by :func:`save_results_acd_exp`.
+    """
     if data_type == 'sim':
         restore_backup_configs(config)
     #else:
@@ -307,6 +416,7 @@ def test_on_data(config, IR_config, stoi, itos, stoi_MF, itos_MF, chunk, composi
     return config
 
 def restore_backup_configs(config):
+    """Roll the config paths back to the pre-simulation snapshots."""
     config.csv_1H_path_SGNN = config.csv_1H_path_SGNN_backup
     config.csv_13C_path_SGNN = config.csv_13C_path_SGNN_backup
     config.csv_HSQC_path_SGNN = config.csv_HSQC_path_SGNN_backup
@@ -333,9 +443,11 @@ def process_spectrum_data(config: Any, sample_ids: List[str], data_type: str) ->
     
     
 def select_relevant_samples(df: pd.DataFrame, sample_ids: List[str]) -> pd.DataFrame:
+    """Filter ``df`` down to rows whose ``sample-id`` is in ``sample_ids``."""
     return df[df['sample-id'].isin(sample_ids)]
 
 def save_and_update_config(config, data_type: str, spectrum_type: str, data: pd.DataFrame) -> Tuple[str, Any]:
+    """Write ``data`` to a temporary CSV and point ``config.csv_<type>_path_SGNN`` at it."""
     temp_dir = tempfile.mkdtemp()
     dummy_path = os.path.join(temp_dir, f"{data_type}_{spectrum_type}_selected_samples.csv")
     
@@ -347,10 +459,15 @@ def save_and_update_config(config, data_type: str, spectrum_type: str, data: pd.
     return dummy_path, config
 
 def update_config_settings(config: Any) -> None:
+    """Reset the validation path and force a fresh dataset build."""
     config.csv_path_val = config.csv_1H_path_SGNN
     config.pickle_file_path = ""
 
 def get_last_checkpoint(model_folder: str) -> str:
+    """Return the most recently modified ``.ckpt`` file inside ``model_folder``.
+
+    Raises ``ValueError`` when the folder contains no checkpoints.
+    """
     checkpoints = [f for f in os.listdir(model_folder) if f.endswith('.ckpt')]
     if not checkpoints:
         raise ValueError(f"No checkpoints found in {model_folder}")
@@ -359,6 +476,7 @@ def get_last_checkpoint(model_folder: str) -> str:
     return os.path.join(model_folder, last_checkpoint)
 
 def load_model_and_data(config: Any, stoi: Dict, stoi_MF: Dict) -> Tuple[Any, Any, Any]:
+    """Build the single- and multi-spectrum val loaders and load the MMT model."""
     #import IPython; IPython.embed();
 
     val_dataloader = mrtf.load_data(config, stoi, stoi_MF, single=True, mode="val")
@@ -368,6 +486,16 @@ def load_model_and_data(config: Any, stoi: Dict, stoi_MF: Dict) -> Tuple[Any, An
 
 def test_model_performance(config: Any, model_MMT: Any, val_dataloader: Any, val_dataloader_multi: Any, 
                            stoi: Dict, itos: Dict, stoi_MF: Dict, itos_MF: Dict) -> Dict[str, Any]:
+    """Score the model with the standard CLIP + greedy-sampling battery.
+
+    Computes retrieval (Tanimoto) statistics for the CLIP head, greedy decoding
+    and the full ranking pass, prints a summary and returns a dict whose keys
+    carry a trailing underscore (matching the pickle schema below).
+
+    ``MW_filter`` is hard-coded ``True`` and ``greedy_full`` ``False``; the
+    latter selects the lightweight ``run_greedy_sampling`` path instead of the
+    exhaustive greedy search.
+    """
     print("\033[1m\033[31mThis is: test_performance\033[0m")
     
     MW_filter = True
@@ -405,6 +533,7 @@ def test_model_performance(config: Any, model_MMT: Any, val_dataloader: Any, val
     return results
 
 def save_results_acd_exp(results: Dict[str, Any], config: Any, data_type: str, composite_idx: str) -> None:
+    """Pickle the "after" metrics (and augmented molecules for ``sim`` runs)."""
     variables_to_save = {
         'avg_tani_bl_ZINC': results['avg_tani_bl_ZINC_'],
         'results_dict_greedy_bl_ZINC': results.get('results_dict_greedy_bl_ZINC_'),
@@ -429,6 +558,7 @@ def save_results_acd_exp(results: Dict[str, Any], config: Any, data_type: str, c
     )
 
 def save_data_with_datetime_index(data: Any, base_folder: str, name: str, idx: Union[int, str]) -> None:
+    """Pickle ``data`` to ``<base_folder>/<timestamp>_<name>_<idx>.pkl``."""
     current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{current_datetime}_{name}_{idx}.pkl"
     os.makedirs(base_folder, exist_ok=True)
