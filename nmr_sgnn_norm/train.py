@@ -1,3 +1,10 @@
+"""Single-experiment driver: data split -> build net -> train -> evaluate.
+
+Wires the parsed CLI args from ``main.py`` to the concrete dataset, the chosen
+message-passing / readout variant and the shared training loop, then reports
+test MAE/RMSE (per atom for 13C, per proton for 1H).
+"""
+
 import numpy as np
 
 import torch
@@ -17,6 +24,11 @@ import os
 
 
 def train(args):
+    """Run one full experiment and return ``(net, test_mae, test_rmse, time_per_mol)``.
+
+    ``args`` is the ``argparse.Namespace`` built in ``main.py``; the same fold
+    seed therefore always reproduces the same train/val/test split.
+    """
     target = args.target
     message_passing_mode = args.message_passing_mode
     readout_mode = args.readout_mode
@@ -30,9 +42,13 @@ def train(args):
 
     
 
+    # The 10-fold split below already reserves one fold for test; this ratio then
+    # carves a small validation slice out of the remaining 90%.
     data_split = [0.99, 0.01]
     batch_size = 128
     
+    # Inference-only switch, kept for debugging: flip to True to skip training
+    # and just load `model_path`.
     use_training = False
 
     # Create models/sgnn directory if it doesn't exist
@@ -40,6 +56,8 @@ def train(args):
     os.makedirs(model_dir, exist_ok=True)
     
     if memo is not None:
+        # `memo` is a free-form run tag so repeated runs of the same setting do
+        # not overwrite each other's checkpoint.
         model_path = os.path.join(model_dir, f'{target}_{graph_representation}_{message_passing_mode}_{readout_mode}_{fold_seed}_{memo}.pt')
     else:
         model_path = os.path.join(model_dir, f'{target}_{graph_representation}_{message_passing_mode}_{readout_mode}_{fold_seed}.pt')
@@ -49,21 +67,29 @@ def train(args):
 
     data = GraphDataset(target, graph_representation)
     kfold = RandomSplitter()
+    # Fold assignment is fixed by random_state=27407, so every fold seed sees the
+    # same ten partitions and only picks a different held-out fold.
     data_fold = kfold.k_fold_split(data, k=10, random_state=27407, log=False)
     trainval_set, test_set = data_fold[fold_seed]
 
     train_set, val_set = split_dataset(trainval_set, data_split, shuffle=True, random_state=random_seed)
 
+    # drop_last on the train loader keeps batch shapes uniform; the val/test
+    # loaders keep every molecule because the metrics are averages.
     train_loader = DataLoader(dataset=train_set, batch_size=batch_size, shuffle=True, collate_fn=collate_reaction_graphs, drop_last=True)
     val_loader = DataLoader(dataset=val_set, batch_size=batch_size, shuffle=False, collate_fn=collate_reaction_graphs)
     test_loader = DataLoader(dataset=test_set, batch_size=batch_size, shuffle=False, collate_fn=collate_reaction_graphs)
     
+    # Standardisation statistics are taken from the training split only.
     train_y = np.hstack([inst[-2][inst[-1]] for inst in iter(train_loader.dataset)])
     train_y_mean, train_y_std = np.mean(train_y), np.std(train_y)
 
     node_dim = data.node_attr.shape[1]
     edge_dim = data.edge_attr.shape[1]
 
+    # NOTE (known issue, left unchanged): the trailing .cuda() is hard-coded, so
+    # this crashes on a CPU-only machine ("Torch not compiled with CUDA enabled"
+    # or an AssertionError from the CUDA backend) before training can start.
     if message_passing_mode == 'proposed':
         net = nmr_mpnn_PROPOSED(node_dim, edge_dim, readout_mode, node_embedding_dim, readout_n_hidden_dim).cuda()
     elif message_passing_mode == 'baseline':
@@ -90,11 +116,16 @@ def train(args):
     test_y_pred, time_per_mol = inference(net, test_loader, train_y_mean, train_y_std)
     
     if target == '13C':
+        # One prediction per annotated carbon: index -3 is shift_test and the
+        # trailing mask restricts it to annotated atoms.
         test_y = np.hstack([inst[-3][inst[-1]] for inst in iter(test_loader.dataset)])
         test_mae = mean_absolute_error(test_y, test_y_pred)
         test_rmse = mean_squared_error(test_y, test_y_pred)**0.5
     
     elif target == '1H':
+        # The model predicts one (mean) shift per carbon, but the metric is per
+        # proton, so repeat each prediction as often as that carbon carries
+        # hydrogens (index -4 = numHshifts, index -3 = all individual shifts).
         test_y = np.hstack([inst[-3] for inst in iter(test_loader.dataset)])
         test_numHs = np.hstack([inst[-4] for inst in iter(test_loader.dataset)])
         test_y_pred2 = np.repeat(test_y_pred, test_numHs)

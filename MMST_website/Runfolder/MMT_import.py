@@ -1,3 +1,22 @@
+"""Central import hub for the MMST web app.
+
+Importing this module does three things, in order:
+
+1. put the repository root and ``models/chemprop-ir`` on ``sys.path`` so the
+   ``utils_MMT`` package and the vendored chemprop fork become importable;
+2. import the ``utils_MMT`` modules under short aliases used everywhere else
+   (``mrtf`` = result tests, ``ex`` = execution, ``mtf`` = transformer training,
+   ``dl`` = data generation, ``irs`` = IR simulation, ``cv``/``pt`` = plots,
+   ``hf`` = helpers);
+3. load the four token dictionaries (``itos``, ``stoi``, ``stoi_MF``,
+   ``itos_MF``) and a random run id.
+
+It also provides the small config helpers used by ``app.py``: JSON <-> config
+object conversion (attributes are read as ``config.foo``) and loading of the
+paired ``config_V8.json`` / ``ir_config_V8.json``. The JSON files are resolved
+relative to this file, so the app must keep its Runfolder layout.
+"""
+
 # Standard library imports
 import json
 import os
@@ -75,6 +94,11 @@ torch.cuda.device_count()
 
 
 def parse_arguments(hyperparameters):
+    """Turn a config dict into an attribute namespace (``config.target`` ...).
+
+    JSON stores everything as lists/dicts, so any single-element list or tuple is
+    unwrapped to its scalar before the namespace is built.
+    """
     parsed_args = {key: val[0] if isinstance(val, (list, tuple)) else val for key, val in hyperparameters.items()}
     return Namespace(**parsed_args)
 
@@ -96,6 +120,11 @@ def parse_arguments(hyperparameters):
 
 
 def load_json_dics():
+    """Load the four token dictionaries from the repository root.
+
+    Returns ``(itos, stoi, stoi_MF, itos_MF)`` — plain token <-> index maps used
+    by the transformer and the matched-molecular-pair generator.
+    """
     # Get the directory of the current script
     script_dir = os.path.dirname(__file__)
     
@@ -125,10 +154,19 @@ rand_num = str(random.randint(1, 10000000))
 
  
 def save_config(config, path):
+    """Dump a plain ``dict`` to ``path`` as JSON.
+
+    NOTE (known issue, left unchanged): every config in this app is an
+    ``argparse.Namespace`` (see ``parse_arguments``), and ``json.dump`` cannot
+    serialise that, so calling this with such an object raises
+    "TypeError: Object of type Namespace is not JSON serializable". Use
+    ``save_updated_config`` (which calls ``vars``) for namespace configs.
+    """
     with open(path, 'w') as f:
         json.dump(config, f)
  
 def load_config(path):
+    """Read one JSON config file; returns ``None`` when the file is missing."""
     try:
         with open(path, 'r') as f:
             return json.load(f)
@@ -137,6 +175,7 @@ def load_config(path):
 
  
 def save_updated_config(config, path):
+    """Persist a config namespace as JSON by dumping its ``__dict__``."""
     config_dict = vars(config)
     with open(path, 'w') as f:
         json.dump(config_dict, f, indent=4)
@@ -161,6 +200,11 @@ def save_updated_config(config, path):
 #     return IR_config, config
 
 def load_configs():
+    """Load both configs from ``Runfolder`` and return ``(IR_config, config)``.
+
+    ``IR_config`` is post-processed by chemprop's ``modify_predict_args`` so it
+    carries the defaults chemprop expects; both are attribute namespaces.
+    """
     # Get the directory of the current script
     script_dir = os.path.dirname(__file__)
     
@@ -191,6 +235,7 @@ def load_configs():
 # itos, stoi, stoi_MF, itos_MF = load_json_dics()
 
 def plot_first_smiles(csv_path):
+    """Quick debug helper: draw and pop up the first SMILES of a CSV."""
     # Load the CSV file
     df = pd.read_csv(csv_path)
     # Extract the first SMILES string
@@ -203,6 +248,12 @@ def plot_first_smiles(csv_path):
     img.show()
 
 def sim_and_display():
+    """Simulate all spectra for the SMILES CSV named in the config.
+
+    Cleans the SGNN input CSV, runs the full data-generation pipeline with the
+    IR model, then copies the generated paths into the ``*_display`` config keys
+    (which the plotting routes read), saves the config and returns it.
+    """
     print("="*50)
     print("sim_and_display function called")
     try:
@@ -214,6 +265,10 @@ def sim_and_display():
         print(f"SGNN_csv_gen_smi path: {config.SGNN_csv_gen_smi}")
         
         # Ensure the path doesn't have a leading slash when checking file existence
+        # NOTE (known issue, left unchanged): only this local copy is stripped.
+        # config.csv_SGNN_gen_smi / csv_SMI_targets keep the leading slash, so on
+        # Windows (where "/data/x.csv" is not a valid absolute path) the guard
+        # passes but the generation step below fails to open the file.
         csv_path = config.SGNN_csv_gen_smi
         if csv_path.startswith('/'):
             csv_path = csv_path[1:]

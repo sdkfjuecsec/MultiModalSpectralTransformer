@@ -1,4 +1,27 @@
-
+#!/bin/bash
+#
+# Experiment sweep for the SGNN NMR shift predictor.
+#
+# Purpose
+#   Reproduce the paper's four ablations over all 10 folds and both nuclei:
+#     Proposed  : PAGTN message passing + graph-aware (Set2Set) readout
+#     SG-IR     : NNConv message passing  + graph-aware readout
+#     SG-IMP    : PAGTN message passing   + per-atom readout
+#     SG-Only   : NNConv message passing  + per-atom readout
+#
+# Usage
+#   bash run.sh          (run from inside nmr_sgnn_norm/; it writes to ./result/)
+#
+# The block of commented-out commands at the top is the older variant that
+# trained with main.py directly; the live block below evaluates an existing
+# checkpoint instead.
+#
+# NOTE (known issue, left unchanged): the live calls below pass
+#   --readout_mode proposed_set2set
+# but main.py only accepts the choices 'proposed' and 'baseline', so argparse
+# exits with "invalid choice: 'proposed_set2set'". Additionally eval_by_range.py
+# and make_all_preds.py are not part of this repository, so every command fails
+# with "can't open file" even after the choice error is worked around.
 
 
 # for fold_seed in {0..2}
@@ -26,6 +49,8 @@
 # done
 
 
+# --- Per-fold evaluation of the four ablations -----------------------------
+# fold_seed selects the held-out tenth of the data (see k_fold_split in train.py).
 for fold_seed in {0..9}
 do
   for target in 13C 1H
@@ -51,6 +76,9 @@ do
 done
 
 
+# --- Dump per-atom predictions for the proposed model ---------------------
+# Only the fully proposed variant is exported; the predictions are consumed
+# downstream by the analysis notebooks.
 for fold_seed in {0..9}
 do
   for target in 13C 1H

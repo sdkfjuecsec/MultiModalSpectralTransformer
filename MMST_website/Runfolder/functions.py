@@ -1,3 +1,17 @@
+"""Rendering and parsing helpers used by ``app.py``.
+
+Two groups of utilities live here:
+
+* molecule drawing - turn a SMILES plus the model's per-token probabilities into
+  a coloured SVG / coloured HTML string (uncertain atoms are warmer coloured);
+* CSV ingestion - ``parse_NMR_csv`` reads one uploaded spectrum file into the
+  module level ``molecules`` dict, and ``write_to_log_file`` persists the
+  browser console lines next to ``config.json``.
+
+No Flask route lives here; everything is a plain function so it can be tested or
+reused outside the web app.
+"""
+
 from flask import Flask, render_template, send_file, request, redirect, flash, jsonify, session
 from flask_socketio import SocketIO, emit
 import os
@@ -69,6 +83,11 @@ logger = logging.getLogger(__name__)
 
 
 def write_to_log_file(messages):
+    """Write the posted console ``messages`` to a timestamped log file.
+
+    One file is created per call under ``Log_Folder``; its path is stored back in
+    ``config.json`` as ``Console_Log_File`` so the UI can offer it for download.
+    """
     # Read the existing config file if it exists
     if os.path.exists(config_PATH):
         with open(config_PATH, 'r') as json_file:
@@ -101,6 +120,13 @@ def write_to_log_file(messages):
         json.dump(config_data, json_file, indent=4)
 
 def process_probabilities(smile, probabilities):
+    """Fold token probabilities onto atoms so an atom can be coloured.
+
+    The transformer emits one probability per SMILES *token*, but RDKit needs one
+    value per *atom*. Bracketed / alphabetic characters start a new atom
+    symbol, so every run of non-atom tokens (bond symbols, ring closures,
+    branches) is averaged together with the atoms it sits between.
+    """
     mol = Chem.MolFromSmiles(smile)
     if mol is None:
         raise ValueError("Invalid SMILES string")
@@ -134,9 +160,14 @@ def process_probabilities(smile, probabilities):
             atom_probabilities.append(current_atom_prob)
 
     # Ensure we have the correct number of probabilities
+    # Too many (e.g. multi-character atom symbols counted twice) -> keep the first n.
     if len(atom_probabilities) > num_atoms:
         atom_probabilities = atom_probabilities[:num_atoms]
     if len(atom_probabilities) != num_atoms:
+        # NOTE (known issue, left unchanged): `warnings` is used here but never
+        # imported in this module, so whenever the two lengths disagree this
+        # branch raises NameError: name 'warnings' is not defined instead of
+        # warning and padding, and the molecule is not rendered at all.
         warnings.warn(f"Number of processed probabilities ({len(atom_probabilities)}) "
                       f"does not match number of atoms in molecule ({num_atoms}). "
                       "This may lead to incorrect coloring."
@@ -146,20 +177,28 @@ def process_probabilities(smile, probabilities):
     return atom_probabilities
 
 def generate_colored_molecule(smile, probabilities, label=None):
+    """Draw ``smile`` as an SVG with atoms tinted by their probability.
+
+    ``label`` (if given) is appended as SVG text under the structure, which is
+    how the UI shows probability / error / Tanimoto metadata.
+    """
     molecule = Chem.MolFromSmiles(smile)
     atom_probabilities = process_probabilities(smile, probabilities)
     
     d = rdMolDraw2D.MolDraw2DSVG(300, 300)
     d.drawOptions().useBWAtomPalette()
     
+    # One highlight colour per atom index; low probability -> warmer colour.
     highlight_atom_colors = {i: get_color(prob) for i, prob in enumerate(atom_probabilities)}
     
     d.DrawMolecule(molecule, highlightAtoms=list(highlight_atom_colors.keys()), highlightAtomColors=highlight_atom_colors)
     d.FinishDrawing()
     
+    # RDKit emits newlines inside the SVG; they break the JSON transport.
     svg = d.GetDrawingText().replace('\n', '')
     
     if label:
+        # Build a multi-line <text> block; each tspan shifts by one line height.
         lines = label.split('\n')
         label_svg = '<text x="10" y="20" font-family="sans-serif" font-size="14px" fill="black">'
         for i, line in enumerate(lines):
@@ -169,6 +208,7 @@ def generate_colored_molecule(smile, probabilities, label=None):
     return svg
 
 def generate_colored_html(smile, probabilities):
+    """Return the SMILES as HTML where each character is tinted by its probability."""
     html_string = '<span style="font-family: monospace;">'
     
     for char, prob in zip(smile, probabilities):
@@ -180,6 +220,7 @@ def generate_colored_html(smile, probabilities):
     return html_string
 
 def get_color(prob):
+    """Map a probability in [0, 1] to an RGB triple: low = red, high = green."""
     green_value = prob * 0.9
     red_value = 1.0 - prob * 0.40
     blue_value = 0.7
@@ -189,6 +230,11 @@ def get_color(prob):
 
 
 def generate_morgan_fingerprints():
+    """Fingerprint every SMILES currently held in ``molecules``.
+
+    Returns ``(fingerprints, smiles_list)``; molecules RDKit cannot parse are
+    skipped so the two lists stay aligned.
+    """
     fingerprints = []
     smiles_list = []
     for smiles in molecules.keys():
@@ -200,12 +246,23 @@ def generate_morgan_fingerprints():
     return fingerprints, smiles_list
 
 def perform_umap(fingerprints):
+    """Project the fingerprints to 2-D with UMAP (for the cluster plot)."""
     umap_model = UMAP(n_components=2)
     transformed_fingerprints = umap_model.fit_transform(fingerprints)
     return transformed_fingerprints
 
 
 def parse_NMR_csv(file_path, nmr_type):
+    """Parse one uploaded spectrum CSV and merge it into ``molecules``.
+
+    Expected layout: ``SMILES, shifts, sample_id``, where ``shifts`` is the
+    literal Python repr of the peaks (``[(ppm, intensity), ...]`` for 1H,
+    ``[ppm, ...]`` for 13C, ``[[ppm1, ppm2], ...]`` for HSQC, etc.). IR files are
+    the exception: a single absorbance column with an implicit wavenumber axis.
+
+    Returns the whole module level ``molecules`` dict keyed by sample id, so the
+    caller effectively replaces its own copy with this accumulator.
+    """
     global IR_data
     if nmr_type is None:
         logger.error(f"Unknown NMR type in file path: {file_path}")
@@ -239,6 +296,9 @@ def parse_NMR_csv(file_path, nmr_type):
                     logger.warning(f"Skipping invalid row in {file_path}: {row}")
                     continue
 
+                # Tolerate CSVs whose shift field contains commas: everything
+                # between the first and last column is re-joined, so only a
+                # 3-column file is read as smiles / shifts / sample-id.
                 smiles, raw_data, zinc_id = row if len(row) == 3 else (row[0], ",".join(row[1:-1]), row[-1])
                 
                 smiles = smiles.strip('\"')
@@ -251,6 +311,8 @@ def parse_NMR_csv(file_path, nmr_type):
                     continue
 
                 # Parse NMR data based on type
+                # HSQC/COSY are forced to floats because the CSV may store them
+                # as ints; 1H keeps (ppm, intensity) tuples; 13C is a flat ppm list.
                 try:
                     if nmr_type == '13C':
                         data = ast.literal_eval(raw_data)
@@ -265,6 +327,8 @@ def parse_NMR_csv(file_path, nmr_type):
                     continue
 
                 if zinc_id not in molecules:
+                    # `molecular_weight` and `probability` are random
+                    # placeholders, not values measured or predicted anywhere.
                     molecules[zinc_id] = {
                         'smiles': smiles,
                         'zinc_id': zinc_id,
@@ -282,6 +346,12 @@ def parse_NMR_csv(file_path, nmr_type):
     return molecules
 
 def parse_SMILES_csv(file_path):
+    """Validate and normalise the SMILES in the first column of a CSV.
+
+    It only logs invalid entries; the parsed rows are deliberately discarded
+    (nothing is written back to ``molecules``), which makes this a validation
+    helper rather than a loader.
+    """
     try:
         with open(file_path, 'r') as file:
             reader = csv.reader(file)

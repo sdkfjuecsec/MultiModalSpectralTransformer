@@ -1,3 +1,25 @@
+"""Flask + Socket.IO front end of the MMST (Multi-Modal Spectral Transformer) demo.
+
+Run it from inside ``MMST_website/Runfolder`` (``python app.py``); it serves a
+single-page UI on port 8083 that lets a user
+
+* upload experimental NMR CSVs (1H / 13C / HSQC / COSY / IR)     -> /upload
+* page through the uploaded molecules and render them           -> /molecule_image,
+                                                                   /next_molecule,
+                                                                   /prev_molecule
+* plot one spectrum, or the measured vs simulated pair          -> /plot_nmr, /plot_dual_NMR
+* run the MMT model on experimental data                        -> /run_model_exp_data
+* run a full improvement cycle (MF generation + retraining)     -> /run_IC
+* score a checkpoint with MNS / greedy sampling                 -> /test_model
+
+Paths of every intermediate CSV live in ``config_V8.json``; the routes mutate
+that file through ``save_updated_config`` so a later request sees what an
+earlier one produced. ``print_to_console`` pushes progress lines to the browser
+over Socket.IO. The heavy lifting is delegated to ``MMT_import.py`` (model /
+config helpers, imported as ``mrtf``, ``ex``, ``mtf`` ...) and to ``functions.py``
+(molecule rendering and CSV parsing, imported as ``f``).
+"""
+
 # Standard library imports
 import ast
 import base64
@@ -64,12 +86,14 @@ logger = logging.getLogger(__name__)
  
 @app.route('/')
 def index():
+    """Render the main page, restoring the saved UI ``state`` from the session."""
     state = session.get('state', {})
     return render_template('index.html', state=state)
 
 
 @app.route('/next_molecule')
 def next_molecule():
+    """Advance the shared molecule cursor by one (clamped at the last molecule)."""
     global current_index
     if current_index < len(data_dict) - 1:
         current_index += 1
@@ -77,6 +101,7 @@ def next_molecule():
 
 @app.route('/prev_molecule')
 def prev_molecule():
+    """Move the shared molecule cursor back by one (clamped at the first molecule)."""
     global current_index
     if current_index > 0:
         current_index -= 1
@@ -85,6 +110,12 @@ def prev_molecule():
 
 @app.route('/upload', methods=['GET', 'POST'])
 def upload_files_individually():
+    """Save the five uploaded NMR CSVs and record their paths in ``config_V8.json``.
+
+    Each non-empty file is written to ``UPLOAD_FOLDER`` under its original name;
+    the parsed molecules become the new global ``data_dict`` and the file path is
+    stored in the config under the spectrum key so later plots can find it.
+    """
     global data_dict
     if request.method == 'POST':
         uploaded_files = {
@@ -137,8 +168,17 @@ def upload_files_individually():
 @app.route('/molecule_image/', defaults={'index': None})
 @app.route('/molecule_image/<int:index>')
 def molecule_image(index):
+    """Render the molecule at ``index`` as a PNG with sample id and molar mass.
+
+    With no index in the URL the current cursor is used, otherwise the explicit
+    index wins. The drawing itself is done by RDKit.
+    """
     global data_dict, current_index
 
+    # NOTE (known issue, left unchanged): `data_dict` is only a DataFrame with a
+    # 'sample-id' column after /plot_nmr has run; the assignment made by /upload
+    # is a {zinc_id: {...}} dict from functions.parse_NMR_csv, so requesting this
+    # route right after an upload raises KeyError: 'sample-id' -> HTTP 500.
     sample_ids = data_dict['sample-id']
     
     size = (300, 400)
@@ -181,9 +221,15 @@ def molecule_image(index):
     return send_file(img_io, mimetype='image/png')
 
 def plot_hist_of_results_combined(results_dict_greedy, results_dict_mns):
+    """Draw the greedy vs MNS Tanimoto-similarity histograms side by side.
+
+    Returns an in-memory PNG (``io.BytesIO``) that the calling route streams to
+    the browser; the figure is closed afterwards so repeated calls do not leak.
+    """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 3))
 
-    # Greedy sampling plot
+    # Greedy sampling plot: tanimoto_sim == 0 marks a generation RDKit rejected,
+    # so those entries are counted as failures instead of being histogrammed.
     tani_list_greedy = results_dict_greedy.get('tanimoto_sim', [])
     tani_list_greedy = [t for t in tani_list_greedy if t != 0]
     successful_greedy = len(tani_list_greedy)
@@ -203,6 +249,8 @@ def plot_hist_of_results_combined(results_dict_greedy, results_dict_mns):
     tani_list_mns = []
     for key in tqdm(results_dict_mns.keys()):
         sorted_list = results_dict_mns[key]
+        # The per-generation records are sorted by rank; take the top entry and
+        # read its Tanimoto similarity field (index 4) for the histogram.
         third_element = sorted_list[0][0][4]
         tani_list_mns.append(third_element)
 
@@ -229,6 +277,12 @@ def plot_hist_of_results_combined(results_dict_greedy, results_dict_mns):
 
 
 def get_path(config, spectrum_type):
+    """Return the configured file/folder path for one spectrum type.
+
+    ``config`` is the ``SimpleNamespace`` built from ``config_V8.json``; the
+    ``key_map`` translates the UI-facing name into the config attribute name
+    (e.g. ``'1H'`` -> ``csv_1H_path_display``).
+    """
     key_map = {
         "1H": "csv_1H_path_display",
         "13C": "csv_13C_path_display",
@@ -239,6 +293,7 @@ def get_path(config, spectrum_type):
     
     attr_name = key_map.get(spectrum_type)
     if attr_name is None:
+        # Unknown spectrum type is a programming error, not user input.
         raise ValueError(f"Invalid spectrum type: {spectrum_type}")
 
     if hasattr(config, attr_name):
@@ -249,6 +304,12 @@ def get_path(config, spectrum_type):
 
 @app.route('/simulate/<path:SMILES_Path>', methods=['GET'])
 def simulate(SMILES_Path):
+    """Simulate NMR/IR spectra for the SMILES listed in ``SMILES_Path``.
+
+    The CSV path is URL-decoded and stored in the config as the SGNN input, then
+    ``sim_and_display`` runs the generation pipeline. Returns 204 on success and
+    a JSON error body (with traceback) on failure.
+    """
     try:
         print("=" * 50)
         print("SIMULATE ROUTE CALLED")
@@ -309,10 +370,22 @@ def simulate(SMILES_Path):
 
 @app.route('/plot_nmr')
 def plot_nmr():
+    """Return a Plotly figure (as JSON) of one experimental spectrum.
+
+    ``nmr_type`` comes from the query string and falls back to the session; it
+    is re-stored in the session so the UI keeps the last selection. The spectrum
+    is read from the CSV whose path ``get_path`` resolves, and the *global*
+    ``data_dict`` is replaced with that DataFrame so the molecule routes can
+    index into it afterwards.
+    """
     try:
         global current_index, data_dict
 
         nmr_type = request.args.get('nmr_type', session.get('nmr_type', '1H'))
+        # NOTE (known issue, left unchanged): this int() sits *outside* the
+        # try/except ValueError below, so a non-numeric ?index= raises ValueError,
+        # is caught by the outer handler and answered with a generic 500 instead
+        # of the intended fallback to 0.
         index_str = int(request.args.get('index', 0))
         try:
             index = int(index_str)
@@ -320,6 +393,8 @@ def plot_nmr():
             index = 0  # Default to 0 if index is not a valid integer
 
         IR_data = {}
+        # Redundant re-read of the same argument (kept so the session always
+        # carries the type actually used below).
         nmr_type = request.args.get('nmr_type', session.get('nmr_type', '1H'))
         session['nmr_type'] = nmr_type
 
@@ -328,6 +403,8 @@ def plot_nmr():
         NMR_file = get_path(config_data, nmr_type)
         print_to_console("NMR Plot: Run Plot_NMR")
 
+        # Every 1H/13C/HSQC/COSY spectrum shares the same CSV layout, so the
+        # branches are equivalent; IR is the only special case.
         if nmr_type == "1H":
             data_dict = pd.read_csv(NMR_file) 
 
@@ -341,6 +418,8 @@ def plot_nmr():
             data_dict = pd.read_csv(NMR_file)    
 
         elif nmr_type == "IR":
+            # IR is stored one CSV per sample inside a folder, so the sample id
+            # is first taken from the 1H table to build the file name.
             IR_data = {}
             NMR_file = get_path(config_data, "1H")
             data_dict = pd.read_csv(NMR_file)
@@ -350,10 +429,15 @@ def plot_nmr():
             IR_csv_path = os.path.join(IR_folder, str(current_sample_id) + ".csv")            
             IR_df = pd.read_csv(IR_csv_path)
 
+            # NOTE (known issue, left unchanged): a bare `return` yields None, so
+            # Flask fails with "The view function did not return a valid response"
+            # instead of sending the intended error to the browser.
             if IR_df.shape[1] != 1:
                 logger.error(f"Invalid column count for IR data in {IR_csv_path}")
                 return
             absorbance = IR_df.iloc[:, 0].astype(float).tolist()
+            # The CSV holds no wavelength axis, so it is reconstructed as an
+            # evenly spaced 400-4000 cm^-1 grid.
             wave_lengths = np.linspace(400, 4000, len(absorbance))
             IR_data = {'wave_lengths': wave_lengths, 'absorbance': absorbance}
 
@@ -368,6 +452,11 @@ def plot_nmr():
         #import IPython; IPython.embed(); 
 
         # Get the shifts for the current sample ID
+        # NOTE (known issue, left unchanged): `.values` always returns an ndarray,
+        # so the `not nmr_data` test below raises ValueError ("truth value of an
+        # array with more than one element is ambiguous") as soon as the CSV has
+        # two or more rows; the 404 branch is therefore never taken and the outer
+        # handler answers 500 instead.
         nmr_data = data_dict.loc[data_dict['sample-id'] == current_sample_id, 'shifts'].values
         print_to_console("NMR Plot: Plot_NMR 3")
 
@@ -449,17 +538,27 @@ def plot_nmr():
 
 @app.route('/log_messages', methods=['POST'])
 def log_messages():
+    """Persist the browser console lines posted as JSON to a timestamped log file."""
     messages = request.json.get('messages', [])
     f.write_to_log_file(messages)
     return jsonify({"status": "Messages logged"})
 
 @app.route('/test_model/<path:Checkpoint_Path>/<int:MNS_Value>/<string:spectral_types>')
 def test_model(Checkpoint_Path, MNS_Value, spectral_types):
+    """Score a checkpoint with MNS and greedy sampling on the (simulated) val set.
+
+    ``spectral_types`` selects which modalities feed the transformer (e.g.
+    ``1H_13C``), ``MNS_Value`` is the number of multinomial samples per
+    molecule. Returns a PNG comparing the two Tanimoto histograms.
+    """
     try:
         print("start test_model")
         print_to_console("Testing model: Start test_model")
 
+        # greedy_full=True uses the slow exhaustive greedy sampler; False uses
+        # the fast per-molecule greedy walk in run_greedy_sampling.
         greedy_full = False
+        # Discard generated molecules whose mass deviates too far from the target.
         MW_filter = True
         itos, stoi, stoi_MF, itos_MF = load_json_dics()
         IR_config, config = load_configs()
@@ -551,6 +650,13 @@ def test_model(Checkpoint_Path, MNS_Value, spectral_types):
 
 
 def test_model_IC():
+    """Same scoring procedure as ``test_model``, but for an improvement-cycle run.
+
+    Unlike the route it is a plain helper: it uses the config currently on disk
+    (no checkpoint from the URL) and returns ``(corr_sampleing_prob, png)``,
+    where ``corr_sampleing_prob`` is the agreement metric compared against
+    ``IC_threshold`` by ``run_IC``.
+    """
     try:
         print("start test_model_IC")
         greedy_full = False
@@ -639,6 +745,11 @@ def test_model_IC():
 import pandas as pd
 
 def select_samples_csv(file_path, data_size):
+    """Copy the first ``data_size`` rows of a CSV into a sibling ``*_sel.csv``.
+
+    Returns the path of the new file; the suffix keeps the original data intact
+    while giving the model a deterministic subset to evaluate on.
+    """
     # Read the CSV file
     df = pd.read_csv(file_path)
     # Select the specified number of rows
@@ -654,7 +765,13 @@ def select_samples_csv(file_path, data_size):
 
 @app.route('/run_IC/<path:model_save_dir>/<int:MF_generations>/<int:num_epochs>/<int:MF_delta_weight>/<int:max_scaffold_generations>/<float:lr_pretraining>/<float:IC_threshold>/<int:data_size>')
 def run_IC(model_save_dir, MF_generations, num_epochs, MF_delta_weight, max_scaffold_generations, lr_pretraining, IC_threshold, data_size):   
+    """Run the Iterative Improvement Cycle until the score beats ``IC_threshold``.
 
+    One iteration is: generate new SMILES with the matched-molecular-pair
+    generator, blend them with the training data, simulate their spectra,
+    fine-tune the transformer, then re-score the model. The loop only exits on
+    success, so a run that never reaches the threshold keeps going.
+    """
     itos, stoi, stoi_MF, itos_MF = load_json_dics()
     IR_config, config = load_configs()
     config.data_size = data_size
@@ -695,6 +812,10 @@ def run_IC(model_save_dir, MF_generations, num_epochs, MF_delta_weight, max_scaf
 
     performance = 0
     print_to_console("Running run_IC: Starting Improvement Cycle")
+    # NOTE (known issue, left unchanged): `while True` has a single exit, the
+    # `break` after the threshold test at the end of the body. If the score never
+    # exceeds IC_threshold the request never returns and the cycle retrains
+    # forever (there is no iteration cap or timeout).
     while True:
         config.execution_type = "SMI_generation_MF"
         if config.execution_type == "SMI_generation_MF":
@@ -705,6 +826,8 @@ def run_IC(model_save_dir, MF_generations, num_epochs, MF_delta_weight, max_scaf
             config, results_dict_MF = ex.SMI_generation_MF(config, stoi, stoi_MF, itos, itos_MF)
 
             # Iterate through the dictionary and remove 'nan' from lists
+            # (MF failures come back as float('nan') entries, which would break
+            # both the CSV round-trip and the spectrum simulation).
             results_dict_MF = {key: value for key, value in results_dict_MF.items() if not hf.contains_only_nan(value)}
             for key, value in results_dict_MF.items():
                 results_dict_MF[key] = hf.remove_nan_from_list(value)
@@ -816,6 +939,13 @@ def run_IC(model_save_dir, MF_generations, num_epochs, MF_delta_weight, max_scaf
 
 
 def sort_and_rank_chemical_data(data):
+    """Rank every candidate of every target SMILES and sort them best-first.
+
+    Each record carries two error values at its end (HSQC and COSY); both are
+    rank-normalised independently, the two ranks are averaged, and that average
+    is appended as the final element used for sorting. The input dict is
+    modified in place as well as returned reordered.
+    """
     sorted_data = {}
     
     for smiles, compounds_list in data.items():
@@ -829,6 +959,8 @@ def sort_and_rank_chemical_data(data):
         rankings_2 = [item[1] for item in rankings]
         
         # Create rankings for each float value
+        # Double argsort turns values into 0..n-1 ranks (duplicates get ties broken
+        # by position, which is good enough for a display ordering).
         rank_1 = np.argsort(np.argsort(rankings_1))
         rank_2 = np.argsort(np.argsort(rankings_2))
         
@@ -851,6 +983,19 @@ def sort_and_rank_chemical_data(data):
 
 @app.route('/run_model_exp_data')
 def run_model_exp_data():
+    """Run the MMT model on *experimental* spectra and cache the results.
+
+    The five measured CSV paths, the checkpoint and the evaluation size come
+    from the query string; they are written into the config, used for one
+    MNS + greedy scoring pass, and the resulting dictionaries are pickled under
+    ``MMST_website/pkl_files`` so ``/colored_molecule`` and ``/plot_dual_NMR``
+    can replay them.
+
+    NOTE (known issue, left unchanged): the success path returns the raw
+    ``io.BytesIO`` produced by ``plot_hist_of_results_combined`` instead of a
+    Flask response, so Flask raises "The view function did not return a valid
+    response" and the client gets a 500 even though the pickle was written.
+    """
     print_to_console("Running run_model_exp_data: Start")
 
     Checkpoint_Path = urllib.parse.unquote(request.args.get('Checkpoint_Path'))
@@ -1031,6 +1176,12 @@ def run_model_exp_data():
 
 @app.route('/colored_molecule/<int:index>/<int:i>')
 def colored_molecule(index, i):
+    """Return the target molecule (``i == 0``) or generation ``i`` with per-atom colours.
+
+    Atom colours encode the model's per-token probability, so the SVG/HTML
+    returned shows which substructures the model was (un)certain about. Index
+    ``index`` selects the target SMILES, in the key order of the pickled results.
+    """
     try:
         colors = []
         label = ""
@@ -1078,10 +1229,18 @@ def colored_molecule(index, i):
 
 
 def process_sdf_file(sdf_file_path, config, IR_config, trash_folder="trash_folder"):
+    """Simulate all five spectra for the structures in one SDF file.
+
+    The SDF is copied into a fresh ``trash_folder`` (wiped on every call) because
+    the generators read from a folder; afterwards 1H, 13C, COSY, HSQC and IR are
+    generated in turn and their results returned as
+    ``(nmr_data, csv_paths)`` for plotting.
+    """
     # Create trash folder if it doesn't exist
     trash_folder_path = Path(trash_folder)
 
     # Delete the trash folder if it exists
+    # (stale structures from a previous call would otherwise be simulated again).
     if trash_folder_path.exists():
         shutil.rmtree(trash_folder_path)
 
@@ -1134,6 +1293,13 @@ def process_sdf_file(sdf_file_path, config, IR_config, trash_folder="trash_folde
 
 @app.route('/plot_dual_NMR')
 def plot_dual_NMR():
+    """Return a Plotly figure (as JSON) overlaying measured and simulated spectra.
+
+    The measured spectrum of sample ``exp_index`` is paired with generation
+    ``sim_index`` of the same target: the generated SMILES is taken from the
+    pickled results, its SDF is re-simulated on the fly by ``process_sdf_file``,
+    and both traces are drawn in one figure (blue = measured, red = simulated).
+    """
     try:
         print_to_console("Running plot_dual_NMR: Start")
         IR_config, config = load_configs()
@@ -1164,6 +1330,9 @@ def plot_dual_NMR():
             IR_csv_path = os.path.join(config.IR_path_REAL, f"{current_sample_id}.csv")
             IR_df = pd.read_csv(IR_csv_path)
 
+            # NOTE (known issue, left unchanged): like in plot_nmr, the bare
+            # `return` sends None to Flask, which then raises an internal error
+            # instead of reporting the bad IR file to the caller.
             if IR_df.shape[1] != 1:
                 logger.error(f"Invalid column count for IR data in {IR_csv_path}")
                 return
@@ -1281,17 +1450,21 @@ def plot_dual_NMR():
 
 @app.route('/test')
 def test_js():
+    """Serve a minimal page used to sanity-check the Socket.IO wiring."""
     return render_template('test_js.html')
 
 @socketio.on('connect')
 def handle_connect():
+    """Socket.IO hook: log a newly opened browser session."""
     print('Client connected')
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    """Socket.IO hook: log a closed browser session."""
     print('Client disconnected')
 
 def print_to_console(message):
+    """Echo ``message`` to the server log and push it to the browser console."""
     print(f"Emitting message: {message}")  # Debug print
     socketio.emit('console_message', {'message': message})
 

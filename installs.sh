@@ -1,4 +1,24 @@
 #!/bin/bash
+#
+# Environment bootstrap for the NMR structure elucidation code.
+#
+# Purpose
+#   Recreate the pinned Python 3.7 environment the project was developed in:
+#   system libraries first, then Jupyter, PyTorch + DGL (CUDA 11.1), the
+#   chemistry/plotting stack, and finally the app dependencies.
+#
+# Usage
+#   Debian/Ubuntu image, root privileges, conda env already active:
+#     conda activate NMR_Structure_Elucidator
+#     bash installs.sh
+#   The conda create/activate lines are commented out below, so create the env
+#   yourself first if it does not exist yet.
+#
+# Why the pins
+#   The code targets Python 3.7, which caps several transitive dependencies
+#   (scipy, pynndescent) and breaks on newer Jupyter / umap releases; the
+#   explicit versions here are the combination that actually imports.
+#
 
 # System libraries the Python packages dlopen at runtime. Without them the
 # notebooks fail with ImportError before any Python code can help:

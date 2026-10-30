@@ -1,4 +1,19 @@
 #!/bin/bash
+#
+# Commit every local change and push it to origin.
+#
+# Purpose
+#   Mirror the development working tree to the remote so the other environment
+#   (training cluster / laptop) can `bash pull_latest.sh` it.
+#
+# Usage
+#   bash push_changes.sh "Your commit message"
+#   The commit message is mandatory; a missing argument exits with status 1.
+#
+# Note
+#   `git add .` stages *everything* that is not ignored, so keep large data
+#   files, checkpoints and any credentials in .gitignore before running this.
+#
 
 # Script to commit and push changes from the development environment
 # Usage: bash push_changes.sh "Your commit message"
