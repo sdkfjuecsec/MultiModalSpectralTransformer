@@ -6,6 +6,19 @@
  * By Junnan Li
  * Based on huggingface code base
  * https://github.com/huggingface/transformers/blob/v4.15.0/src/transformers/models/bert
+
+Module summary
+--------------
+Minimal BERT / Q-Former stack used by the BLIP branch of the project. It is a
+trimmed copy of the HuggingFace BERT implementation with two BLIP additions:
+``BertEmbeddings`` accepts learnable ``query_embeds`` that are prepended to the
+token sequence, and every ``cross_attention_freq``-th ``BertLayer`` adds a
+cross-attention block over ``encoder_hidden_states``. ``BertLMHeadModel`` acts
+as the language-model decoder of the Q-Former and ``BertForMaskedLM`` as the
+masked-LM head used for the image-conditioned text objective.
+
+Note: this is a legacy copy kept under ``_old/``; the trainable model used by
+the current experiments is in ``models_MMT_v15_4*.py``.
 """
 
 import math
@@ -49,9 +62,21 @@ logger = logging.get_logger(__name__)
 
 
 class BertEmbeddings(nn.Module):
-    """Construct the embeddings from word and position embeddings."""
+    """Construct the embeddings from word and position embeddings.
+
+    BLIP extension: optional ``query_embeds`` (the Q-Former queries) are
+    concatenated in front of the token embeddings, so the queries occupy
+    positions ``0 .. query_len-1`` of the sequence.
+
+    Args:
+        config: BERT config providing ``vocab_size``, ``hidden_size``,
+            ``pad_token_id``, ``max_position_embeddings`` and the LayerNorm /
+            dropout hyper-parameters.
+    """
 
     def __init__(self, config):
+        """Create the word and position tables, LayerNorm, dropout and the
+        ``position_ids`` buffer."""
         super().__init__()
         self.word_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
@@ -82,6 +107,20 @@ class BertEmbeddings(nn.Module):
         query_embeds=None,
         past_key_values_length=0,
     ):
+        """Build the input embeddings of the (optionally query-prefixed) sequence.
+
+        Args:
+            input_ids: ``LongTensor`` of token ids, or ``None`` for a
+                query-only forward pass.
+            position_ids: Optional explicit positions; defaults to the slices
+                stored in ``self.position_ids``.
+            query_embeds: Optional Q-Former queries prepended to the tokens.
+            past_key_values_length (int): Number of already-cached positions,
+                used to offset the default ``position_ids``.
+
+        Returns:
+            Tensor: ``(batch, query_len + seq_len, hidden_size)``.
+        """
         if input_ids is not None:
             seq_length = input_ids.size()[1]
         else:
@@ -109,7 +148,17 @@ class BertEmbeddings(nn.Module):
 
 
 class BertSelfAttention(nn.Module):
+    """Multi-head self- or cross-attention with optional relative positions.
+
+    Args:
+        config: BERT config (hidden size, head count, attention dropout and
+            position-embedding type).
+        is_cross_attention (bool): When True, the key/value projections are
+            built for ``config.encoder_width`` instead of ``config.hidden_size``.
+    """
+
     def __init__(self, config, is_cross_attention):
+        """Create the query/key/value projections and the attention dropout."""
         super().__init__()
         self.config = config
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(
@@ -147,18 +196,23 @@ class BertSelfAttention(nn.Module):
         self.save_attention = False
 
     def save_attn_gradients(self, attn_gradients):
+        """Hook target that stores the attention-map gradients (XAI / grad-CAM)."""
         self.attn_gradients = attn_gradients
 
     def get_attn_gradients(self):
+        """Return the gradients stored by ``save_attn_gradients``."""
         return self.attn_gradients
 
     def save_attention_map(self, attention_map):
+        """Store the last attention map when ``self.save_attention`` is set."""
         self.attention_map = attention_map
 
     def get_attention_map(self):
+        """Return the attention map stored by ``save_attention_map``."""
         return self.attention_map
 
     def transpose_for_scores(self, x):
+        """Reshape ``(batch, seq, hidden)`` into ``(batch, heads, seq, head_size)``."""
         new_x_shape = x.size()[:-1] + (
             self.num_attention_heads,
             self.attention_head_size,
@@ -176,6 +230,24 @@ class BertSelfAttention(nn.Module):
         past_key_value=None,
         output_attentions=False,
     ):
+        """Compute scaled dot-product attention.
+
+        Args:
+            hidden_states: Query input ``(batch, seq, hidden)``.
+            attention_mask: Additive mask (0 = keep, very negative = drop).
+            head_mask: Optional per-head multiplicative mask.
+            encoder_hidden_states: When given, this call acts as cross-attention
+                and the key/value tensors come from this tensor.
+            encoder_attention_mask: Additive mask for the encoder states.
+            past_key_value: Optional cached ``(key, value)`` for incremental
+                decoding; it is concatenated with the freshly computed ones.
+            output_attentions (bool): Also return the attention probabilities.
+
+        Returns:
+            tuple: ``(context_layer, [attention_probs], (key_layer,
+            value_layer))``; the attention map is only included when
+            ``output_attentions`` is True.
+        """
 
         # If this is instantiated as a cross-attention module, the keys
         # and values come from an encoder; the attention mask needs to be
@@ -276,13 +348,17 @@ class BertSelfAttention(nn.Module):
 
 
 class BertSelfOutput(nn.Module):
+    """Output projection + residual LayerNorm that closes an attention block."""
+
     def __init__(self, config):
+        """Create the dense projection, LayerNorm and dropout."""
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
+        """Apply dense -> dropout -> LayerNorm(x + residual)."""
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
@@ -290,13 +366,23 @@ class BertSelfOutput(nn.Module):
 
 
 class BertAttention(nn.Module):
+    """Self-attention block with residual output; also used for cross-attention.
+
+    Args:
+        config: BERT config.
+        is_cross_attention (bool): Forwarded to ``BertSelfAttention`` so that
+            the key/value projections use ``config.encoder_width``.
+    """
+
     def __init__(self, config, is_cross_attention=False):
+        """Create the attention and output sub-modules."""
         super().__init__()
         self.self = BertSelfAttention(config, is_cross_attention)
         self.output = BertSelfOutput(config)
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
+        """Remove the given heads in place (HuggingFace head pruning)."""
         if len(heads) == 0:
             return
         heads, index = find_pruneable_heads_and_indices(
@@ -329,6 +415,14 @@ class BertAttention(nn.Module):
         past_key_value=None,
         output_attentions=False,
     ):
+        """Run the attention module and add its residual output.
+
+        All arguments are forwarded to ``BertSelfAttention.forward``; see that
+        method for their meaning.
+
+        Returns:
+            tuple: ``(attention_output, [attention_probs], key/value cache)``.
+        """
         self_outputs = self.self(
             hidden_states,
             attention_mask,
@@ -347,7 +441,10 @@ class BertAttention(nn.Module):
 
 
 class BertIntermediate(nn.Module):
+    """Up-projection + activation of a position-wise feed-forward block."""
+
     def __init__(self, config):
+        """Create the up-projection and resolve the activation function."""
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
@@ -356,19 +453,24 @@ class BertIntermediate(nn.Module):
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states):
+        """Project to ``intermediate_size`` and apply the activation."""
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
 
 class BertOutput(nn.Module):
+    """Down-projection + residual LayerNorm closing a feed-forward block."""
+
     def __init__(self, config):
+        """Create the down-projection, LayerNorm and dropout."""
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
+        """Apply dense -> dropout -> LayerNorm(x + residual)."""
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
@@ -376,7 +478,22 @@ class BertOutput(nn.Module):
 
 
 class BertLayer(nn.Module):
+    """One transformer layer of the Q-Former encoder.
+
+    A layer holds a self-attention block, an optional cross-attention block and
+    two separate feed-forward stacks: ``intermediate`` / ``output`` for the text
+    tokens and ``intermediate_query`` / ``output_query`` for the Q-Former
+    queries. Cross-attention exists only when ``config.add_cross_attention`` is
+    set and ``layer_num % config.cross_attention_freq == 0``.
+
+    Args:
+        config: BERT config.
+        layer_num (int): Index of this layer inside the encoder; decides whether
+            the cross-attention branch is instantiated.
+    """
+
     def __init__(self, config, layer_num):
+        """Create attention, optional cross-attention and both feed-forward stacks."""
         super().__init__()
         self.config = config
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
@@ -410,6 +527,22 @@ class BertLayer(nn.Module):
         output_attentions=False,
         query_length=0,
     ):
+        """Run self-attention, optional query cross-attention and feed-forward.
+
+        Args:
+            hidden_states: Input sequence ``(batch, query_len + text_len,
+                hidden)``; the first ``query_length`` rows are the queries.
+            attention_mask / head_mask: Forwarded to the attention blocks.
+            encoder_hidden_states / encoder_attention_mask: Keys/values and
+                mask used by the cross-attention block (if present).
+            past_key_value: Optional cached keys/values for decoding.
+            output_attentions (bool): Also return attention maps.
+            query_length (int): Number of leading query tokens; when > 0 the
+                queries and the text tokens get different feed-forward stacks.
+
+        Returns:
+            tuple: ``(layer_output, [attention maps], present_key_value)``.
+        """
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = (
             past_key_value[:2] if past_key_value is not None else None
@@ -474,18 +607,23 @@ class BertLayer(nn.Module):
         return outputs
 
     def feed_forward_chunk(self, attention_output):
+        """Feed-forward applied to text-token positions."""
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
         return layer_output
 
     def feed_forward_chunk_query(self, attention_output):
+        """Feed-forward applied to Q-Former query positions."""
         intermediate_output = self.intermediate_query(attention_output)
         layer_output = self.output_query(intermediate_output, attention_output)
         return layer_output
 
 
 class BertEncoder(nn.Module):
+    """Stack of ``BertLayer`` modules with optional gradient checkpointing."""
+
     def __init__(self, config):
+        """Build ``config.num_hidden_layers`` layers."""
         super().__init__()
         self.config = config
         self.layer = nn.ModuleList(
@@ -506,6 +644,30 @@ class BertEncoder(nn.Module):
         return_dict=True,
         query_length=0,
     ):
+        """Run every layer of the stack.
+
+        Args:
+            hidden_states: Input sequence ``(batch, seq, hidden)``.
+            attention_mask: Additive extended attention mask.
+            head_mask: Optional per-layer head masks.
+            encoder_hidden_states / encoder_attention_mask: Cross-attention
+                keys/values and their mask.
+            past_key_values: Optional per-layer key/value caches.
+            use_cache (bool): When True the present key/values are collected.
+            output_attentions / output_hidden_states (bool): Collect the
+                corresponding intermediate tensors.
+            return_dict (bool): Return a ``BaseModelOutputWithPastAndCrossAttentions``
+                instead of a plain tuple.
+            query_length (int): Number of leading Q-Former query tokens.
+
+        Returns:
+            BaseModelOutputWithPastAndCrossAttentions | tuple: Last hidden
+            state plus the optional caches / attentions.
+
+        Side effects:
+            When gradient checkpointing is enabled and ``use_cache`` is set the
+            flag is turned off and a warning is logged.
+        """
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = (
@@ -589,12 +751,16 @@ class BertEncoder(nn.Module):
 
 
 class BertPooler(nn.Module):
+    """Tanh MLP applied to the first token to produce a pooled vector."""
+
     def __init__(self, config):
+        """Create the dense layer and the Tanh activation."""
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
+        """Project the first token (``[:, 0]``) through dense + Tanh."""
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
         first_token_tensor = hidden_states[:, 0]
@@ -604,7 +770,10 @@ class BertPooler(nn.Module):
 
 
 class BertPredictionHeadTransform(nn.Module):
+    """Dense + activation + LayerNorm applied before the LM head."""
+
     def __init__(self, config):
+        """Create the dense layer, resolve the activation and add LayerNorm."""
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         if isinstance(config.hidden_act, str):
@@ -614,6 +783,7 @@ class BertPredictionHeadTransform(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states):
+        """Apply dense -> activation -> LayerNorm."""
         hidden_states = self.dense(hidden_states)
         hidden_states = self.transform_act_fn(hidden_states)
         hidden_states = self.LayerNorm(hidden_states)
@@ -621,7 +791,10 @@ class BertPredictionHeadTransform(nn.Module):
 
 
 class BertLMPredictionHead(nn.Module):
+    """Output projection to the vocabulary, with a separately registered bias."""
+
     def __init__(self, config):
+        """Create the head transform, the tied-weight decoder and the bias."""
         super().__init__()
         self.transform = BertPredictionHeadTransform(config)
 
@@ -635,17 +808,22 @@ class BertLMPredictionHead(nn.Module):
         self.decoder.bias = self.bias
 
     def forward(self, hidden_states):
+        """Map hidden states to vocabulary logits."""
         hidden_states = self.transform(hidden_states)
         hidden_states = self.decoder(hidden_states)
         return hidden_states
 
 
 class BertOnlyMLMHead(nn.Module):
+    """Thin wrapper exposing ``BertLMPredictionHead`` as the MLM head."""
+
     def __init__(self, config):
+        """Create the prediction head."""
         super().__init__()
         self.predictions = BertLMPredictionHead(config)
 
     def forward(self, sequence_output):
+        """Return the per-token vocabulary logits."""
         prediction_scores = self.predictions(sequence_output)
         return prediction_scores
 
@@ -684,6 +862,13 @@ class BertModel(BertPreTrainedModel):
     """
 
     def __init__(self, config, add_pooling_layer=False):
+        """Build the embeddings, the encoder stack and the optional pooler.
+
+        Args:
+            config: BERT config.
+            add_pooling_layer (bool): Add a ``BertPooler`` on top of the
+                sequence output (disabled for the Q-Former / LM heads).
+        """
         super().__init__(config)
         self.config = config
 
@@ -696,9 +881,11 @@ class BertModel(BertPreTrainedModel):
         self.init_weights()
 
     def get_input_embeddings(self):
+        """Return the word embedding table."""
         return self.embeddings.word_embeddings
 
     def set_input_embeddings(self, value):
+        """Replace the word embedding table (used for weight tying)."""
         self.embeddings.word_embeddings = value
 
     def _prune_heads(self, heads_to_prune):
@@ -884,6 +1071,11 @@ class BertModel(BertPreTrainedModel):
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
         if is_decoder:
+            # NOTE (known issue, left unchanged): ``input_ids`` is only checked
+            # for "not None" via an assert on ``query_embeds``; a query-only
+            # call with ``is_decoder=True`` (``input_ids=None``) therefore
+            # raises ``AttributeError: 'NoneType' object has no attribute
+            # 'shape'`` on the next line instead of working.
             extended_attention_mask = self.get_extended_attention_mask(
                 attention_mask,
                 input_ids.shape,
@@ -965,11 +1157,18 @@ class BertModel(BertPreTrainedModel):
 
 
 class BertLMHeadModel(BertPreTrainedModel):
+    """Causal language-model decoder used by the Q-Former.
+
+    It is a ``BertModel`` (no pooler) plus an MLM head, run in decoder mode so
+    that the Q-Former queries attend causally to the text tokens and, when
+    ``encoder_hidden_states`` is given, cross-attend to the image features.
+    """
 
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
 
     def __init__(self, config):
+        """Build the inner ``BertModel`` and the LM head."""
         super().__init__(config)
 
         self.bert = BertModel(config, add_pooling_layer=False)
@@ -978,9 +1177,11 @@ class BertLMHeadModel(BertPreTrainedModel):
         self.init_weights()
 
     def get_output_embeddings(self):
+        """Return the vocabulary projection (used for weight tying)."""
         return self.cls.predictions.decoder
 
     def set_output_embeddings(self, new_embeddings):
+        """Replace the vocabulary projection."""
         self.cls.predictions.decoder = new_embeddings
 
     def forward(
@@ -1097,6 +1298,22 @@ class BertLMHeadModel(BertPreTrainedModel):
     def prepare_inputs_for_generation(
         self, input_ids, query_embeds, past=None, attention_mask=None, **model_kwargs
     ):
+        """Build the keyword arguments for one incremental decoding step.
+
+        Args:
+            input_ids: Tokens generated so far ``(batch, seq)``.
+            query_embeds: Q-Former queries, unchanged at every step.
+            past: Optional key/value cache from the previous step.
+            attention_mask: Mask over the generated tokens; when ``None`` an
+                all-ones mask is created.
+            **model_kwargs: Extra keys forwarded by ``generate``; only
+                ``encoder_hidden_states`` / ``encoder_attention_mask`` are used.
+
+        Returns:
+            dict: Arguments for ``BertLMHeadModel.forward``; the attention mask
+            is prefixed with ones for the query positions, and ``input_ids`` is
+            truncated to the last token when a cache is present.
+        """
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
@@ -1118,6 +1335,15 @@ class BertLMHeadModel(BertPreTrainedModel):
         }
 
     def _reorder_cache(self, past, beam_idx):
+        """Reorder the key/value cache for beam search.
+
+        Args:
+            past: Per-layer tuple of cached tensors.
+            beam_idx: Indices of the beams kept in the current step.
+
+        Returns:
+            tuple: The cache re-indexed along the batch dimension.
+        """
         reordered_past = ()
         for layer_past in past:
             reordered_past += (
@@ -1129,11 +1355,20 @@ class BertLMHeadModel(BertPreTrainedModel):
 
 
 class BertForMaskedLM(BertPreTrainedModel):
+    """Masked-LM head used by BLIP for the image-conditioned text objective.
+
+    NOTE (known issue, left unchanged): ``forward`` prints ``"aewb"`` on every
+    call (leftover debugging output), and ``sequence_output`` is only assigned
+    inside ``if query_embeds is not None:``. When ``query_embeds`` is ``None``
+    the next line ``prediction_scores = self.cls(sequence_output)`` raises
+    ``UnboundLocalError`` because the local was never assigned.
+    """
 
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
 
     def __init__(self, config):
+        """Build the inner ``BertModel`` and the MLM head."""
         super().__init__(config)
 
         self.bert = BertModel(config, add_pooling_layer=False)
@@ -1142,9 +1377,11 @@ class BertForMaskedLM(BertPreTrainedModel):
         self.init_weights()
 
     def get_output_embeddings(self):
+        """Return the vocabulary projection (used for weight tying)."""
         return self.cls.predictions.decoder
 
     def set_output_embeddings(self, new_embeddings):
+        """Replace the vocabulary projection."""
         self.cls.predictions.decoder = new_embeddings
 
     def forward(
@@ -1169,6 +1406,8 @@ class BertForMaskedLM(BertPreTrainedModel):
             config.vocab_size]`` (see ``input_ids`` docstring) Tokens with indices set to ``-100`` are ignored
             (masked), the loss is only computed for the tokens with labels in ``[0, ..., config.vocab_size]``
         """
+        # NOTE (known issue, left unchanged): leftover debug print, executed on
+        # every forward call (see the class docstring).
         print("aewb")
 
         return_dict = (
@@ -1191,6 +1430,8 @@ class BertForMaskedLM(BertPreTrainedModel):
 
         if query_embeds is not None:
             sequence_output = outputs[0][:, query_embeds.shape[1] :, :]
+        # NOTE (known issue, left unchanged): ``sequence_output`` is unbound when
+        # ``query_embeds`` is None -> UnboundLocalError on the next line.
         prediction_scores = self.cls(sequence_output)
 
         if return_logits:

@@ -1,3 +1,32 @@
+"""BLIP-style contrastive model pairing ChemBERTa SMILES features with MMT spectra.
+
+Pipeline overview
+-----------------
+``BLIPModel`` runs two encoders: ``ChembertaFingerprint`` encodes the target
+SMILES string, and the pretrained ``MultimodalTransformer`` encodes the spectra.
+Both outputs are fed through the same stack of Q-Former query tokens and a
+projection head, and the two projected vectors are compared with an
+InfoNCE-style contrastive loss.
+
+Contents
+--------
+BLIP_make
+    Loads both pretrained backbones and builds the optimizer.
+get_extended_attention_mask
+    Local broadcastable-mask helper used by ``ChembertaFingerprint``.
+ChembertaFingerprint
+    ChemBERTa + pooling + linear fingerprint head.
+BLIPModel
+    Q-Former fusion of the SMILES and spectra embeddings.
+cross_entropy / ProjectionHead
+    Contrastive loss and the MLP projection used by both branches.
+BLIPMultiGPU
+    ``pl.LightningModule`` wrapper.
+
+Legacy note: this file lives under ``_old/``; the active training code is
+``models_MMT_v15_4*.py`` + ``TransformerMultiGPU``.
+"""
+
 import argparse
 import math
 import os
@@ -47,6 +76,28 @@ if base_path not in sys.path:
 
     
 def BLIP_make(config, stoi, stoi_MF, itos):
+    """Load the two frozen backbones and build the BLIP model and optimizer.
+
+    Args:
+        config: Experiment configuration (``device``, ``model_version``,
+            ``loss_fn``, ``CB_model_path``, ``MT_model_path`` and the per-group
+            learning rates ``CB_lr`` / ``MT_lr`` / ``Qformer_lr`` /
+            ``MT_projection_lr`` / ``weight_decay``).
+        stoi (dict): SMILES token -> id mapping (accepted but unused here).
+        stoi_MF (dict): Formula token -> id mapping (accepted but unused here).
+        itos: SMILES id -> token mapping, handed to ``BLIPModel``.
+
+    Returns:
+        tuple: ``(BLIP_model, optimizer)`` where ``optimizer`` is an
+        ``AdamW`` over four parameter groups.
+
+    Side effects:
+        Downloads / loads the pretrained ChemBERTa (``config.model_version``)
+        and its tokenizer, loads the two ``.pth`` checkpoints, and *freezes*
+        every parameter of ``CB_model`` and ``MT_model``. This means the
+        ``CB_lr`` / ``MT_lr`` groups will produce ``requires_grad`` warnings and
+        no updates unless some parameters are unfrozen afterwards.
+    """
     # Select device
     device = config.device
 
@@ -165,9 +216,22 @@ def get_extended_attention_mask(attention_mask, input_shape):
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         return extended_attention_mask
 
-# a dict to store the activations
+# Global dict used to store activations captured by ``getActivation`` hooks.
 activation = {}
 def getActivation(name):
+    """Build a forward hook that stores the module output under ``name``.
+
+    Args:
+        name (str): Key used in the global ``activation`` dict.
+
+    Returns:
+        callable: ``hook(model, input, output)`` suitable for
+        ``module.register_forward_hook``.
+
+    Side effects:
+        The returned hook mutates the module-level ``activation`` dict and
+        detaches the captured tensor from the autograd graph.
+    """
     # the hook signature
     def hook(model, input, output):
         activation[name] = output.detach()
@@ -175,7 +239,19 @@ def getActivation(name):
 
 
 class ChembertaFingerprint(nn.Module):
+    """ChemBERTa encoder followed by a pooling + linear fingerprint head.
+
+    Args:
+        chemberta (RobertaModel): Pretrained ChemBERTa backbone.
+        config: Configuration exposing ``fp_dim_reduction``,
+            ``num_linear_layers``, ``use_relu``, ``use_dropout``,
+            ``num_class`` and ``pca_components``.
+        sigmoid (bool): Apply a sigmoid to the fingerprint (used when the loss
+            is a plain BCE instead of ``BCEWithLogitsLoss``).
+    """
+
     def __init__(self, chemberta, config, sigmoid=False):
+        """Create the head layers and store the hyper-parameters."""
         super(ChembertaFingerprint, self).__init__()
         self.sigmoid = sigmoid
         self.fp_dim_reduction = config.fp_dim_reduction
@@ -206,6 +282,18 @@ class ChembertaFingerprint(nn.Module):
         self.sig_fn = nn.Sigmoid()  
 
     def forward(self, x, mask):
+        """Encode SMILES ids and return fingerprint, pooled and memory features.
+
+        Args:
+            x: ``LongTensor`` of ChemBERTa token ids ``(batch, seq)``.
+            mask: Attention mask (1 = attend, 0 = padding).
+
+        Returns:
+            tuple: ``(fingerprint, out_1, enc_out)`` where ``fingerprint`` is
+            the (optionally sigmoid-activated) prediction, ``out_1`` is the
+            detached pooled projection handed to the contrastive branch, and
+            ``enc_out`` is the full encoder memory used as Q-Former keys.
+        """
 
         # Generate embeddings
         embeddings = self.chemberta.embeddings(x) 
@@ -237,6 +325,22 @@ class ChembertaFingerprint(nn.Module):
 
 
 class BLIPModel(nn.Module):
+    """BLIP-style two-tower model with a shared Q-Former.
+
+    Args:
+        CB_model (ChembertaFingerprint): Frozen SMILES encoder.
+        MT_model (MultimodalTransformer): Frozen spectra encoder.
+        tokenizer (RobertaTokenizer): ChemBERTa tokenizer for SMILES strings.
+        itos (dict): SMILES id -> token mapping.
+        config: Experiment configuration (device, embedding widths,
+            ``BLIP_temperature``, ``projection_dim``, dropout).
+
+    The Q-Former is built in ``init_Qformer`` with 32 query tokens, a
+    cross-attention width of 768 and a cross-attention block every second layer;
+    the query-token parameters are re-initialised from the corresponding
+    text-attention weights.
+    """
+
     def __init__(
         self,
         CB_model,
@@ -245,6 +349,7 @@ class BLIPModel(nn.Module):
         itos,
         config,
         ):
+        """Store the backbones and build the projections, upscale layer and Q-Former."""
         super().__init__()
         self.CB_model = CB_model
         self.MT_model = MT_model
@@ -268,6 +373,26 @@ class BLIPModel(nn.Module):
 
         
     def forward(self, x):
+        """Compute the contrastive loss between the SMILES and spectra branches.
+
+        Args:
+            x (dict): Batch dictionary. The modality tensors are taken only for
+                modalities listed in ``config.training_mode``.
+
+        Returns:
+            tuple: ``(loss.mean(), loss)`` where ``loss`` has one entry per
+            batch element and is the average of the text and image directions
+            of the InfoNCE loss.
+
+        Side effects:
+            Writes ``x['trg_SMI_input']`` into the *caller's* batch dict, i.e.
+            it mutates its input.
+
+        NOTE (known issue, left unchanged): the computation ends with a literal
+        ``import IPython; IPython.embed();``, so every forward call (training
+        and validation alike) stops in an interactive debugger instead of
+        returning. In a non-interactive run this raises and kills the process.
+        """
         # Getting Image and Text Features
         #smi_input_ids, smi_attention_mask, spectra_padded, spectra_mask = batch
         src_1H = x['src_1H'].to(self.config.device) if "1H" in self.config.training_mode else None
@@ -347,10 +472,31 @@ class BLIPModel(nn.Module):
         texts_loss = cross_entropy(logits, targets, reduction='none')
         images_loss = cross_entropy(logits.T, targets.T, reduction='none')
         loss =  (images_loss + texts_loss) / 2.0 # shape: (batch_size)
+        # NOTE (known issue, left unchanged): leftover debugger breakpoint (see
+        # the method docstring); it prevents ``loss.mean()`` from ever being
+        # returned in a normal (non-interactive) run.
         import IPython; IPython.embed();
         return loss.mean(), loss
 
     def inference(self, x, gen_enc_SMI_list):
+        """Evaluate the contrastive objective on generated SMILES.
+
+        Unlike ``forward`` this runs under ``torch.no_grad()`` and takes the
+        generated SMILES as strings.
+
+        Args:
+            x (dict): Spectra / target batch, read like in ``forward``.
+            gen_enc_SMI_list (list[str]): Generated SMILES to encode with
+                ChemBERTa.
+
+        Returns:
+            tuple: ``(mean_loss, losses, logits, targets, logits[:, 0])``.
+
+        Side effects:
+            Temporarily switches every sub-module to eval mode and unconditionally
+            switches them back to train mode before returning (so a caller
+            running inference inside validation ends up in train mode).
+        """
         # Set all components to evaluation mode
         self.CB_model.eval()
         self.MT_model.eval()
@@ -524,6 +670,22 @@ class BLIPModel(nn.Module):
     #     return  losses.mean(), losses, logits, targets, logits[:,0]
     
     def init_Qformer(self, num_query_token, encoder_width, cross_attention_freq=2):
+        """Build a pretrained BERT language model adapted as a Q-Former.
+
+        Args:
+            num_query_token (int): Number of learnable query tokens.
+            encoder_width (int): Hidden size of the cross-attended memory.
+            cross_attention_freq (int): Insert one cross-attention block every
+                this many layers.
+
+        Returns:
+            tuple: ``(Qformer, query_tokens)`` where ``Qformer`` is a
+            ``BertLMHeadModel`` and ``query_tokens`` has shape
+            ``(1, num_query_token, hidden_size)``.
+
+        Side effects:
+            Downloads / loads ``bert-base-uncased`` (config and weights).
+        """
         encoder_config = BertConfig.from_pretrained("bert-base-uncased")
         encoder_config.encoder_width = encoder_width
         # insert cross-attention layer every other block
@@ -543,6 +705,17 @@ class BLIPModel(nn.Module):
     ######################generate me the cosine similarity of every  output to every input..
 
 def cross_entropy(preds, targets, reduction='none'):
+    """Soft-target cross entropy used by the contrastive loss.
+
+    Args:
+        preds: Logits ``(batch, batch)``.
+        targets: Soft targets of the same shape (rows sum to one).
+        reduction (str): ``"none"`` returns the per-row losses, ``"mean"``
+            their average.
+
+    Returns:
+        Tensor | None: The requested reduction, or ``None`` for any other value.
+    """
     log_softmax = nn.LogSoftmax(dim=-1)
     loss = (-targets * log_softmax(preds)).sum(1)
     if reduction == "none":
@@ -556,7 +729,21 @@ def cross_entropy(preds, targets, reduction='none'):
 ####################################################################################
 
 class ProjectionHead(nn.Module):
+    """Residual MLP head projecting an embedding to ``projection_dim``.
+
+    Args:
+        config: Configuration exposing ``CB_embedding``, ``MT_embedding``,
+            ``projection_dim`` and ``dropout``.
+        embedding_type (str): ``"CB"`` or ``"MT"``; selects the input width.
+
+    NOTE (known issue, left unchanged): the default value is the *list*
+    ``["CB", "MT"]``, which matches neither branch, so ``self.embedding_dim``
+    is never assigned and construction fails with ``AttributeError`` unless
+    the caller always passes a string.
+    """
+
     def __init__(self, config, embedding_type=["CB","MT"]):
+        """Select the input width and build the residual MLP."""
         super().__init__()
         if embedding_type=="CB":
             self.embedding_dim = config.CB_embedding
@@ -572,6 +759,7 @@ class ProjectionHead(nn.Module):
         self.layer_norm = nn.LayerNorm(self.projection_dim)
     
     def forward(self, x):
+        """Apply projection -> GELU -> fc -> dropout with a residual + LayerNorm."""
         projected = self.projection(x)
         x = self.gelu(projected)
         x = self.fc(x)
@@ -588,8 +776,16 @@ class ProjectionHead(nn.Module):
 
 
 class BLIPMultiGPU(pl.LightningModule):
-    
+    """Lightning wrapper around :class:`BLIPModel`.
+
+    Args:
+        config: Experiment configuration. Reads ``itos_path``, ``stoi_path``,
+            ``stoi_MF_path``, ``BLIP_model_save_dir`` and
+            ``model_save_interval``, and forwards the rest to ``BLIP_make``.
+    """
+
     def __init__(self, config):
+        """Load the vocabularies, build ``BLIPModel`` and store the optimizer."""
         super(BLIPMultiGPU, self).__init__()
         self.start_time = time.time()
         self.config=config
@@ -603,12 +799,25 @@ class BLIPMultiGPU(pl.LightningModule):
             
     
     def forward(self, x):
-        # Your forward logic
+        """Return the scalar contrastive loss for the batch."""
         loss, losses = self.BLIP_model(x)
         return loss
 
     
     def training_step(self, batch, batch_idx):
+        """Run one training step and log the scalar loss.
+
+        Args:
+            batch (dict): Batch dictionary.
+            batch_idx (int): Index of the current batch (unused).
+
+        Returns:
+            dict: ``{'loss': loss, 'log': {'train_loss': loss}}``.
+
+        Side effects:
+            Pushes ``train_loss`` straight to the experiment logger
+            (Weights & Biases).
+        """
         loss = self.forward(batch)
         #### update this part
         tensorboard_logs = {'train_loss': loss}   
@@ -617,7 +826,15 @@ class BLIPMultiGPU(pl.LightningModule):
 
     
     def validation_step(self, batch, batch_idx):
-        #import IPython; IPython.embed();
+        """Run one validation step and log the scalar loss under ``test_loss``.
+
+        Args:
+            batch (dict): Batch dictionary.
+            batch_idx (int): Index of the current batch (unused).
+
+        Returns:
+            dict: ``{'loss': loss, 'log': {'test_loss': loss}}``.
+        """
         loss = self.forward(batch)
         tensorboard_logs = {'test_loss': loss}   
         self.logger.experiment.log({'test_loss': loss})   ### test_loss
@@ -625,6 +842,18 @@ class BLIPMultiGPU(pl.LightningModule):
 
 
     def on_epoch_end(self):
+        """Save a ``.ckpt`` and a raw ``.pth`` state dict at the end of each epoch.
+
+        Side effects:
+            Writes ``MultimodalBLIP_Epoch_{epoch}_Loss{loss}.pth`` and the
+            matching ``.ckpt`` into ``config.BLIP_model_save_dir``.
+
+        NOTE (known issue, left unchanged): ``train_loss`` is only pushed
+        directly to the experiment logger (``self.logger.experiment.log``) and
+        never through ``self.log``, so ``trainer.callback_metrics`` usually has
+        no such key. ``loss`` is then ``None`` and ``f'{loss:.3f}'`` raises
+        ``TypeError`` at the end of the first epoch.
+        """
         epoch = self.current_epoch
         loss = self.trainer.callback_metrics.get('train_loss', None)  
         save_path = os.path.join(self.config.BLIP_model_save_dir, f"MultimodalBLIP_Epoch_{epoch}_Loss{loss:.3f}.pth")
@@ -633,6 +862,14 @@ class BLIPMultiGPU(pl.LightningModule):
         torch.save(self.BLIP_model.state_dict(), save_path)
         
     def on_batch_end(self):
+        """Save a checkpoint whenever ``model_save_interval`` seconds elapsed.
+
+        Side effects:
+            Writes a timestamped ``.pth`` state dict and ``.ckpt`` into
+            ``config.BLIP_model_save_dir``, prints the path and resets the
+            timer. Same ``callback_metrics['train_loss']`` caveat as
+            ``on_epoch_end`` applies to the loss formatting.
+        """
         elapsed_time = time.time() - self.start_time
         time_obj = datetime.timedelta(seconds=elapsed_time)
         time_str = str(time_obj).split('.')[0]  # This will give you a string formatted as 'H:M:S'
@@ -649,6 +886,17 @@ class BLIPMultiGPU(pl.LightningModule):
             self.start_time = time.time()
     
     def configure_optimizers(self):
+        """Return the pre-built optimizer plus a reduce-on-plateau scheduler.
+
+        Returns:
+            dict: Lightning's optimizer configuration; the scheduler monitors
+            ``'train_loss'`` with mode ``min``.
+
+        NOTE (known issue, left unchanged): the monitored key ``'train_loss'``
+        is produced by ``training_step`` only in the legacy ``'log'`` dict, not
+        via ``self.log``, so the scheduler may never receive a metric and never
+        reduce the learning rate.
+        """
         optimizer = self.optimizer #torch.optim.AdamW(self.parameters(), lr=self.config.lr)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
         return {

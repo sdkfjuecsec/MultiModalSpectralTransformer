@@ -1,5 +1,46 @@
 # before modifying _embed_spectrum_13C for single sample processing
 
+"""Multimodal transformer (MMT) and its PyTorch-Lightning training wrapper.
+
+Pipeline overview
+-----------------
+Every available modality (1H, 13C, HSQC, COSY, IR, molecular formula `MF`,
+molecular SMILES `MS`, molecular weight `MW`) is first projected to
+``config.hidden_size`` by its own embedding layer. The per-modality embeddings
+are then concatenated along the *token* axis together with the MF/MS/MW
+tokens, encoded by one transformer encoder per "primary" modality, and the
+resulting memories are concatenated and fused once more by ``encoder_cross``.
+The fused memory is (a) mean-pooled into a fingerprint head (``fp1``) and
+(b) used as the memory of a causal transformer decoder that generates the
+SMILES token sequence.
+
+Contents
+--------
+make_pl
+    Loads the vocabularies and builds the loss functions / SGNN statistics.
+create_metric
+    Wrapper around the helper validity and count-based rewards.
+run_sgnn_sim_calculations_if_possible_2D
+    Runs the SGNN spectrum simulation and scores generated spectra.
+calculate_total_loss
+    Assembles the weighted total loss.
+PointEmbedding_* / SpectrumEmbedding_*
+    Per-point and per-spectrum linear projection (+ ReLU).
+MolecularFormulaEmbedding / MolecularSmilesEmbedding / Embedding_MW
+    Token / scalar embedding layers.
+MultimodalTransformer
+    The encoder + decoder network itself.
+TransformerMultiGPU
+    ``pl.LightningModule`` wiring the network into training / validation.
+
+Variant note: this is the MW/MF ablation build. Unlike
+``models_MMT_v15_4.py`` (and its byte-identical twin
+``models_MMT_v15_4_orig.py``) it (a) overwrites the MF and MW embeddings /
+masks with zeros inside every ``_create_embeddings_and_masks_*`` helper and
+(b) wraps the whole prologue of ``MultimodalTransformer.forward`` in a bare
+``try`` / ``except`` that drops into an interactive IPython shell.
+"""
+
 import argparse
 import math
 import os
@@ -48,6 +89,26 @@ if base_path not in sys.path:
     sys.path.append(base_path)
 
 def make_pl(config):
+    """Load the vocabularies and build the loss functions used for training.
+
+    Reads four JSON dictionaries from disk (``config.itos_path``,
+    ``config.stoi_path``, ``config.itos_MF_path``, ``config.stoi_MF_path``) and
+    loads the per-target (13C / 1H) standardisation statistics used by the
+    SGNN feedback path.
+
+    Args:
+        config: Experiment configuration exposing the four vocabulary paths,
+            ``device`` and the SGNN related settings used by ``load_std_mean``.
+
+    Returns:
+        tuple: ``(SMI_loss_fn, MF_loss_fn, MW_loss_fn, FP_loss_fn, itos, stoi,
+        itos_MF, stoi_MF, sgnn_means_stds)``. ``MF_loss_fn`` is constructed but
+        never used by the current loss computation.
+
+    Side effects:
+        Reads JSON files from disk and moves the loss modules onto
+        ``config.device``.
+    """
     
     ### Load dictionaries:
     # Load from file
@@ -111,12 +172,43 @@ def create_metric(gen_smis, trg_smis):
 
 
 def run_sgnn_sim_calculations_if_possible_2D(df_succ_smis, tensor_2D, sgnn_means_stds, config, NMR_technique):
+    """Simulate 2D spectra for generated SMILES and score them against the input.
+
+    The simulator is run three times with decreasing micro-batch sizes
+    (``batch_size / gpu_num``, then 10, then 1) so that samples that make the
+    parallel simulator fail still get a chance to succeed.
+
+    Args:
+        df_succ_smis (pd.DataFrame): Subset of the current batch whose SMILES
+            could be parsed; must provide ``sample-id`` and ``sdf_path``.
+        tensor_2D (list): Experimental 2D spectrum tensors, one entry per
+            batch sample, indexed by the integer prefix of ``sample-id``.
+        sgnn_means_stds (tuple): ``(mean_C, std_C, mean_H, std_H)`` used by the
+            SGNN simulator to undo the target normalisation.
+        config: Experiment configuration; ``matching``, ``padding``,
+            ``ML_dump_folder``, ``batch_size`` and ``gpu_num`` are read.
+        NMR_technique (str): ``"HSQC"`` or ``"COSY"``, selects the loader used
+            for the simulated dataframe.
+
+    Returns:
+        tuple: ``(avg_sim_error, sim_error_list)``; ``(None, None)`` when the
+        simulator fails or nothing could be scored.
+
+    Side effects:
+        Runs the SGNN simulator (writes into ``config.ML_dump_folder``) and
+        silently swallows per-sample exceptions.
+    """
     #import IPython; IPython.embed();
 
     try:
         batch_data, failed_ids = sc.main_execute(df_succ_smis, sgnn_means_stds, config.ML_dump_folder, int(config.batch_size / config.gpu_num))
     except Exception as e:
         # Handle exceptions from batch data execution
+        # NOTE (known issue, left unchanged): this early exit returns three
+        # values while both call sites unpack only two
+        # (``avg, list = run_sgnn_sim_calculations_if_possible_2D(...)``), so a
+        # simulator failure raises ``ValueError`` here. That error is in turn
+        # swallowed by the bare ``except`` in ``calculate_total_loss``.
         return None, None, None
 
     ### run the single generations 
@@ -152,6 +244,10 @@ def run_sgnn_sim_calculations_if_possible_2D(df_succ_smis, tensor_2D, sgnn_means
         
         if NMR_technique == "HSQC":
             #try: ### Because some of the data will be blanked out from the dataloader if selected which would cause an error when this index is selected.
+            # NOTE (known issue, left unchanged): ``sf`` is not imported anywhere
+            # in this module, so this call raises ``NameError``; the bare
+            # ``except: pass`` below then silently drops every sample, making
+            # the SGNN feedback term always ``None``/zero.
             try: 
                 sgnn_sim_df = sf.load_HSQC_dataframe_from_file(sdf_path)
             # Convert tensor to numpy array
@@ -170,6 +266,7 @@ def run_sgnn_sim_calculations_if_possible_2D(df_succ_smis, tensor_2D, sgnn_means
 
         elif NMR_technique == "COSY":
             #try: ### Because some of the data will be blanked out from the dataloader if selected which would cause an error when this index is selected.
+            # Same missing ``sf`` module as above applies to the COSY branch.
             try: 
                 sgnn_sim_df = sf.load_COSY_dataframe_from_file(sdf_path)
             # Convert tensor to numpy array
@@ -356,57 +453,115 @@ def calculate_total_loss(gen_output,
 
 
 class PointEmbedding_1H(nn.Module):
+    """Affine projection applied independently to every 1H spectrum point.
+
+    Args:
+        input_dim (int): Features per point (``config.input_dim_1H``).
+        output_dim (int): Projection width (``config.hidden_size``).
+    """
+
     def __init__(self, input_dim, output_dim):
+        """Create the single linear layer used by ``forward``."""
         super(PointEmbedding_1H, self).__init__()
         self.fc_H = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
+        """Return ``x @ W^T + b``; the ReLU lives in ``SpectrumEmbedding_1H``."""
         x = self.fc_H(x)
         return x    
     
 class PointEmbedding_13C(nn.Module):
+    """Affine projection applied independently to every 13C spectrum point.
+
+    Args:
+        input_dim (int): Features per point (``config.input_dim_13C``).
+        output_dim (int): Projection width (``config.hidden_size``).
+    """
+
     def __init__(self, input_dim, output_dim):
+        """Create the single linear layer used by ``forward``."""
         super(PointEmbedding_13C, self).__init__()
         self.fc_C = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
+        """Return the projected points; activation is applied by the caller."""
         x = self.fc_C(x)
         return x
     
 class PointEmbedding_HSQC(nn.Module):
+    """Affine projection applied to every HSQC peak (F2, F1[, direction]) row.
+
+    Args:
+        input_dim (int): Features per peak (``config.input_dim_HSQC``).
+        output_dim (int): Projection width (``config.hidden_size``).
+    """
+
     def __init__(self, input_dim, output_dim):
+        """Create the single linear layer used by ``forward``."""
         super(PointEmbedding_HSQC, self).__init__()
         self.fc_HSQC = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
+        """Return the projected peaks; activation is applied by the caller."""
         x = self.fc_HSQC(x)
         return x
 
 class PointEmbedding_COSY(nn.Module):
+    """Affine projection applied to every COSY peak row.
+
+    Args:
+        input_dim (int): Features per peak (``config.input_dim_COSY``).
+        output_dim (int): Projection width (``config.hidden_size``).
+    """
+
     def __init__(self, input_dim, output_dim):
+        """Create the single linear layer used by ``forward``."""
         super(PointEmbedding_COSY, self).__init__()
         self.fc_COSY = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
+        """Return the projected peaks; activation is applied by the caller."""
         x = self.fc_COSY(x)
         return x
 
 class SpectrumEmbedding_1H(nn.Module):
+    """Pointwise 1H projection followed by a ReLU.
+
+    Args:
+        input_dim (int): Features per 1H point.
+        output_dim (int): Embedding width (``config.hidden_size``).
+    """
+
     def __init__(self, input_dim, output_dim):
+        """Wrap a ``PointEmbedding_1H`` layer."""
         super(SpectrumEmbedding_1H, self).__init__()
         self.point_embedding_layer_1H = PointEmbedding_1H(input_dim, output_dim)
 
     def forward(self, padded_spectra):
+        """Project every point of a padded 1H spectrum and apply ReLU."""
         embedded_spectra = self.point_embedding_layer_1H(padded_spectra)
         embedded_spectra = F.relu(embedded_spectra)          
         return embedded_spectra
 
 class SpectrumEmbedding_13C(nn.Module):
+    """Pointwise 13C projection followed by a ReLU.
+
+    Args:
+        input_dim (int): Features per 13C point.
+        output_dim (int): Embedding width (``config.hidden_size``).
+    """
+
     def __init__(self, input_dim, output_dim):
+        """Wrap a ``PointEmbedding_13C`` layer."""
         super(SpectrumEmbedding_13C, self).__init__()
         self.point_embedding_layer_13C = PointEmbedding_13C(input_dim, output_dim)
 
     def forward(self, padded_spectra):
+        """Project the padded 13C spectrum and apply ReLU.
+
+        The 13C tensor arrives without a trailing feature axis, so an extra
+        singleton dimension is appended before the linear layer sees it.
+        """
         padded_spectra1 = padded_spectra.unsqueeze(-1)
         embedded_spectra = self.point_embedding_layer_13C(padded_spectra1)
         embedded_spectra = F.relu(embedded_spectra)      
@@ -414,78 +569,162 @@ class SpectrumEmbedding_13C(nn.Module):
         return embedded_spectra
 
 class SpectrumEmbedding_HSQC(nn.Module):
+    """Pointwise HSQC projection followed by a ReLU.
+
+    Args:
+        input_dim (int): Features per HSQC peak (2 or 3).
+        output_dim (int): Embedding width (``config.hidden_size``).
+    """
+
     def __init__(self, input_dim, output_dim):
+        """Wrap a ``PointEmbedding_HSQC`` layer."""
         super(SpectrumEmbedding_HSQC, self).__init__()
         self.point_embedding_layer_HSQC = PointEmbedding_HSQC(input_dim, output_dim)
 
     def forward(self, padded_spectra):
+        """Project every HSQC peak and apply ReLU."""
         embedded_spectra = self.point_embedding_layer_HSQC(padded_spectra)
         embedded_spectra = F.relu(embedded_spectra)
 
         return embedded_spectra
     
 class SpectrumEmbedding_COSY(nn.Module):
+    """Pointwise COSY projection followed by a ReLU.
+
+    Args:
+        input_dim (int): Features per COSY peak.
+        output_dim (int): Embedding width (``config.hidden_size``).
+    """
+
     def __init__(self, input_dim, output_dim):
+        """Wrap a ``PointEmbedding_COSY`` layer."""
         super(SpectrumEmbedding_COSY, self).__init__()
         self.point_embedding_layer_COSY = PointEmbedding_COSY(input_dim, output_dim)
 
     def forward(self, padded_spectra):
+        """Project every COSY peak and apply ReLU."""
         embedded_spectra = self.point_embedding_layer_COSY(padded_spectra)
         embedded_spectra = F.relu(embedded_spectra)     
         return embedded_spectra  
     
 class SpectrumEmbedding_IR(nn.Module):
+    """Project a whole fixed-length IR spectrum (all bins at once) to one token.
+
+    Args:
+        num_bins (int): Number of IR bins (``config.input_dim_IR``).
+        embedding_dim (int): Embedding width (``config.hidden_size``).
+    """
+
     def __init__(self, num_bins, embedding_dim):
+        """Create the dense layer that mixes all bins."""
         super(SpectrumEmbedding_IR, self).__init__()
         self.linear_spec_embedding_IR = nn.Linear(num_bins, embedding_dim)
     
     def forward(self, x):
+        """Cast the bins to float and apply the dense projection.
+
+        The cast is required because the dataloader may hand over integer
+        tensors, which ``nn.Linear`` does not accept.
+        """
         embedded_spectrum = self.linear_spec_embedding_IR(x.float())
         return embedded_spectrum
 
 class MolecularFormulaEmbedding(nn.Module):
+    """Lookup-table embedding of the tokenised molecular formula.
+
+    Args:
+        vocab_size (int): Formula vocabulary size (``config.MF_vocab_size``).
+        embedding_dim (int): Embedding width (``config.hidden_size``).
+    """
+
     def __init__(self, vocab_size, embedding_dim):
+        """Create the embedding table; index 0 is the padding token."""
         super(MolecularFormulaEmbedding, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
         #self.embedding_linear = nn.Linear(embedding_dim, embedding_dim)
 
     def forward(self, x):
+        """Return the embedding of ``x`` (``LongTensor``)."""
         x = self.embedding(x) 
         return x  
 
 class MolecularSmilesEmbedding(nn.Module):
+    """Lookup-table embedding of the tokenised molecular SMILES string.
+
+    Args:
+        vocab_size (int): SMILES vocabulary size (``config.MS_vocab_size``).
+        embedding_dim (int): Embedding width (``config.hidden_size``).
+    """
+
     def __init__(self, vocab_size, embedding_dim):
+        """Create the embedding table; index 0 is the padding token."""
         super(MolecularSmilesEmbedding, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
         #self.embedding_linear = nn.Linear(embedding_dim, embedding_dim)
 
     def forward(self, x):
+        """Return the embedding of ``x`` (``LongTensor``)."""
         x = self.embedding(x) 
         return x  
     
 class Embedding_MW(nn.Module):
+    """Project a single scalar (molecular weight) to a hidden-size token.
+
+    Args:
+        num_bins (int): Input width; always called with 1 by the model.
+        embedding_dim (int): Embedding width (``config.hidden_size``).
+    """
+
     def __init__(self, num_bins, embedding_dim):
+        """Create the dense layer that expands the scalar."""
         super(Embedding_MW, self).__init__()
         self.linear_spec_embedding_MW = nn.Linear(num_bins, embedding_dim)
 
     def forward(self, x):
+        """Cast to float and project the molecular weight."""
         x = x.float()  # Cast to float if necessary
         embedded_spectrum = self.linear_spec_embedding_MW(x)
         return embedded_spectrum
 
 class MolecularSmilesEmbedding(nn.Module):
+    """Lookup-table embedding of the tokenised molecular SMILES string.
+
+    Duplicate of the class defined above (kept verbatim; the later definition
+    shadows the earlier one). Same arguments and same behaviour.
+
+    Args:
+        vocab_size (int): SMILES vocabulary size.
+        embedding_dim (int): Embedding width.
+    """
+
     def __init__(self, vocab_size, embedding_dim):
+        """Create the embedding table; index 0 is the padding token."""
         super(MolecularSmilesEmbedding, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
         #self.embedding_linear = nn.Linear(embedding_dim, embedding_dim)
 
     def forward(self, x):
+        """Return the embedding of ``x`` (``LongTensor``)."""
         x = self.embedding(x) 
         return x  
 
     
 class MultimodalTransformer(nn.Module):
+    """Encoder--decoder network fusing spectra, formulas, SMILES and MW.
+
+    The constructor instantiates every embedding layer and every transformer
+    block; which of them actually run is decided per call from
+    ``config.training_mode`` (a string such as ``"1H+13C+MF"``).
+
+    Args:
+        config: Experiment configuration holding the hidden size, head counts,
+            per-modality input dimensions and vocabulary sizes.
+        src_pad_idx (int): Padding index of the source sequences (accepted for
+            API symmetry; the attribute itself is intentionally not stored).
+    """
+
     def __init__(self, config, src_pad_idx=0):
+        """Build all embedding, encoder, decoder and head modules."""
         super(MultimodalTransformer, self).__init__()
 
         self.config = config
@@ -551,7 +790,32 @@ class MultimodalTransformer(nn.Module):
                                      embedding_src_MS=None, src_padding_mask_MS=None,
                                      embedding_src_MW=None, src_padding_mask_MW=None
                                      ):
-        # Overwrite MW and MF with zeros and all-ones mask of correct shapes if not None
+        """Assemble the 1H encoder input from the enabled modalities.
+
+        Appends the MF/MS/MW token blocks in the fixed order 1H -> MF -> MS ->
+        MW, but only for modalities present in ``self.config.training_mode``
+        and actually supplied (``None`` entries are skipped).
+
+        Ablation variant: the MF and MW embeddings and padding masks are
+        overwritten with zeros first. Because the zeroed mask is all-False
+        (i.e. "nothing is padding"), those blocks are not ignored; they remain
+        in the sequence as constant zero tokens.
+
+        Args:
+            embedding_src_1H / src_padding_mask_1H: 1H embedding and mask.
+            embedding_src_MF / src_padding_mask_MF: formula embedding and mask.
+            embedding_src_MS / src_padding_mask_MS: SMILES embedding and mask.
+            embedding_src_MW / src_padding_mask_MW: weight embedding and mask.
+
+        Returns:
+            tuple: ``(embedding_src, src_padding_mask)`` concatenated along the
+            sequence axis (``dim=0`` for embeddings, ``dim=1`` for masks), or
+            ``(None, None)`` when no modality is active.
+
+        Side effects:
+            Prints a warning and returns ``(None, None)`` when nothing matched.
+        """
+        # Ablation: zero out the MF/MW blocks so the model cannot use them.
         if embedding_src_MW is not None:
             embedding_src_MW = torch.zeros_like(embedding_src_MW)
         if src_padding_mask_MW is not None:
@@ -592,6 +856,23 @@ class MultimodalTransformer(nn.Module):
                                      embedding_src_MS=None, src_padding_mask_MS=None,
                                      embedding_src_MW=None, src_padding_mask_MW=None
                                      ):
+        """Assemble the 13C encoder input from the enabled modalities.
+
+        Same contract as ``_create_embeddings_and_masks_1H`` but for the 13C
+        spectrum; the concatenation order is 13C -> MF -> MS -> MW. The MF/MW
+        blocks are zeroed (ablation variant) and, being all-False-masked, stay
+        in the sequence as constant zero tokens.
+
+        Args:
+            embedding_src_13C / src_padding_mask_13C: 13C embedding and mask.
+            embedding_src_MF / src_padding_mask_MF: formula embedding and mask.
+            embedding_src_MS / src_padding_mask_MS: SMILES embedding and mask.
+            embedding_src_MW / src_padding_mask_MW: weight embedding and mask.
+
+        Returns:
+            tuple: ``(embedding_src, src_padding_mask)`` or ``(None, None)``.
+        """
+        # Ablation: zero out the MF/MW blocks so the model cannot use them.
         if embedding_src_MW is not None:
             embedding_src_MW = torch.zeros_like(embedding_src_MW)
         if src_padding_mask_MW is not None:
@@ -630,6 +911,22 @@ class MultimodalTransformer(nn.Module):
                                      embedding_src_MS=None, src_padding_mask_MS=None,
                                      embedding_src_MW=None, src_padding_mask_MW=None
                                      ):
+        """Assemble the HSQC encoder input from the enabled modalities.
+
+        Same contract as ``_create_embeddings_and_masks_1H``; the concatenation
+        order is HSQC -> MF -> MS -> MW. The MF/MW blocks are zeroed (ablation
+        variant) and remain attended as constant zero tokens.
+
+        Args:
+            embedding_src_HSQC / src_padding_mask_HSQC: HSQC embedding and mask.
+            embedding_src_MF / src_padding_mask_MF: formula embedding and mask.
+            embedding_src_MS / src_padding_mask_MS: SMILES embedding and mask.
+            embedding_src_MW / src_padding_mask_MW: weight embedding and mask.
+
+        Returns:
+            tuple: ``(embedding_src, src_padding_mask)`` or ``(None, None)``.
+        """
+        # Ablation: zero out the MF/MW blocks so the model cannot use them.
         if embedding_src_MW is not None:
             embedding_src_MW = torch.zeros_like(embedding_src_MW)
         if src_padding_mask_MW is not None:
@@ -669,12 +966,27 @@ class MultimodalTransformer(nn.Module):
                                      embedding_src_MS=None, src_padding_mask_MS=None,
                                      embedding_src_MW=None, src_padding_mask_MW=None
                                      ):
+        """Assemble the COSY encoder input from the enabled modalities.
+
+        Same contract as ``_create_embeddings_and_masks_1H``; the concatenation
+        order is COSY -> MF -> MS -> MW. The MF/MW blocks are zeroed (ablation
+        variant) and remain attended as constant zero tokens.
+
+        Args:
+            embedding_src_COSY / src_padding_mask_COSY: COSY embedding and mask.
+            embedding_src_MF / src_padding_mask_MF: formula embedding and mask.
+            embedding_src_MS / src_padding_mask_MS: SMILES embedding and mask.
+            embedding_src_MW / src_padding_mask_MW: weight embedding and mask.
+
+        Returns:
+            tuple: ``(embedding_src, src_padding_mask)`` or ``(None, None)``.
+        """
 
         # Initialize empty lists to collect embeddings and masks
         embeddings = []
         masks = []
 
-         # Overwrite MW and MF with zeros and all-ones mask of correct shapes if not None
+        # Ablation: zero out the MF/MW blocks so the model cannot use them.
         if embedding_src_MW is not None:
             embedding_src_MW = torch.zeros_like(embedding_src_MW)
         if src_padding_mask_MW is not None:
@@ -713,13 +1025,28 @@ class MultimodalTransformer(nn.Module):
                                      embedding_src_MS=None, src_padding_mask_MS=None,
                                      embedding_src_MW=None, src_padding_mask_MW=None
                                      ):
+        """Assemble the IR encoder input from the enabled modalities.
+
+        Same contract as ``_create_embeddings_and_masks_1H``; the concatenation
+        order is IR -> MF -> MS -> MW. The MF/MW blocks are zeroed (ablation
+        variant) and remain attended as constant zero tokens.
+
+        Args:
+            embedding_src_IR / src_padding_mask_IR: IR embedding and mask.
+            embedding_src_MF / src_padding_mask_MF: formula embedding and mask.
+            embedding_src_MS / src_padding_mask_MS: SMILES embedding and mask.
+            embedding_src_MW / src_padding_mask_MW: weight embedding and mask.
+
+        Returns:
+            tuple: ``(embedding_src, src_padding_mask)`` or ``(None, None)``.
+        """
 
         # Initialize empty lists to collect embeddings and masks
         embeddings = []
         masks = []
 
 
-         # Overwrite MW and MF with zeros and all-ones mask of correct shapes if not None
+        # Ablation: zero out the MF/MW blocks so the model cannot use them.
         if embedding_src_MW is not None:
             embedding_src_MW = torch.zeros_like(embedding_src_MW)
         if src_padding_mask_MW is not None:
@@ -753,13 +1080,34 @@ class MultimodalTransformer(nn.Module):
             return None, None
 
     def _embed_spectrum_1H(self, spectrum, mask):
+        """Embed a 1H spectrum and transpose it to ``(seq, batch, hidden)``.
+
+        Args:
+            spectrum: Padded 1H tensor as produced by the dataloader.
+            mask: Padding mask with 1 marking a padded position.
+
+        Returns:
+            tuple: ``(embedding, padding_mask)``. The ReLU is applied twice
+            here (once inside ``SpectrumEmbedding_1H`` and once again below),
+            which is idempotent and therefore harmless.
+        """
         embedding = self.linear_spec_embedding_1H(spectrum)
         embedding = F.relu(embedding) 
         embedding = embedding.permute(1,0,2)
+        # ``TransformerEncoder`` expects a boolean mask: True = ignore position.
         padding_mask = mask.to(torch.bool)
         return embedding, padding_mask
     
     def _embed_spectrum_13C(self, spectrum, mask):
+        """Embed a 13C spectrum and transpose it to ``(seq, batch, hidden)``.
+
+        Args:
+            spectrum: Padded 13C tensor.
+            mask: Padding mask with 1 marking a padded position.
+
+        Returns:
+            tuple: ``(embedding, padding_mask)``.
+        """
         embedding = self.linear_spec_embedding_13C(spectrum)
         embedding = F.relu(embedding)
         embedding = embedding.permute(1,0,2)
@@ -767,6 +1115,15 @@ class MultimodalTransformer(nn.Module):
         return embedding, padding_mask
     
     def _embed_spectrum_HSQC(self, spectrum, mask):
+        """Embed the HSQC peaks and transpose to ``(seq, batch, hidden)``.
+
+        Args:
+            spectrum: Padded HSQC peak tensor.
+            mask: Padding mask with 1 marking a padded position.
+
+        Returns:
+            tuple: ``(embedding, padding_mask)``.
+        """
         embedding = self.linear_spec_embedding_HSQC(spectrum)
         embedding = F.relu(embedding) 
         embedding = embedding.permute(1,0,2)
@@ -774,6 +1131,15 @@ class MultimodalTransformer(nn.Module):
         return embedding, padding_mask
 
     def _embed_spectrum_COSY(self, spectrum, mask):
+        """Embed the COSY peaks and transpose to ``(seq, batch, hidden)``.
+
+        Args:
+            spectrum: Padded COSY peak tensor.
+            mask: Padding mask with 1 marking a padded position.
+
+        Returns:
+            tuple: ``(embedding, padding_mask)``.
+        """
         embedding = self.linear_spec_embedding_COSY(spectrum)
         embedding = F.relu(embedding) 
         embedding = embedding.permute(1,0,2)
@@ -781,6 +1147,17 @@ class MultimodalTransformer(nn.Module):
         return embedding, padding_mask
     
     def _embed_spectrum_IR(self, spectrum, mask):
+        """Embed a whole IR spectrum into a single token position.
+
+        Args:
+            spectrum: IR bin tensor of shape ``(batch, num_bins)``.
+            mask: Unused; kept for a uniform call signature with the other
+                ``_embed_*`` helpers.
+
+        Returns:
+            tuple: ``(embedding, padding_mask)`` where the mask is all-False
+            (nothing is ever masked, because the IR spectrum is one token).
+        """
         # Apply linear transformation
         embedding = self.linear_spec_embedding_IR(spectrum)
         embedding = F.relu(embedding)
@@ -789,6 +1166,16 @@ class MultimodalTransformer(nn.Module):
         return embedding, padding_mask
 
     def _embed_MF(self, tokenized_formula, padding_mask):
+        """Embed the tokenised molecular formula.
+
+        Args:
+            tokenized_formula: ``LongTensor`` of formula token ids.
+            padding_mask: Padding mask produced by the collate function.
+
+        Returns:
+            tuple: ``(embedding, padding_mask)`` with the embedding transposed
+            to ``(seq, batch, hidden)`` for the encoder.
+        """
         embedding = self.linear_embedding_MF(tokenized_formula)
         embedding = F.relu(embedding)            
         #embedding = embedding.unsqueeze(0)   
@@ -798,6 +1185,16 @@ class MultimodalTransformer(nn.Module):
         return embedding, padding_mask    
 
     def _embed_MS(self, tokenized_smi, padding_mask):
+        """Embed the tokenised molecular SMILES.
+
+        Args:
+            tokenized_smi: ``LongTensor`` of SMILES token ids.
+            padding_mask: Padding mask produced by the collate function.
+
+        Returns:
+            tuple: ``(embedding, padding_mask)`` with the embedding transposed
+            to ``(seq, batch, hidden)``.
+        """
         embedding = self.linear_embedding_MS(tokenized_smi)
         embedding = F.relu(embedding)            
         #embedding = embedding.unsqueeze(0)   
@@ -807,6 +1204,15 @@ class MultimodalTransformer(nn.Module):
         return embedding, padding_mask 
        
     def _embed_MW(self, trg_MW):
+        """Embed the (normalised) molecular weight.
+
+        Args:
+            trg_MW: Weight tensor, already shaped ``(batch, 1)`` by ``forward``.
+
+        Returns:
+            tuple: ``(embedding, padding_mask)``; the mask is an all-False
+            ``(batch, 1)`` tensor because a single scalar can never be padded.
+        """
         embedding = self.linear_embedding_MW(trg_MW)
         embedding = F.relu(embedding)            
         #embedding = embedding.unsqueeze(0)     
@@ -823,6 +1229,41 @@ class MultimodalTransformer(nn.Module):
     
     
     def forward(self, src_1H, mask_1H, src_13C, mask_13C, src_HSQC, mask_HSQC, src_COSY, mask_COSY, src_IR, mask_IR, src_MF, mask_MF, src_MS, mask_MS, trg_MW, trg_SMI_input=None):
+        """Run the full encoder/decoder forward pass.
+
+        Args:
+            src_1H / mask_1H, src_13C / mask_13C, src_HSQC / mask_HSQC,
+            src_COSY / mask_COSY, src_IR / mask_IR, src_MF / mask_MF,
+            src_MS / mask_MS: Per-modality inputs and padding masks. Only the
+                modalities named in ``self.config.training_mode`` are used; the
+                others are skipped and may be ``None``.
+            trg_MW: Molecular weight tensor of shape ``(batch,)``; it is
+                reshaped to ``(batch, 1)`` below.
+            trg_SMI_input: Optional teacher-forcing decoder input of shape
+                ``(trg_seq_len, batch)``. When ``None`` the decoder is skipped.
+
+        Returns:
+            tuple: either ``(memory, embedding_src, src_padding_mask,
+            fingerprint)`` when ``trg_SMI_input`` is ``None``, or
+            ``(output, fingerprint, memory, src_padding_mask)`` otherwise,
+            where ``output`` holds the per-token logits for the SMILES loss.
+
+        Side effects:
+            None in the normal path; on error the ``except`` branch starts an
+            interactive IPython shell (see the known issue below).
+
+        NOTE (known issue, left unchanged): the embedding / feature-dimension
+        prologue is wrapped in a bare ``try`` whose handler is
+        ``import IPython; IPython.embed();``. Any real error there is swallowed
+        instead of propagated, and the handler only "works" when a TTY is
+        attached; otherwise it raises again. It also masks the original
+        exception, so the underlying failure is lost.
+
+        NOTE (known issue, left unchanged): ``current_batch_size`` starts as
+        ``False`` and is only overwritten for enabled modalities, so a mode set
+        without 1H/13C/HSQC/COSY would build placeholder tensors with a
+        boolean batch size and fail.
+        """
         try:
             
             trg_MW = trg_MW.unsqueeze(1)        
@@ -856,9 +1297,14 @@ class MultimodalTransformer(nn.Module):
                 embedding_src_MW = embedding_src_MW.unsqueeze(0) 
 
 
+            # Token counts of the per-modality blocks when entirely padded. These are
+            # hard-coded numbers (129/193 and 130/66) rather than values derived from
+            # ``config``; the hidden width is likewise fixed at 128 below.
             feature_dim = 193 if "MS" in self.config.training_mode else 129
             feature_dim_IR = 130 if "MS" in self.config.training_mode else 66
         except:
+            # NOTE (known issue, left unchanged): bare ``except`` + interactive
+            # debugger instead of error propagation (see the method docstring).
             import IPython; IPython.embed();
 
         memory = []
@@ -936,6 +1382,12 @@ class MultimodalTransformer(nn.Module):
             src_padding_mask.append(src_padding_mask_COSY)
         else:
             # create blank embeddings with blank mask 
+            # NOTE (known issue, left unchanged): the COSY placeholder is fixed
+            # at 65 tokens (hidden width 128) instead of ``feature_dim``. All
+            # three tensors agree on 65, so concatenation still succeeds, but a
+            # run whose real COSY length is not 65 mixes a mis-sized blank block
+            # into the fused memory and the all-ones mask marks those 65
+            # positions as ignored.
             memory_COSY = torch.zeros((65, current_batch_size, 128)).to(self.config.device)
             embedding_src_COSY = torch.zeros((65, current_batch_size, 128)).to(self.config.device)
             src_padding_mask_COSY = torch.ones((current_batch_size, 65)).to(self.config.device)
@@ -1011,8 +1463,21 @@ class MultimodalTransformer(nn.Module):
 ####################################################################################
 
 class TransformerMultiGPU(pl.LightningModule):
+    """PyTorch-Lightning wrapper around :class:`MultimodalTransformer`.
+
+    Owns the inner network, the loss functions, the SMILES vocabularies and the
+    SGNN statistics, and implements the training / validation loops, greedy and
+    multinomial SMILES sampling and periodic checkpointing.
+
+    Args:
+        config: Experiment configuration. ``model_save_dir``,
+            ``training_setup``, ``training_mode``, ``max_len``,
+            ``gen_SMI_sequence``, ``use_real_data`` and ``sampling_method`` are
+            the keys that drive behaviour.
+    """
 
     def __init__(self, config):
+        """Build the losses, the inner model and store the vocabularies."""
         super(TransformerMultiGPU, self).__init__()
         #self.l1 = torch.nn.Linear(512, 512)
         self.start_time = time.time()
@@ -1042,6 +1507,17 @@ class TransformerMultiGPU(pl.LightningModule):
 
 
     def forward(self, x):
+        """Select the configured modalities from the batch dict and call the model.
+
+        Args:
+            x (dict): Batch produced by the collate function. Keys are the
+                ``src_*`` / ``mask_*`` tensors per modality plus ``trg_MW``,
+                ``trg_enc_SMI``, ``trg_FP`` and ``trg_SMI_input``.
+
+        Returns:
+            tuple: ``(gen_output, gen_FP, memory, src_padding_mask)`` as
+            returned by :meth:`MultimodalTransformer.forward`.
+        """
         src_1H = x['src_1H'] if "1H" in self.config.training_mode else None
         mask_1H = x['mask_1H'] if "1H" in self.config.training_mode else None
         src_13C = x['src_13C'] if "13C" in self.config.training_mode else None
@@ -1077,6 +1553,24 @@ class TransformerMultiGPU(pl.LightningModule):
 
     
     def training_step(self, x, batch_idx): 
+        """One optimisation step: teacher forcing, optional sampling, weighted loss.
+
+        Args:
+            x (dict): Batch dictionary from the dataloader.
+            batch_idx (int): Index of the current batch; also used by
+                ``calculate_total_loss`` to update the loss weights and to
+                decide when to print progress.
+
+        Returns:
+            dict: ``{'loss': total_loss, 'log': {'train_loss': total_loss}}``
+            as required by Lightning, where ``total_loss`` is the first entry of
+            the loss list returned by ``calculate_total_loss``.
+
+        Side effects:
+            Logs every loss component to the configured experiment logger and,
+            when ``config.gen_SMI_sequence`` is True, runs autoregressive
+            sampling (which temporarily switches the model to eval mode).
+        """
 
         trg_enc_SMI = x['trg_enc_SMI']
         #src_MF = x['src_MF']
@@ -1147,6 +1641,19 @@ class TransformerMultiGPU(pl.LightningModule):
     
 
     def validation_step(self, x, batch_idx):
+        """Validation twin of :meth:`training_step`.
+
+        Computes exactly the same losses (including the optional SMILES
+        sampling) but logs them under the ``test_loss`` key and never updates
+        any weights.
+
+        Args:
+            x (dict): Batch dictionary from the validation dataloader.
+            batch_idx (int): Index of the current batch.
+
+        Returns:
+            dict: ``{'loss': total_loss, 'log': {'test_loss': total_loss}}``.
+        """
         trg_enc_SMI = x['trg_enc_SMI']
         #src_MF = x['src_MF']
         trg_FP = x['trg_FP']
@@ -1216,12 +1723,37 @@ class TransformerMultiGPU(pl.LightningModule):
         return {'loss': losses_list[0], 'log': tensorboard_logs}
     
     def on_epoch_end(self):
+        """Save a checkpoint named after the epoch and the current train loss.
+
+        Side effects:
+            Writes ``MultimodalTransformer_Epoch_{epoch}_Loss{loss}.pth`` into
+            ``config.model_save_dir``.
+
+        NOTE (known issue, left unchanged): ``loss`` is looked up in
+        ``self.trainer.callback_metrics``, which is only populated when
+        Lightning logs the metric itself (e.g. via ``self.log``). The legacy
+        ``'log'`` dict returned by ``training_step`` does not guarantee that key,
+        so ``loss`` can be ``None`` and ``f'{loss:.3f}'`` then raises
+        ``TypeError`` at the end of the first epoch.
+        """
         epoch = self.current_epoch
         loss = self.trainer.callback_metrics.get('train_loss', None)  
         save_path = os.path.join(self.config.model_save_dir, f"MultimodalTransformer_Epoch_{epoch}_Loss{loss:.3f}.pth")
         torch.save(self.model.state_dict(), save_path)
         
     def on_batch_end(self):
+        """Time-based checkpointing: save whenever the interval has elapsed.
+
+        Compares the wall-clock time since the last save (kept in
+        ``self.start_time``) against ``config.model_save_interval`` and, when it
+        has passed, writes both a ``.pth`` state dict and a Lightning ``.ckpt``
+        before resetting the timer.
+
+        Side effects:
+            Writes files into ``config.model_save_dir`` and prints the path.
+            Same ``callback_metrics['train_loss']`` caveat as
+            :meth:`on_epoch_end` applies to the ``.{loss}.{:.3f}`` formatting.
+        """
         elapsed_time = time.time() - self.start_time
         time_obj = datetime.timedelta(seconds=elapsed_time)
         time_str = str(time_obj).split('.')[0]  # This will give you a string formatted as 'H:M:S'
@@ -1239,6 +1771,19 @@ class TransformerMultiGPU(pl.LightningModule):
 
         
     def configure_optimizers(self):
+        """Return an AdamW optimizer plus a reduce-on-plateau LR scheduler.
+
+        Returns:
+            dict: ``{'optimizer': ..., 'lr_scheduler': {'scheduler': ...,
+            'monitor': 'loss'}}``. The learning rate was chosen in ``__init__``
+            from ``config.lr_pretraining`` / ``config.lr_finetuning``.
+
+        NOTE (known issue, left unchanged): the scheduler monitors the metric
+        named ``'loss'``, while ``training_step`` / ``validation_step`` only
+        report ``'train_loss'`` / ``'test_loss'``. Unless a Lightning version
+        happens to alias the legacy ``'loss'`` entry, the plateau scheduler never
+        receives a value and the learning rate is never reduced.
+        """
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
         return {'optimizer': optimizer,
@@ -1248,6 +1793,48 @@ class TransformerMultiGPU(pl.LightningModule):
                 }            
             
     def _generate_sequences(self, model, config, memory, src_padding_mask, max_output_len, temperature, stoi, itos):
+        """Autoregressively sample SMILES token sequences from the decoder.
+
+        Starts from a ``<SOS>`` token per batch element and appends one token at
+        a time, always running for ``max_output_len`` steps.
+
+        Args:
+            model (MultimodalTransformer): The inner model; its decoder,
+                target embedding, positional table, dropout and ``fc_out`` are
+                used directly.
+            config: Configuration exposing ``device`` and ``sampling_method``
+                (``"greedy"``, ``"multinomial"`` or ``"mix"``).
+            memory: Encoder memory of shape ``(src_len, batch, hidden)``.
+            src_padding_mask: Padding mask for ``memory``.
+            max_output_len (int): Number of decoding steps.
+            temperature (float): Softmax temperature applied to the logits.
+            stoi (dict): Token -> id mapping (``"<SOS>"`` is required).
+            itos (dict): Id -> token mapping, used to build the strings.
+
+        Returns:
+            tuple: ``(gen_tensor, gen_smi, confidence_list)`` for the requested
+            sampling method (for ``"mix"`` the tensors of both branches are
+            merged by ``hf.combine_gen_sims``).
+
+        Side effects:
+            Switches the model to eval mode for sampling and back to train mode
+            afterwards, and runs under ``torch.no_grad()``.
+
+        NOTE (known issue, left unchanged): the loop never stops at ``<EOS>``,
+        so decoding always consumes ``max_output_len`` steps even for finished
+        sequences.
+
+        NOTE (known issue, left unchanged): in the ``"mix"`` branch
+        ``gen_smi1`` is built from the *multinomial* confidence list
+        (``hf.tensor_to_smiles_and_prob_2(gen_tensor1[1:],
+        confidence_list_multinom, itos)``) and the greedy list is overwritten,
+        so the reported greedy confidences belong to the sampled sequence.
+
+        NOTE (known issue, left unchanged): ``model.train()`` is called
+        unconditionally at the end, so sampling during ``validation_step``
+        leaves the network in training mode (dropout active) for the remainder
+        of validation.
+        """
         #memory = model.transformer.encoder(src, src_key_padding_mask=src_padding_mask)
         model.eval()
         with torch.no_grad():
