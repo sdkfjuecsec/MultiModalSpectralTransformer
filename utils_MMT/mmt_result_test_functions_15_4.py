@@ -1,3 +1,44 @@
+"""Result-analysis utilities for the v15.4 Multimodal Transformer (MMT).
+
+This module wraps a trained MMT (and optionally a CLIP) checkpoint and provides
+the downstream analyses used to benchmark molecule generation from spectra:
+
+1.  Data / model loading helpers (``load_data``, ``load_MMT_model``,
+    ``load_CLIP_model``).
+2.  Correct-token / max-token probability statistics over a validation set
+    (``calculate_corr_max_prob``, ``predict_prop_correct_max_sequence_3``,
+    ``calculate_corr_max_prob_2``, ``predict_corr_max_performance_metric``,
+    ``run_model_analysis``, ``run_test_performance_CLIP_3``).
+3.  Greedy decoding and evaluation (``greedy_sequence_2``,
+    ``evaluate_greedy_2``, ``run_greedy_sampling``, ``run_greedy_sampling_v2``,
+    ``run_test_performance_CLIP_greedy_3``).
+4.  Multinomial sampling and evaluation (``multinomial_sequence_multi_2``,
+    ``run_multinomial_sampling``, ``run_multinomial_sampling_v2``,
+    ``run_test_mns_performance_CLIP_3``, ``generate_mns_list``,
+    ``run_mns_hit_counter_experiment``).
+5.  Post-processing / filtering: SMILES de-duplication, canonicalisation,
+    molecular-weight and molecular-formula filters, invalid-pair bookkeeping.
+6.  Similarity scoring (Tanimoto against the ground-truth molecule, CLIP dot
+    similarity, simulated HSQC/COSY error) and hit-rate statistics
+    (``calc_percentage_top_x_correct``, ``run_precentage_calculation*``).
+7.  Plotting helpers: Tanimoto histograms, rank histograms, molecule grids.
+
+The ``prepare_*_data_from_src_2`` helpers re-apply the same per-dimension
+scaling used by :mod:`utils_MMT.run_batch_gen_val_MMT_v15_4` before handing
+tensors to the SGNN spectrum simulator.
+
+Most functions take a ``config`` namespace carrying checkpoint paths,
+``config.device``, ``config.temperature``, ``config.max_len`` and
+``config.multinom_runs``. ``config.temperature`` is frequently mutated in place
+to escape sampling collapse and restored afterwards, so callers must not rely
+on it staying constant across a call.
+
+This file only performs analysis: it never trains models and never writes
+checkpoints. Large commented-out sections below preserve earlier versions of
+``calculate_max_prob``, ``predict_prop_max_sequence_3`` and
+``greedy_sequence_2``; they are not executed.
+"""
+
 # Standard library imports
 import glob
 import json
@@ -44,12 +85,40 @@ from utils_MMT.models_CLIP_v15_4 import CLIPMultiGPU  # CHANGE WHEN I HAVE A CLI
 
 
 def worker_init_fn(worker_id):
+    """Seed a DataLoader worker deterministically from the loader's base seed.
+
+    Args:
+        worker_id (int): Worker index supplied by PyTorch; unused because both
+            seeds derive from ``torch.initial_seed()``.
+
+    Returns:
+        None
+
+    Side effects:
+        Sets the global NumPy and ``random`` module seeds of the worker process.
+    """
     np.random.seed(torch.initial_seed() % (2**32))
     random.seed(torch.initial_seed() % (2**32))
 
 def prepare_HSQC_data_from_src_2(src_HSQC_list):
-    """
-    Processes and scales HSQC spectral data from the source list.
+    """Keep the non-empty HSQC rows and rescale them for the SGNN simulator.
+
+    Args:
+        src_HSQC_list (list[torch.Tensor]): Per-sample HSQC tensors of shape
+            (n_peaks, 2) holding (1H shift, 13C shift) pairs.
+
+    Returns:
+        list[torch.Tensor]: One tensor per input sample with the same shape,
+            where column 0 (1H) is multiplied by 10 and column 1 (13C) by 200.
+            Samples without any surviving row are returned as empty tensors so
+            the output stays aligned with the input list.
+
+    Side effects:
+        None; the input tensors are not modified in place.
+
+    Notes:
+        The row filter keeps rows where *both* coordinates are non-zero; the
+        inline comment in the body is misleading.
     """
     processed_HSQC = []
 
@@ -69,8 +138,20 @@ def prepare_HSQC_data_from_src_2(src_HSQC_list):
     return processed_HSQC
 
 def prepare_COSY_data_from_src_2(src_COSY_list):
-    """
-    Processes and scales HSQC spectral data from the source list.
+    """Keep the non-empty COSY rows and rescale them for the SGNN simulator.
+
+    Args:
+        src_COSY_list (list[torch.Tensor]): Per-sample COSY tensors of shape
+            (n_peaks, 2) holding (1H shift, 1H shift) pairs.
+
+    Returns:
+        list[torch.Tensor]: One tensor per input sample with the same shape,
+            where both columns are multiplied by 10. Samples without any
+            surviving row are returned as empty tensors so the output stays
+            aligned with the input list.
+
+    Side effects:
+        None; the input tensors are not modified in place.
     """
     processed_COSY = []
 
@@ -91,9 +172,23 @@ def prepare_COSY_data_from_src_2(src_COSY_list):
     return processed_COSY
 
 def generate_df_for_HSQC_calculations(gen_conv_SMI_list, trg_conv_SMI_list, src_HSQC_list):
-    """
-    Generates a DataFrame containing successfully generated SMILES along with their corresponding target SMILES
-    and a unique sample identifier. It also filters and returns new lists for source HSQC data and failed SMILES pairs.
+    """Split generated molecules into parseable and failed buckets (HSQC variant).
+
+    Args:
+        gen_conv_SMI_list (list[str]): Generated SMILES strings.
+        trg_conv_SMI_list (list[str]): Matching ground-truth SMILES strings.
+        src_HSQC_list (list[torch.Tensor]): HSQC tensors aligned with both lists.
+
+    Returns:
+        tuple:
+            pandas.DataFrame: Columns ``sample-id`` (``"<index>_<random>"``),
+                ``SMILES`` and ``trg_SMILES`` for the parseable molecules.
+            list[torch.Tensor]: ``src_HSQC_list`` restricted to those molecules.
+            list[list[str]]: ``[gen_smi, trg_smi]`` pairs that failed to parse.
+
+    Side effects:
+        Consumes the global ``random`` state when minting sample ids, so the ids
+        are not reproducible without seeding.
     """
     succ_gen_list =[]
     src_HSQC_list_new = []
@@ -114,9 +209,22 @@ def generate_df_for_HSQC_calculations(gen_conv_SMI_list, trg_conv_SMI_list, src_
     return df_succ_smis, src_HSQC_list_new, failed_list
 
 def generate_df_for_COSY_calculations(gen_conv_SMI_list, trg_conv_SMI_list, src_COSY_list):
-    """
-    Generates a DataFrame containing successfully generated SMILES along with their corresponding target SMILES
-    and a unique sample identifier. It also filters and returns new lists for source HSQC data and failed SMILES pairs.
+    """Split generated molecules into parseable and failed buckets (COSY variant).
+
+    Args:
+        gen_conv_SMI_list (list[str]): Generated SMILES strings.
+        trg_conv_SMI_list (list[str]): Matching ground-truth SMILES strings.
+        src_COSY_list (list[torch.Tensor]): COSY tensors aligned with both lists.
+
+    Returns:
+        tuple:
+            pandas.DataFrame: Columns ``sample-id`` (``"<index>_<random>"``),
+                ``SMILES`` and ``trg_SMILES`` for the parseable molecules.
+            list[torch.Tensor]: ``src_COSY_list`` restricted to those molecules.
+            list[list[str]]: ``[gen_smi, trg_smi]`` pairs that failed to parse.
+
+    Side effects:
+        Consumes the global ``random`` state when minting sample ids.
     """
     succ_gen_list =[]
     src_COSY_list_new = []
@@ -139,8 +247,24 @@ def generate_df_for_COSY_calculations(gen_conv_SMI_list, trg_conv_SMI_list, src_
 
 def calculate_corr_max_prob(config, model_MMT, val_dataloader, stoi, itos):
     """
-    Calculates and aggregates the probabilities of correct token predictions and maximum probabilities
-    across all batches in a validation dataloader using a given model.
+    Token-probability statistics for the teacher-forced (ground-truth) token stream.
+
+    Args:
+        config: Experiment namespace (``config.device``, ``config.temperature``).
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches collated by ``collate_fn``.
+        stoi (dict[str, int]): Token-to-index map; ``"<EOS>"`` terminates a sequence.
+        itos (dict[int, str]): Index-to-token map (accepted for API symmetry, unused).
+
+    Returns:
+        dict[str, list[float]]: Four parallel lists, one entry per sequence:
+        ``aggregated_corr_prob_multi`` (product of the probabilities assigned to
+        the ground-truth token), ``aggregated_corr_prob_avg`` (their mean),
+        ``aggregated_max_prob_multi`` (product of the arg-max token probabilities)
+        and ``aggregated_max_prob_avg`` (their mean).
+
+    Side effects:
+        Runs the model in eval/no-grad mode; prints a tqdm progress bar.
     """
     aggregated_corr_prob_multi, aggregated_corr_prob_avg, aggregated_max_prob_multi, aggregated_max_prob_avg =[],[],[],[]
     prob_dict_results = {}
@@ -282,7 +406,33 @@ def calculate_corr_max_prob(config, model_MMT, val_dataloader, stoi, itos):
 
 def evaluate_greedy_2(model, stoi, itos, val_dataloader, config, randomize=False):
     """
-    Evaluates the greedy generation approach over a dataset.
+    Evaluate greedy generation over a validation loader and score it.
+
+    Args:
+        model (torch.nn.Module): Trained MMT decoder.
+        stoi (dict): Token-to-index map.
+        itos (dict): Index-to-token map used to decode tensors back to SMILES.
+        val_dataloader (DataLoader): Validation batches; each batch must be a
+            ``dict`` with ``"trg_enc_SMI"`` and the spectral keys read by
+            ``vgmmt.run_model``.
+        config: Experiment namespace (``config.device``, ``config.max_len``,
+            ``config.temperature``).
+        randomize (bool, optional): If True, shuffle the generated SMILES before
+            pairing them with the targets; this destroys the 1:1 pairing and is
+            only meant as an ablation baseline. Defaults to False.
+
+    Returns:
+        tuple:
+            dict: Keys ``gen_conv_SMI_list``, ``trg_conv_SMI_list``,
+                ``gen_conv_SMI_list_`` / ``trg_conv_SMI_list_`` (pairs that
+                produced a Tanimoto score), ``idx_list``, ``token_probs_list``,
+                ``validity_term``, ``tanimoto_scores_``, ``tanimoto_scores_all``,
+                ``data_dict_list`` and ``failed``.
+            list: Source HSQC tensors.
+            list: Source COSY tensors.
+
+    Side effects:
+        Prints a tqdm bar; leaves ``config`` untouched (no temperature change).
     """    
     gen_conv_SMI_list = []
     trg_conv_SMI_list = []
@@ -339,7 +489,29 @@ def evaluate_greedy_2(model, stoi, itos, val_dataloader, config, randomize=False
 
 def predict_prop_correct_max_sequence_3(model, stoi, memory, src_padding_mask, trg_enc_SMI, config):
     """
-    Predicts the properties of each token in a sequence generated by a transformer model.
+    Predict the per-token probabilities of the ground-truth and arg-max tokens.
+
+    Teacher-forces the *ground-truth* SMILES into the decoder while separately
+    tracking the greedy (arg-max) path, so both probability streams are produced
+    in a single pass over the sequence.
+
+    Args:
+        model (torch.nn.Module): Trained MMT decoder.
+        stoi (dict[str, int]): Token-to-index map (``"<SOS>"`` start token).
+        memory (torch.Tensor): Encoder memory, shape (seq_len, batch, d_model).
+        src_padding_mask (torch.BoolTensor): Encoder padding mask.
+        trg_enc_SMI (torch.Tensor): Ground-truth target tokens (``<SOS>`` included).
+        config: Experiment namespace (``config.device``, ``config.temperature``).
+
+    Returns:
+        tuple: ``trg_tensor`` (ground-truth tokens, ``<SOS>`` removed),
+        ``corr_token_prob`` (probability of the ground-truth token per step),
+        ``trg_tensor_max`` (arg-max tokens, ``<SOS>`` removed) and
+        ``max_token_prob`` (their probabilities).
+
+    Side effects:
+        Switches ``model`` to eval mode; all computation runs under
+        ``torch.no_grad``.
     """
 
     # Ensure the model is in evaluation mode
@@ -401,7 +573,31 @@ def predict_prop_correct_max_sequence_3(model, stoi, memory, src_padding_mask, t
 
 
 def run_model_analysis(config, model_MMT, val_dataloader, stoi, itos):
-    #import IPython; IPython.embed();
+    """Run the full probability + greedy analysis pipeline for one loader.
+
+    Args:
+        config: Experiment namespace.
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches.
+        stoi (dict): Token-to-index map.
+        itos (dict): Index-to-token map.
+
+    Returns:
+        tuple[dict, dict]: ``prob_dict_results`` from
+        :func:`calculate_corr_max_prob`, and the enriched ``results_dict`` from
+        :func:`evaluate_greedy_2` (with SGNN HSQC/COSY errors, the successful
+        SMILES frame and the prepared spectra tensors added).
+
+    Side effects:
+        Prints stage names; runs the SGNN simulator through
+        ``ttf.run_sgnn_sim_calculations_if_possible_return_spectra``.
+
+    NOTE (known issue, left unchanged):
+        The ``try`` block binds ``final_prob_*`` locals that are never used or
+        returned, and it catches everything with a bare ``except``. If the
+        aggregation fails, the statistics are silently dropped and the caller
+        receives no confidence summary at all.
+    """
     print("calculate_corr_max_prob")
 
     prob_dict_results = calculate_corr_max_prob(config, model_MMT, val_dataloader, stoi, itos)
@@ -442,7 +638,26 @@ def run_model_analysis(config, model_MMT, val_dataloader, stoi, itos):
 
 
 def load_data(config, stoi, stoi_MF, single=True, mode="val"):
-    """Loads the dataset and Multimodal Transformer (MMT) model."""
+    """Build the validation ``DataLoader`` for the requested mode.
+
+    Args:
+        config: Experiment namespace (batch size, dataset settings).
+        stoi (dict): Token-to-index map for SMILES tokens.
+        stoi_MF (dict): Token-to-index map for the molecular-formula aux task.
+        single (bool, optional): If True, force ``batch_size=1`` with
+            ``drop_last=True`` (one molecule per step, required by the
+            per-molecule generation loops; the final sample is silently dropped).
+            Defaults to True.
+        mode (str, optional): Split selector handed to ``MultimodalData``,
+            normally ``"val"``. Defaults to ``"val"``.
+
+    Returns:
+        torch.utils.data.DataLoader: Non-shuffled loader using ``collate_fn``
+        and :func:`worker_init_fn`.
+
+    Side effects:
+        Instantiates ``MultimodalData``, which reads the CSV / spectra files.
+    """
 
     # Load and prepare the validation dataset
     data = MultimodalData(config, stoi, stoi_MF, mode=mode)
@@ -465,7 +680,27 @@ def load_data(config, stoi, stoi_MF, single=True, mode="val"):
 
 
 def load_MMT_model(config):
-    """Loads the dataset and Multimodal Transformer (MMT) model."""
+    """Load the MMT checkpoint through its Lightning wrapper.
+
+    Args:
+        config: Experiment namespace; needs ``config.checkpoint_path`` and the
+            architecture fields consumed by ``TransformerMultiGPU``.
+
+    Returns:
+        torch.nn.Module: The inner ``.model`` of the loaded ``TransformerMultiGPU``,
+        already moved to CUDA.
+
+    Side effects:
+        Reads the checkpoint from disk, allocates GPU memory, and leaves the
+        returned module in whatever mode the checkpoint restored (usually
+        training mode, so callers relying on dropout-free output must call
+        ``.eval()`` themselves).
+
+    NOTE (known issue, left unchanged):
+        ``.to("cuda")`` is hard-coded instead of using ``config.device``, so this
+        fails on CPU-only machines even though the rest of the module is
+        device-agnostic.
+    """
     # Initialize and load the multi-GPU model
 
     multi_gpu_model = TransformerMultiGPU(config)
@@ -477,7 +712,19 @@ def load_MMT_model(config):
 
 
 def load_CLIP_model(config):
+    """Load the CLIP checkpoint and return its inner scoring module.
 
+    Args:
+        config: Experiment namespace; needs ``config.CLIP_model_path`` and
+            ``config.device``.
+
+    Returns:
+        torch.nn.Module: The ``CLIP_model`` attribute of the loaded
+        ``CLIPMultiGPU`` wrapper, moved to ``config.device``.
+
+    Side effects:
+        Reads the checkpoint from disk and allocates device memory.
+    """
     CLIP_multi_gpu_model = CLIPMultiGPU(config)
     checkpoint_path = config.CLIP_model_path
     CLIP_model = CLIP_multi_gpu_model.load_from_checkpoint(config=config, checkpoint_path=checkpoint_path)
@@ -508,6 +755,35 @@ def run_test_mns_performance_CLIP_3(config,
                                  stoi, 
                                  itos, 
                                  MW_filter):
+    """Multinomial sampling + CLIP + HSQC/COSY scoring for every validation sample.
+
+    For each target it keeps sampling until ``config.multinom_runs`` unique
+    canonical molecules are found (or 20 attempts), temporarily raising
+    ``config.temperature`` by 0.1 per attempt to escape repetition collapse.
+
+    Args:
+        config: Experiment namespace (``multinom_runs``, ``temperature``,
+            ``max_len``, ``device``).
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        model_CLIP (torch.nn.Module): CLIP wrapper exposing
+            ``inference(data_dict, smiles_list)`` -> ``(mean_loss, losses, logits,
+            targets, dot_similarity)``.
+        val_dataloader (DataLoader): Validation batches.
+        stoi (dict): Token-to-index map.
+        itos (dict): Index-to-token map.
+        MW_filter (bool): If True, keep only generated molecules whose rounded
+            molecular weight equals the target's.
+
+    Returns:
+        dict[str, list]: ``{target SMILES: [sorted_combined_list, batch_data]}``,
+        where each row is ``[SMILES, CLIP loss, dot similarity, token probability,
+        Tanimoto]`` sorted by Tanimoto descending; ``[None, None]`` is stored when
+        nothing valid was generated.
+
+    Side effects:
+        Mutates ``config.temperature`` while sampling and restores it per target;
+        runs both models in inference mode; prints progress counters.
+    """
     ### Same code as function: run_multinomial_sampling
     n_times = config.multinom_runs
     results_dict = {} #defaultdict(list)
@@ -577,6 +853,29 @@ def run_test_performance_CLIP_greedy_3(config,
                                  stoi_MF, 
                                  itos, 
                                  itos_MF):
+    """Greedy-decoding evaluation with CLIP dot similarity and SGNN HSQC error.
+
+    Args:
+        config: Experiment namespace.
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        model_CLIP (torch.nn.Module): CLIP wrapper exposing ``inference``.
+        val_dataloader (DataLoader): Validation batches.
+        stoi, stoi_MF, itos, itos_MF (dict): Token maps; the ``*_MF`` pair is
+            accepted for call-site symmetry and is not used here.
+
+    Returns:
+        tuple[dict, list]: ``{target SMILES: [combined_list, batch_data]}`` where
+        rows are ``[gen SMILES, CLIP loss, dot similarity, Tanimoto, HSQC error]``,
+        plus the list of targets whose Tanimoto computation failed.
+
+    Side effects:
+        Runs MMT and CLIP inference; prints the batch index every 10 batches.
+
+    NOTE (known issue, left unchanged):
+        ``vgmmt.run_model`` returns **six** values, but this line unpacks only
+        five, so every call raises ``ValueError: too many values to unpack`` and
+        the function cannot run.
+    """
 
 
     results_dict = defaultdict(list)
@@ -617,16 +916,28 @@ def run_test_performance_CLIP_greedy_3(config,
 
 def predict_corr_max_performance_metric(trg_tensor, corr_token_prob, max_token_prob, stoi):
     """
-    Calculates performance metrics for token predictions in sequences.
+    Aggregate token probabilities of one sequence into four summary scores.
 
-    Parameters:
-    trg_tensor (torch.Tensor): The target tensor containing sequences.
-    corr_token_prob (torch.Tensor): Probabilities of correct tokens.
-    max_token_prob (torch.Tensor): Probabilities of tokens with maximum likelihood.
-    multinom_token_prob (torch.Tensor): Probabilities of tokens chosen via multinomial sampling.
+    Args:
+        trg_tensor (torch.Tensor): Ground-truth token tensor; only
+            ``trg_tensor[0]`` (first sequence of the batch) is inspected.
+        corr_token_prob (torch.Tensor): Probability of the ground-truth token per
+            step, aligned with ``trg_tensor[0]``.
+        max_token_prob (torch.Tensor): Probability of the arg-max token per step.
+        stoi (dict[str, int]): Token-to-index map; ``"<EOS>"`` stops the scan.
 
     Returns:
-    tuple: Contains two dictionaries - one with aggregated probabilities and another with sample-wise probabilities.
+        tuple[dict, dict]: ``prop_dict`` with ``prob_corr_multi``,
+        ``prob_corr_avg``, ``prob_max_multi``, ``prob_max_avg``, and
+        ``sample_dict`` with ``sample_prob_list_corr`` / ``sample_prob_list_max``.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged):
+        Only the first sequence of the batch is scored, and the ``zip`` over
+        three differently-shaped inputs truncates to the shortest one, so any
+        remaining molecules are silently ignored.
     """
 
     # Initialize dictionaries for storing results
@@ -670,6 +981,27 @@ def predict_corr_max_performance_metric(trg_tensor, corr_token_prob, max_token_p
 
 ## There is something wrong with the predict_corr_max_performance_metric function
 def calculate_corr_max_prob_2(config, model, stoi, val_dataloader, gen_num):
+    """Batch-wise wrapper around :func:`predict_corr_max_performance_metric`.
+
+    Args:
+        config: Experiment namespace.
+        model (torch.nn.Module): Trained MMT decoder.
+        stoi (dict): Token-to-index map.
+        val_dataloader (DataLoader): Validation batches.
+        gen_num (int): Kept for API compatibility; unused (callers always pass 1).
+
+    Returns:
+        tuple[dict, dict]: Aggregated per-batch probability lists, and the
+        ``sample_dict`` of the last processed batch.
+
+    Side effects:
+        Runs the model in eval/no-grad mode; prints a tqdm bar.
+
+    NOTE (known issue, left unchanged):
+        ``sample_dict`` is only bound inside the loop, so an empty loader raises
+        ``UnboundLocalError`` on ``return``; even for a non-empty loader only the
+        last batch's per-sample probabilities are returned.
+    """
     
     prob_dict_results = {}
     aggregated_corr_prob_multi = []
@@ -705,6 +1037,28 @@ def run_test_performance_CLIP_3(config,
                                 model_MMT,
                                 val_dataloader,                                   
                                 stoi):
+    """Collect model-confidence statistics for a validation split.
+
+    Args:
+        config: Experiment namespace.
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches.
+        stoi (dict): Token-to-index map.
+
+    Returns:
+        dict[str, list[float]]: ``statistics_multiplication_avg``,
+        ``statistics_multiplication_sum`` and ``statistics_avg_avg``, each a
+        ``[correct-token, max-token]`` pair.
+
+    Side effects:
+        Runs the model; prints ``"failed statistics"`` on failure.
+
+    NOTE (known issue, left unchanged):
+        The ``try`` block is the only place that binds ``final_prob_*``; when the
+        aggregation raises (e.g. ``statistics.mean`` of an empty list) the
+        following ``total_results[...] = ...`` lines raise ``NameError`` and mask
+        the original error.
+    """
 
 
     total_results = {}
@@ -735,6 +1089,28 @@ def run_test_performance_CLIP_3(config,
 ### Sample 1000 unique molecules and plot their tanimoto similartyy 
 ### compared to the target
 def run_multinomial_sampling(config, model_MMT, val_dataloader, itos, stoi, MW_filter=False):
+    """Multinomial-sampling baseline with per-target Tanimoto statistics.
+
+    Args:
+        config: Experiment namespace (``multinom_runs``, ``temperature``,
+            ``max_len``, ``device``).
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches.
+        itos (dict): Index-to-token map.
+        stoi (dict): Token-to-index map.
+        MW_filter (bool, optional): Keep only same-molecular-weight generations.
+            Defaults to False.
+
+    Returns:
+        tuple: ``(config, results_dict)`` where ``results_dict[idx]`` is a
+        single-element list holding ``gen_conv_SMI_list``, ``trg_conv_SMI_list``,
+        ``tanimoto_sim``, ``tanimoto_mean``, ``tanimoto_std_dev``, ``failed`` and
+        ``prob_list``.
+
+    Side effects:
+        Mutates ``config.temperature`` (+0.1 per attempt) and restores it per
+        sample; prints a batch index every 10 batches.
+    """
     n_times = config.multinom_runs
     results_dict = defaultdict(list)
     temperature_orig = config.temperature
@@ -789,6 +1165,30 @@ def run_multinomial_sampling(config, model_MMT, val_dataloader, itos, stoi, MW_f
 
 # Multinomial
 def multinomial_sequence_multi_2(model, memory, src_padding_mask, stoi, config):
+    """Sample one token per step from ``softmax(logits / temperature)``.
+
+    Args:
+        model (torch.nn.Module): Trained MMT decoder.
+        memory (torch.Tensor): Encoder memory, shape (seq_len, batch, d_model).
+        src_padding_mask (torch.BoolTensor): Encoder padding mask.
+        stoi (dict[str, int]): Token-to-index map (``"<SOS>"`` start token).
+        config: Experiment namespace (``max_len``, ``temperature``, ``device``).
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: ``multinom_tensor`` of shape
+        (max_len, batch) with the sampled token ids and
+        ``multinom_token_prob`` with the probability that was sampled at each
+        step. The ``<SOS>`` row is removed from both.
+
+    Side effects:
+        Switches ``model`` to eval mode; draws from the global torch RNG
+        (``torch.multinomial``), so runs are reproducible only after seeding.
+
+    NOTE (known issue, left unchanged):
+        The loop never stops at ``<EOS>``; it always decodes ``config.max_len``
+        tokens and relies on downstream SMILES parsing to reject the trailing
+        tokens.
+    """
     # Initialization
 
     model.eval()
@@ -830,6 +1230,24 @@ def multinomial_sequence_multi_2(model, memory, src_padding_mask, stoi, config):
 
 
 def run_greedy_sampling(config, model_MMT, val_dataloader, itos, stoi):
+    """Greedy-decode a whole loader and report Tanimoto statistics.
+
+    Args:
+        config: Experiment namespace.
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches.
+        itos (dict): Index-to-token map.
+        stoi (dict): Token-to-index map.
+
+    Returns:
+        tuple: ``(config, results_dict)`` with ``gen_conv_SMI_list``,
+        ``trg_conv_SMI_list``, ``tanimoto_sim``, ``tanimoto_mean``,
+        ``tanimoto_std_dev``, ``failed``, ``prob_list``, ``src_HSQC_list`` and
+        ``src_COSY_list``.
+
+    Side effects:
+        Runs MMT inference only; does not mutate ``config``.
+    """
 
     results_dict = defaultdict(list)
     #model_MMT, val_dataloader = vgmmt.load_data_and_MMT_model(config, stoi, stoi_MF, single=True, mode="val")
@@ -983,7 +1401,32 @@ def run_greedy_sampling(config, model_MMT, val_dataloader, itos, stoi):
 
 def greedy_sequence_2(model, stoi, itos, memory, src_padding_mask, config):
     """
-    Generates a sequence of tokens using a greedy approach.
+    Generate a sequence of tokens with a greedy (arg-max) decoder.
+
+    Args:
+        model (torch.nn.Module): Trained MMT decoder.
+        stoi (dict[str, int]): Token-to-index map (``"<SOS>"`` start token).
+        itos (dict[int, str]): Index-to-token map (accepted but unused; decoding
+            happens in the callers).
+        memory (torch.Tensor): Encoder memory, shape (seq_len, batch, d_model).
+        src_padding_mask (torch.BoolTensor): Encoder padding mask.
+        config: Experiment namespace (``max_len``, ``temperature``, ``device``).
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: ``greedy_tensor`` of shape
+        (steps+1, batch) with the ``<SOS>`` row removed, and
+        ``greedy_token_prob`` holding the arg-max probability per step. For a
+        single molecule the probability tensor is unsqueezed to (steps, 1) so
+        callers can always transpose it the same way.
+
+    Side effects:
+        Switches ``model`` to eval mode; no RNG use (fully deterministic).
+
+    NOTE (known issue, left unchanged):
+        The stopping test ``(next_word == 0).all()`` compares against token id 0
+        instead of ``stoi["<EOS>"]``. Unless id 0 happens to be the EOS index the
+        loop always runs the full ``config.max_len`` steps, and it stops only
+        when *all* batch rows emit 0 at the same step.
     """
     model.eval()
     N = memory.size(1)  # Batch size
@@ -1033,6 +1476,19 @@ def greedy_sequence_2(model, stoi, itos, memory, src_padding_mask, config):
 
 
 def deduplicate_smiles(smiles_list, prob_list):
+    """Remove duplicate SMILES, keeping the probability of the first occurrence.
+
+    Args:
+        smiles_list (list[str]): Possibly duplicated SMILES strings.
+        prob_list (list[float]): Probabilities aligned 1:1 with ``smiles_list``.
+
+    Returns:
+        tuple[list[str], list[float]]: Deduplicated SMILES and their
+        probabilities in first-occurrence (generation) order.
+
+    Side effects:
+        None; the insertion-ordered dict preserves the sampling order.
+    """
     # Create a dictionary to hold unique smiles and their corresponding probabilities
     unique_smiles = {}
 
@@ -1049,6 +1505,23 @@ def deduplicate_smiles(smiles_list, prob_list):
 
 # Function to filter valid SMILES
 def filter_probs_and_valid_smiles_and_canonicolize(smiles_list, token_probs, canonical=True, isomericSmiles=False):
+    """Drop unparseable SMILES, canonicalise the rest and keep their probabilities.
+
+    Args:
+        smiles_list (list[str]): Raw decoded SMILES.
+        token_probs (list[float]): Probabilities aligned with ``smiles_list``.
+        canonical (bool, optional): Forwarded to ``Chem.MolToSmiles``. Defaults
+            to True.
+        isomericSmiles (bool, optional): Keep stereochemistry when True. Defaults
+            to False.
+
+    Returns:
+        tuple[list[str], list[float]]: Valid canonical SMILES and their matching
+        probabilities; entries rejected by ``Chem.MolFromSmiles`` are dropped.
+
+    Side effects:
+        None (``MolToSmiles`` is called with ``doRandom=False``).
+    """
     valid_smiles = []
     valid_token_probs = []
     for smi, prob in zip(smiles_list, token_probs):
@@ -1062,6 +1535,19 @@ def filter_probs_and_valid_smiles_and_canonicolize(smiles_list, token_probs, can
 
 # Function to calculate the rounded molecular weight
 def calc_rounded_mw(smi):
+    """Molecular weight of ``smi`` rounded to the nearest integer.
+
+    Args:
+        smi (str): SMILES string.
+
+    Returns:
+        int | None: ``round(Descriptors.MolWt(mol))``, or ``None`` when RDKit
+        cannot build the molecule (the bare ``except`` also hides any other
+        error, e.g. ``MolWt(None)``).
+
+    Side effects:
+        None.
+    """
     try:
         mol = Chem.MolFromSmiles(smi)
         return round(Descriptors.MolWt(mol))
@@ -1071,6 +1557,19 @@ def calc_rounded_mw(smi):
 
 
 def filter_for_MW(trg_conv_SMI, gen_conv_SMI):
+    """Keep generated SMILES whose rounded molecular weight matches the target.
+
+    Args:
+        trg_conv_SMI (str): Ground-truth SMILES.
+        gen_conv_SMI (list[str]): Generated SMILES to filter.
+
+    Returns:
+        list[str]: Sub-list for which
+        ``calc_rounded_mw(smi) == calc_rounded_mw(trg_conv_SMI)``.
+
+    Side effects:
+        None; the target weight is recomputed for every candidate.
+    """
 
     # Calculate the rounded molecular weight of the target molecule
     trg_mw = calc_rounded_mw(trg_conv_SMI)
@@ -1081,6 +1580,20 @@ def filter_for_MW(trg_conv_SMI, gen_conv_SMI):
 
 
 def filter_for_MW_2(trg_conv_SMI, gen_conv_SMI, prob_list):
+    """Same as :func:`filter_for_MW`, but also returns the matching probabilities.
+
+    Args:
+        trg_conv_SMI (str): Ground-truth SMILES.
+        gen_conv_SMI (list[str]): Generated SMILES.
+        prob_list (list[float]): Probabilities aligned with ``gen_conv_SMI``.
+
+    Returns:
+        tuple[list[str], list[float]]: Filtered SMILES and their probabilities.
+
+    Side effects:
+        None; ``calc_rounded_mw`` runs twice per candidate (once per list
+        comprehension).
+    """
 
     # Calculate the rounded molecular weight of the target molecule
     trg_mw = calc_rounded_mw(trg_conv_SMI)
@@ -1092,6 +1605,20 @@ def filter_for_MW_2(trg_conv_SMI, gen_conv_SMI, prob_list):
 
     
 def filter_dict_results_for_MW(results_dict):
+    """Rebuild Tanimoto statistics after applying the molecular-weight filter.
+
+    Args:
+        results_dict (dict[int, list[dict]]): Output of
+            :func:`run_multinomial_sampling` (``idx -> [{'tanimoto_sim': ...}]``).
+
+    Returns:
+        tuple[list[list[float]], list[list]]: Per-target Tanimoto lists and the
+        ``[filtered_gen_smis, trg_conv_SMI_list]`` pairs used to compute them.
+
+    Side effects:
+        None; assumes every ``result`` dict has ``trg_conv_SMI_list`` and
+        ``gen_conv_SMI_list`` keys (``KeyError`` otherwise).
+    """
     tanimoto_values = []
     gen_trg_smi_lists = []
     for i, idx in enumerate(results_dict.keys()):
@@ -1114,6 +1641,20 @@ def filter_dict_results_for_MW(results_dict):
 
 
 def plot_hist_MN_sampling(config, results_dict):
+    """Overlay one Tanimoto histogram per target on a single figure.
+
+    Args:
+        config: Experiment namespace (unused, kept for call-site symmetry).
+        results_dict (dict[int, list[dict]]): Output of
+            :func:`run_multinomial_sampling`; ``'tanimoto_sim'`` lists are pooled
+            per target.
+
+    Returns:
+        None
+
+    Side effects:
+        Creates and shows a matplotlib figure (blocking ``plt.show()``).
+    """
     # Number of unique idx values
     num_idx = len(results_dict)
 
@@ -1141,6 +1682,23 @@ def plot_hist_MN_sampling(config, results_dict):
 
     
 def plot_hist_MN_sampling_all(config, results_dict):
+    """Pool every target's Tanimoto scores into one histogram.
+
+    Args:
+        config: Experiment namespace (unused, kept for call-site symmetry).
+        results_dict (dict[int, list[dict]]): As in :func:`plot_hist_MN_sampling`.
+
+    Returns:
+        None
+
+    Side effects:
+        Creates and shows one matplotlib figure.
+
+    NOTE (known issue, left unchanged):
+        ``idx`` is read outside the loop that defines it and ``i`` only exists if
+        the loop body ran, so an empty ``results_dict`` raises ``NameError``;
+        otherwise stale loop values drive the bin count and the title.
+    """
     # Number of unique idx values
     num_idx = len(results_dict)
 
@@ -1166,6 +1724,21 @@ def plot_hist_MN_sampling_all(config, results_dict):
     plt.show()
     
 def plot_hist_MN_sampling_filtered(config, results_dict):
+    """Histogram of Tanimoto scores restricted to same-molecular-weight molecules.
+
+    Args:
+        config: Experiment namespace (unused, kept for call-site symmetry).
+        results_dict (dict[int, list[dict]]): Output of
+            :func:`run_multinomial_sampling`.
+
+    Returns:
+        tuple[list[list[float]], list[list]]: Forwarded from
+        :func:`filter_dict_results_for_MW`.
+
+    Side effects:
+        Pops up a matplotlib window; Tanimoto scores are recomputed from scratch
+        instead of reusing the cached ``'tanimoto_sim'`` values.
+    """
     ##filter out all molecules with the same MW as the target
 
     # Number of unique idx values
@@ -1193,6 +1766,25 @@ def plot_hist_MN_sampling_filtered(config, results_dict):
 
 
 def calc_percentage_top_x_correct(results_dict, top_x):
+    """Hit rate: fraction of targets found within their top-``top_x`` samples.
+
+    Args:
+        results_dict (dict[int, list[dict]]): Output of
+            :func:`run_multinomial_sampling` (or its ``v2`` variant).
+        top_x (int): How many leading ``tanimoto_sim`` entries are inspected.
+
+    Returns:
+        float: Cumulative ``count_yes / (count_yes + count_no)`` over every
+        target processed, where a "yes" is ``1 in tanimoto_sim[:top_x]``.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged):
+        With an empty ``results_dict`` the function falls through to ``return``
+        without ever binding ``percentage`` and raises ``UnboundLocalError``;
+        the hit test also requires an *exact* Tanimoto value of 1.
+    """
     count_yes = 0
     count_no = 0
     for i, idx in enumerate(results_dict.keys()):
@@ -1209,6 +1801,22 @@ def calc_percentage_top_x_correct(results_dict, top_x):
     return percentage
     
 def calc_percentage_top_x_correct_greedy(results_dict):
+    """Share of exact Tanimoto hits for a greedy run.
+
+    Args:
+        results_dict (dict): Output of :func:`run_greedy_sampling`; only the
+            ``'tanimoto_sim'`` list is read.
+
+    Returns:
+        float: ``count_yes / (count_yes + count_no)``, where a "yes" means
+        ``tanimoto == 1``.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged):
+        An empty Tanimoto list raises ``ZeroDivisionError`` (0/0).
+    """
     count_yes = 0
     count_no = 0
 
@@ -1223,6 +1831,24 @@ def calc_percentage_top_x_correct_greedy(results_dict):
     
 
 def run_precentage_calculation(config, itos, stoi, stoi_MF, MW_filter):
+    """Full hit-rate sweep (top 1/3/5/10) for multinomial sampling plus greedy.
+
+    Args:
+        config: Experiment namespace.
+        itos (dict): Index-to-token map.
+        stoi (dict): Token-to-index map.
+        stoi_MF (dict): Molecular-formula token map.
+        MW_filter (bool): Forwarded to :func:`run_multinomial_sampling`.
+
+    Returns:
+        tuple: ``percentage_collection`` = ``[greedy_top1, mns_top1, mns_top3,
+        mns_top5, mns_top10]``, plus the two raw results dictionaries.
+
+    Side effects:
+        Loads the MMT checkpoint, forces ``config.temperature = 1`` and runs two
+        full validation passes (single-molecule batches for multinomial,
+        ``config.batch_size`` batches for greedy).
+    """
     
     model_MMT = load_MMT_model(config)
     val_dataloader = load_data(config, stoi, stoi_MF, single=True, mode="val")  
@@ -1248,6 +1874,21 @@ def run_precentage_calculation(config, itos, stoi, stoi_MF, MW_filter):
 
     
 def add_tanimoto_similarity(trg_conv_SMI, combined_list):
+    """Append the 512-bit Morgan Tanimoto score against the target to each row.
+
+    Args:
+        trg_conv_SMI (str): Ground-truth SMILES.
+        combined_list (list[list]): Rows ``[SMILES, loss, dot_sim, prob]``.
+
+    Returns:
+        tuple[list[list], list[list]]: ``(new_combined_list, failed_combined_list)``;
+        valid rows get the score appended at index 4, unparseable rows get
+        ``None`` and are moved to the failed list.
+
+    Side effects:
+        Mutates the input row lists in place via ``item.append`` before returning
+        them.
+    """
     # Generate fingerprint for the ground truth molecule
     ground_truth_mol = Chem.MolFromSmiles(trg_conv_SMI)
     ground_truth_fp = AllChem.GetMorganFingerprintAsBitVect(ground_truth_mol, 2, nBits=512)
@@ -1271,8 +1912,21 @@ def add_tanimoto_similarity(trg_conv_SMI, combined_list):
 
 
 def try_calculate_tanimoto_from_two_smiles(smi1, smi2, nbits, extra_info = False):
-    """This function takes two smile_stings and 
-    calculates the Tanimoto similarity and returns it and prints it out"""
+    """Tanimoto similarity of two SMILES via Morgan fingerprints.
+
+    Args:
+        smi1 (str): First SMILES (the target in most call sites).
+        smi2 (str): Second SMILES (the generated molecule).
+        nbits (int): Fingerprint length, e.g. 512.
+        extra_info (bool, optional): Print both SMILES and the score when True.
+            Defaults to False.
+
+    Returns:
+        float | None: Score rounded to 4 decimals, or ``None`` if RDKit fails.
+
+    Side effects:
+        Optional ``print``; the bare ``except`` also hides programming errors.
+    """
     
     try:
         pattern1 = Chem.MolFromSmiles(smi1)
@@ -1292,6 +1946,21 @@ def try_calculate_tanimoto_from_two_smiles(smi1, smi2, nbits, extra_info = False
 from collections import defaultdict
 
 def calculate_tanimoto_of_all_compared_to_trg(trg_conv_SMI, gen_conv_SMI_list):
+    """Tanimoto score of every generated SMILES against one target (512 bits).
+
+    Args:
+        trg_conv_SMI (str): Ground-truth SMILES.
+        gen_conv_SMI_list (list[str]): Generated SMILES.
+
+    Returns:
+        list[float]: One score per *parseable* generated SMILES; unparseable
+        strings are skipped without placeholders, so the result may be shorter
+        than the input list.
+
+    Side effects:
+        Calls ``Chem.MolFromSmiles`` once for the target and reuses its
+        fingerprint for every candidate.
+    """
     tani_list = []
     ground_truth_mol = Chem.MolFromSmiles(trg_conv_SMI)
     ground_truth_fp = AllChem.GetMorganFingerprintAsBitVect(ground_truth_mol, 2, nBits=512)
@@ -1306,6 +1975,34 @@ def calculate_tanimoto_of_all_compared_to_trg(trg_conv_SMI, gen_conv_SMI_list):
 
 
 def run_mns_hit_counter_experiment(config, model_MMT, val_dataloader, itos, stoi, MW_filter, max_runs):
+    """Measure *when* (at which sample index) a perfect hit first appears.
+
+    Args:
+        config: Experiment namespace (``multinom_runs``, ``temperature``).
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches.
+        itos (dict): Index-to-token map.
+        stoi (dict): Token-to-index map.
+        MW_filter (bool): Apply the molecular-weight filter while sampling.
+        max_runs (int): Upper bound on sampling iterations per target.
+
+    Returns:
+        tuple[list[int], list[list]]: For each target either the 1-based index of
+        the first perfect Tanimoto hit or ``-5`` when none was found; and the
+        ``[gen_smis, trg_smis, tani_list]`` triples used to decide.
+
+    Side effects:
+        Mutates ``config.temperature`` (+0.1 per iteration, saved/restored per
+        target); prints counters every 10 iterations.
+
+    NOTE (known issue, left unchanged):
+        ``1 in tani_list`` / ``tani_list.index(1.0)`` need an *exact* float
+        match, but :func:`calculate_tanimoto_of_all_compared_to_trg` returns
+        un-rounded values, so a hit almost never registers and every target
+        typically burns all ``max_runs`` iterations. If ``max_runs <= 0`` the
+        while-loop body never runs and ``tani_list`` is still undefined at the
+        ``try`` statement.
+    """
     percentage_collection = []
     molecule_tani_comparison_lists = []
     one_finder_list = []
@@ -1364,7 +2061,19 @@ def run_mns_hit_counter_experiment(config, model_MMT, val_dataloader, itos, stoi
     return one_finder_list, molecule_tani_comparison_lists
 
 def sel_data_slice_and_save_as_csv(config):
-    """ Saves the selected molecules in a new csv and replaces the csv_SMI_targets"""
+    """Truncate the validation SMILES CSV to the first ``config.data_size`` rows.
+
+    Args:
+        config: Experiment namespace; ``config.csv_path_val`` is read and
+            ``config.data_size`` rows are kept.
+
+    Returns:
+        config: The same namespace, with ``config.csv_SMI_targets`` pointing at
+        the newly written ``*_sel_<n>.csv`` file.
+
+    Side effects:
+        Writes a new CSV next to the original and mutates the ``config`` object.
+    """
     # File path
     file_path = config.csv_path_val  # Replace with your file path
 
@@ -1384,7 +2093,11 @@ def sel_data_slice_and_save_as_csv(config):
 
 def filter_smiles(df, smi_list):
     """
-    Filter out SMILES strings from smi_list that are present in the DataFrame df.
+    Filter out SMILES strings from smi_list that are already present in df.
+
+    Comparison is exact string matching on the raw ``'SMILES'`` column (no
+    canonicalisation), so differently written forms of the same molecule are
+    not considered duplicates.
 
     Parameters:
     df (pandas.DataFrame): DataFrame with a 'SMILES' column.
@@ -1405,6 +2118,28 @@ from rdkit.Chem import Draw
 import matplotlib.pyplot as plt
 
 def analyze_and_plot(results_dict, mode):
+    """Rank the ground-truth molecule among generations and histogram those ranks.
+
+    Args:
+        results_dict (dict[str, list]): ``{target SMILES: [[SMILES, loss,
+            dot_sim, tanimoto, HSQC_error], ...]}`` from
+            :func:`run_test_mns_performance_CLIP_3` combined with
+            :func:`combine_CLIP_HSQC_data`.
+        mode (str): ``"dot_sim"`` (higher is better, descending sort) or
+            ``"HSQC_sim"`` (lower error is better, ascending sort).
+
+    Returns:
+        list: ``[key, value]`` pairs whose first row has ``tanimoto != 1``, i.e.
+        the targets the run failed to reproduce.
+
+    Side effects:
+        Draws and shows a rank histogram.
+
+    NOTE (known issue, left unchanged):
+        Any ``mode`` other than those two literals leaves ``similaritys``
+        unbound (``UnboundLocalError``); the histogram bins and ticks also use
+        only the last ``value`` list.
+    """
     ranks = []
     failed = []
     
@@ -1446,6 +2181,20 @@ def analyze_and_plot(results_dict, mode):
     
 # Function to plot a molecule with additional data
 def plot_molecule_with_data(smiles, cosine_sim, tanimoto, HSQC_error):
+    """Render one molecule with its CLIP similarity, Tanimoto and HSQC error.
+
+    Args:
+        smiles (str): SMILES to draw.
+        cosine_sim (float | str): CLIP dot similarity; ``''`` is displayed as blank.
+        tanimoto (float | str): Tanimoto score; ``''`` is displayed as blank.
+        HSQC_error (float | str): Simulated-spectrum error; ``''`` is blank.
+
+    Returns:
+        None
+
+    Side effects:
+        Opens a blocking matplotlib window per molecule (``plt.show()``).
+    """
     mol = Chem.MolFromSmiles(smiles)
     cosine_sim_rounded = round(float(cosine_sim), 3) if cosine_sim else ''
     tanimoto_rounded = round(float(tanimoto), 3) if tanimoto else ''
@@ -1460,6 +2209,20 @@ def plot_molecule_with_data(smiles, cosine_sim, tanimoto, HSQC_error):
     ### PLOT Molecules
 
 def plot_CLIP_molecules(results_dict, investigate_number, stop_nr):
+    """Visual walk-through of the generations for a single target.
+
+    Args:
+        results_dict (dict): ``{target SMILES: [combined_list]}`` as returned by
+            :func:`run_clip_similarity_check`.
+        investigate_number (int): Position (in dict order) of the target to show.
+        stop_nr (int): Stop after this many generated molecules.
+
+    Returns:
+        None
+
+    Side effects:
+        Draws one figure per molecule (target first) and blocks on ``plt.show()``.
+    """
     #investigate_number = 5
     # Plot the key SMILES
 
@@ -1483,6 +2246,30 @@ def generate_mns_list(config,
                   stoi, 
                   itos, 
                   MW_filter):
+    """Sample ``config.multinom_runs`` molecules per target and keep the batch.
+
+    Args:
+        config: Experiment namespace (``multinom_runs``, ``temperature``).
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches.
+        stoi (dict): Token-to-index map.
+        itos (dict): Index-to-token map.
+        MW_filter (bool): Apply the molecular-weight filter while sampling.
+
+    Returns:
+        dict[str, list]: ``{target SMILES: [gen_conv_SMI_list,
+        trg_conv_SMI_list, data_dict]}``; the raw collated batch is kept so CLIP
+        and HSQC scoring can be re-run later.
+
+    Side effects:
+        Mutates ``config.temperature`` (+0.1 per attempt, restored per target);
+        prints a counter on every attempt.
+
+    NOTE (known issue, left unchanged):
+        ``ttf.tensor_to_smiles`` does not exist in
+        ``utils_MMT.train_test_functions_pl_v15_4`` (the helper lives in
+        ``hf.tensor_to_smiles``), so the first batch raises ``AttributeError``.
+    """
     ### Same code as function: run_multinomial_sampling
     n_times = config.multinom_runs
     gen_dict = {} #defaultdict(list)
@@ -1529,6 +2316,20 @@ def generate_mns_list(config,
     return gen_dict
 
 def run_clip_similarity_check(config, model_CLIP, gen_dict):
+    """Score every sampled molecule of every target with the CLIP model.
+
+    Args:
+        config: Experiment namespace.
+        model_CLIP (torch.nn.Module): CLIP wrapper exposing ``inference``.
+        gen_dict (dict): Output of :func:`generate_mns_list`.
+
+    Returns:
+        dict[str, list]: ``{target SMILES: [combined_list]}`` where rows are
+        ``[SMILES, CLIP loss, dot similarity, Tanimoto]``.
+
+    Side effects:
+        Runs CLIP inference; no sorting is applied (that line is commented out).
+    """
     results_dict ={}
     for trg_conv_SMI, values in gen_dict.items():
         gen_conv_SMI_list, trg_conv_SMI_list, data_dict = values
@@ -1550,6 +2351,19 @@ def run_clip_similarity_check(config, model_CLIP, gen_dict):
     return results_dict
 
 def run_HSQC_similarity_check(config, gen_dict, results_dict):
+    """Simulate the HSQC spectrum of every sampled molecule and store the errors.
+
+    Args:
+        config: Experiment namespace.
+        gen_dict (dict): Output of :func:`generate_mns_list`.
+        results_dict (dict): Accepted for call-site symmetry; not read.
+
+    Returns:
+        dict[str, list]: ``{target SMILES: [gen_conv_SMI_list, sim_error_list]}``.
+
+    Side effects:
+        Runs the SGNN simulator through ``rbgvm.calculate_HSQC_error``.
+    """
     results_dict_HSQC ={}
     for trg_conv_SMI, values in gen_dict.items():
         gen_conv_SMI_list, trg_conv_SMI_list, data_dict = values
@@ -1563,6 +2377,20 @@ def run_HSQC_similarity_check(config, gen_dict, results_dict):
     return results_dict_HSQC
 
 def combine_CLIP_HSQC_data(results_dict_CLIP, results_dict_HSQC):
+    """Merge CLIP scores and HSQC errors, then sort by Tanimoto descending.
+
+    Args:
+        results_dict_CLIP (dict): Output of :func:`run_clip_similarity_check`.
+        results_dict_HSQC (dict): Output of :func:`run_HSQC_similarity_check`.
+
+    Returns:
+        dict[str, list]: ``{target SMILES: sorted_rows}`` where each row is
+        ``[SMILES, loss, dot_sim, tanimoto, HSQC_error]``.
+
+    Side effects:
+        Mutates the row lists of ``results_dict_CLIP`` in place; a missing HSQC
+        error is replaced by the sentinel ``-9``.
+    """
 
     final_results = {}
     for trg, data in results_dict_CLIP.items():
@@ -1578,7 +2406,18 @@ def combine_CLIP_HSQC_data(results_dict_CLIP, results_dict_HSQC):
 
 
 def filter_invalid_inputs(results_dict):
-    """ Check if there is just a [None,None] entry from the run_test_mns_performance_CLIP_3 function"""
+    """Drop the ``[None, None]`` placeholders written by the sampling loop.
+
+    Args:
+        results_dict (dict): Output of :func:`run_test_mns_performance_CLIP_3`.
+
+    Returns:
+        tuple[dict, int]: The filtered dictionary (only keys whose first value is
+        not ``None``) and the number of dropped keys.
+
+    Side effects:
+        None.
+    """
     filtered_dict = {}
     counter = 0
     for key, value in results_dict.items():
@@ -1591,6 +2430,24 @@ def filter_invalid_inputs(results_dict):
     return filtered_dict, counter
 
 def calc_molecular_formula(smi):
+    """Molecular formula of a SMILES string (used by the MF filter).
+
+    Args:
+        smi (str): SMILES string.
+
+    Returns:
+        str | None: Formula such as ``"C6H6"``, or ``None`` on any error.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged):
+        ``CalcMolFormula`` is never imported in this module, so the ``NameError``
+        raised here is swallowed by the bare ``except`` and this function
+        **always** returns ``None``. As a consequence
+        :func:`filter_for_MF_2` compares ``None == None`` and silently keeps
+        every molecule instead of filtering by formula.
+    """
     try:
         mol = Chem.MolFromSmiles(smi)
         return CalcMolFormula(mol)
@@ -1598,6 +2455,23 @@ def calc_molecular_formula(smi):
         return None
 
 def filter_for_MF_2(trg_conv_SMI, gen_conv_SMI, prob_list):
+    """Keep generated SMILES whose molecular formula equals the target's.
+
+    Args:
+        trg_conv_SMI (str): Ground-truth SMILES.
+        gen_conv_SMI (list[str]): Generated SMILES.
+        prob_list (list[float]): Probabilities aligned with ``gen_conv_SMI``.
+
+    Returns:
+        tuple[list[str], list[float]]: Filtered SMILES and their probabilities.
+
+    Side effects:
+        None; the formula is recomputed for every candidate.
+
+    NOTE (known issue, left unchanged):
+        Because :func:`calc_molecular_formula` currently always returns ``None``
+        (missing import), this filter is a no-op and keeps all candidates.
+    """
     # Calculate the molecular formula of the target molecule
     trg_mf = calc_molecular_formula(trg_conv_SMI)
 
@@ -1608,6 +2482,30 @@ def filter_for_MF_2(trg_conv_SMI, gen_conv_SMI, prob_list):
 
 
 def run_multinomial_sampling_v2(config, model_MMT, val_dataloader, itos, stoi, MW_filter=False, MF_filter=False):
+    """Multinomial sampling with optional molecular-weight / formula filtering.
+
+    Args:
+        config: Experiment namespace (``multinom_runs`` etc.).
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches.
+        itos (dict): Index-to-token map.
+        stoi (dict): Token-to-index map.
+        MW_filter (bool, optional): Apply :func:`filter_for_MW_2`. Defaults to False.
+        MF_filter (bool, optional): Apply :func:`filter_for_MF_2`. Defaults to False.
+
+    Returns:
+        tuple: ``(config, results_dict)`` with the same schema as
+        :func:`run_multinomial_sampling` (per-target Tanimoto statistics).
+
+    Side effects:
+        Mutates ``config.temperature`` (+0.2 per attempt, restored per target);
+        duplicates each batch to 16 generations; prints progress.
+
+    NOTE (known issue, left unchanged):
+        The loop gives up after 5 attempts, so ``config.multinom_runs`` unique
+        molecules are frequently not reached. The ``removed`` bookkeeping is
+        computed but never reported to the caller.
+    """
     n_times = config.multinom_runs
     results_dict = defaultdict(list)
     temperature_orig = config.temperature
@@ -1674,6 +2572,31 @@ def run_multinomial_sampling_v2(config, model_MMT, val_dataloader, itos, stoi, M
     return config, results_dict
 
 def run_precentage_calculation_v2(config, itos, stoi, stoi_MF, MW_filter=False, MF_filter=False):
+    """Same hit-rate sweep as :func:`run_precentage_calculation`, on the v2 samplers.
+
+    Args:
+        config: Experiment namespace.
+        itos (dict): Index-to-token map.
+        stoi (dict): Token-to-index map.
+        stoi_MF (dict): Molecular-formula token map.
+        MW_filter (bool, optional): Forwarded to the multinomial sampler.
+            Defaults to False.
+        MF_filter (bool, optional): Forwarded to the multinomial sampler.
+            Defaults to False.
+
+    Returns:
+        tuple: ``[greedy_top1, mns_top1, mns_top3, mns_top5, mns_top10]`` plus the
+        two raw results dictionaries.
+
+    Side effects:
+        Loads the MMT checkpoint, forces ``config.temperature = 1`` and runs two
+        validation passes.
+
+    NOTE (known issue, left unchanged):
+        The greedy pass is called with ``MW_filter=False, MF_filter=False`` even
+        when filtering was requested, so the greedy and multinomial halves of the
+        comparison do not use the same candidate set.
+    """
     model_MMT = load_MMT_model(config)
     val_dataloader = load_data(config, stoi, stoi_MF, single=True, mode="val")  
     config.temperature = 1
@@ -1698,6 +2621,25 @@ def run_precentage_calculation_v2(config, itos, stoi, stoi_MF, MW_filter=False, 
     return percentage_collection, results_dict_mns_10, results_dict_greedy
 
 def run_greedy_sampling_v2(config, model_MMT, val_dataloader, itos, stoi, MW_filter=False, MF_filter=False):
+    """Greedy-decoding variant that accepts (but currently ignores) the filters.
+
+    Args:
+        config: Experiment namespace.
+        model_MMT (torch.nn.Module): Trained MMT decoder.
+        val_dataloader (DataLoader): Validation batches.
+        itos (dict): Index-to-token map.
+        stoi (dict): Token-to-index map.
+        MW_filter (bool, optional): Accepted for API parity; the filtering block
+            is commented out, so nothing is filtered. Defaults to False.
+        MF_filter (bool, optional): Same. Defaults to False.
+
+    Returns:
+        tuple: ``(config, results_dict)`` with the generated/target SMILES,
+        Tanimoto statistics and the source HSQC/COSY lists.
+
+    Side effects:
+        Runs MMT inference; does not mutate ``config``.
+    """
     results_dict = defaultdict(list)
     gen_conv_SMI_list, trg_conv_SMI_list, prob_list, src_HSQC_list, src_COSY_list = [], [], [], [], []
     for idx, data_dict in enumerate(val_dataloader):

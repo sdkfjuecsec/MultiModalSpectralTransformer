@@ -1,3 +1,38 @@
+"""NMR shift calculation from DFT conformer ensembles (v15.4).
+
+This module turns quantum-chemistry output (DFT isotropic shieldings per
+conformer) into predicted 1H/13C chemical shifts and, finally, into the
+2D HSQC-style peak tables used by the rest of the project.
+
+Pipeline overview
+-----------------
+1. ``get_solvent_ref_shifts`` / ``get_molecule_data`` parse the reference
+   (solvent) and compound SD/MOL files: atom symbols, connectivity, raw text
+   lines and an RDKit molecule.
+2. ``get_shielding_for_conformers`` -> ``calc_rel_en`` ->
+   ``calculate_boltzmann_factors`` -> ``perform_boltzmann_averaging`` convert
+   per-conformer isotropic shieldings into one Boltzmann-weighted shielding
+   per atom (298.15 K, kcal/mol).
+3. ``calculate_nmr_shifts_from_shieldings*`` convert shieldings to shifts,
+   either via a solvent reference (TMS/DMSO) or via the linear scaling
+   recommended by Cheshire NMR.
+4. ``save_results_sdf_file`` stores the shifts in the SDF property
+   ``averaged_NMR_shifts``; the ``load_shifts_from_sdf*`` helpers read it back.
+5. Chirality/symmetry helpers (``get_chiral_carbons`` ...
+   ``find_symmetric_positions``) decide which carbons are split into separate
+   peaks or are symmetry-equivalent; ``selecting_shifts`` and
+   ``perform_deduplication_if_symmetric`` assemble the peak list and
+   ``generate_dft_dataframe`` wraps it into the canonical
+   ``F2 (ppm)`` (1H) / ``F1 (ppm)`` (13C) dataframe layout.
+6. ``load_*`` helpers read the ACD, real, MNova, ML and DFT sources, and
+   ``get_similarity_comparison_variations`` scores two spectra against each
+   other with several assignment strategies.
+
+Coordinate conventions: axis ``F1`` = 13C, axis ``F2`` = 1H; all values are in
+ppm. Paths are handled as POSIX strings (``/``) throughout, and many loaders
+assume the SDF property names produced by this module.
+"""
+
 import ast
 import collections
 import copy
@@ -28,7 +63,32 @@ IPythonConsole.ipython_useSVG = True
 
 # Get the indices of the atoms for calculating the reference shift for carbon and hydrogen
 def get_solvent_ref_shifts(solvent_path):
-    """ This functions calculates the reference shifts for the solvent and returns the C and H shift"""
+    """Calculate the mean reference shieldings of the solvent.
+
+    The solvent (e.g. TMS or DMSO) is computed in the same DFT protocol as the
+    compound, so its mean shieldings act as the internal reference used later
+    to convert shieldings into chemical shifts.
+
+    Args:
+        solvent_path (str): Path to the solvent SDF file containing an
+            ``atom.dprop.Isotropic sheilding`` property block (the misspelling
+            is inherited from the source files).
+
+    Returns:
+        tuple[float, float]: ``(C13_shield_calc, H1_shield_calc)`` - arithmetic
+        mean isotropic shielding over all C atoms and all H atoms, in ppm.
+
+    Side effects:
+        Calls ``get_molecule_data``, which writes a ``.mol`` file next to
+        ``solvent_path``, and reads the SDF text twice.
+
+    NOTE (known issue, left unchanged):
+        Element detection uses a plain substring test (``if "C" in i`` /
+        ``if "H" in i``), so any line containing the letter C or H is counted,
+        e.g. ``Cl`` atoms, ``M  CHG`` charge lines or the ``$$$$`` separator.
+        This shifts the atom-to-shielding zip and can silently pair a carbon
+        shielding with a hydrogen atom.
+    """
     atom_list, connectivity_list, docline_list, name, mol = get_molecule_data(solvent_path)
 
     index_list_C =[]
@@ -85,6 +145,20 @@ def get_solvent_ref_shifts(solvent_path):
 # # Get the indices of the atoms for calculating the reference shift for carbon and hydrogen
 # ### ALSO IN NMR SHIFT RECONSTRUCTION
 def get_molecule_data(compound_path):
+    # Purpose: read an SDF/MOL file into plain Python structures.
+    # Args: compound_path (str) - path to the compound .sdf file.
+    # Returns: (atom_list, connectivity_list, docline_list, name, mol):
+    #   atom_list        - element symbol of every atom in file order,
+    #   connectivity_list - parsed bond rows (atom1, atom2, bond type, ...),
+    #   docline_list     - every raw line of the file as a string,
+    #   name             - file stem used to label conformers,
+    #   mol              - the RDKit molecule built from a truncated .mol copy.
+    # Side effect: writes "<path without .sdf>.mol" next to the input file, because
+    #   RDKit cannot parse the SDF properties and only the MOL block is copied.
+    # NOTE (known issue, left unchanged): the stem is taken with
+    #   compound_path.split("/")[-1], so a Windows path such as
+    #   "C:\\data\\x.sdf" yields a name that still contains the path; any later
+    #   filename-based filtering or matching against "/"-separated lists fails.
     """ This function returns the list of atoms of the molecules 
     and a list of strings with each line of the compound document as one string 
     because reading the SDF files with pandas causes an error"""
@@ -165,7 +239,20 @@ def get_molecule_data(compound_path):
     return atom_list, connectivity_list, docline_list, name, mol
 
 def get_conformer_energy_list(docline_list):
-    """ Returns the list of all the energies fo the different conformers"""
+    """Collect the SCF energies of all conformers from the raw DFT text lines.
+
+    Args:
+        docline_list (list[str]): Raw lines of the DFT output file as returned
+            by ``get_molecule_data``.
+
+    Returns:
+        list[float]: One energy (in whatever unit the DFT output used, usually
+        Hartree) per conformer, in file order, taken from the line following
+        each ``conformer_energy`` marker.
+
+    Side effects:
+        None; the input list is only read.
+    """
     ticker_shielding = False
     conformer_energy_list = []
     for idx, i in enumerate(docline_list):
@@ -179,6 +266,18 @@ def get_conformer_energy_list(docline_list):
 
 
 def get_shielding_for_conformers(docline_list, name):
+    # Purpose: extract the per-conformer isotropic shielding vectors.
+    # Args: docline_list (list[str]) - raw DFT output lines; name (str) - label
+    #   prefixed to each conformer (becomes "<name>_<conformer_index>").
+    # Returns: (shielding_tensors_list, conformer_energy_list):
+    #   shielding_tensors_list - list of rows [label, energy, sh_1, sh_2, ...],
+    #     sorted ascending by energy, one row per conformer,
+    #   conformer_energy_list - energies in original file order.
+    # Side effects: none (pure parsing).
+    # NOTE (known issue, left unchanged): the shielding reader repeatedly calls
+    #   get_conformer_energy_list(docline_list), which rescans the whole file once
+    #   per conformer (quadratic in file length); harmless for correctness but
+    #   slow on files with many conformers.
     """ this Function reads out the energies from the provided file (saved in the docline_list) and 
     extracts all the shielding tensors and saves them in from of a list"""
     ticker_shielding = False
@@ -214,7 +313,17 @@ def get_shielding_for_conformers(docline_list, name):
     return shielding_tensors_list, conformer_energy_list
 
 def calc_rel_en(shielding_tensors_list):
-    """ Calculates the differences in the energies for every conformation"""
+    """Calculate the energy of each conformer relative to the lowest one.
+
+    Args:
+        shielding_tensors_list (list[list]): Rows ``[label, energy, ...]`` as
+            produced by ``get_shielding_for_conformers`` (already sorted by
+            energy).
+
+    Returns:
+        list[float]: Relative energies in the same order as the input, with
+        ``0`` for the (sorted) first/lowest conformer.
+    """
     minimum_val = shielding_tensors_list[0][1]
     list_min_val = [0]   # First item is zero
     for i in shielding_tensors_list[1:]:
@@ -224,7 +333,23 @@ def calc_rel_en(shielding_tensors_list):
 
 
 def calculate_boltzmann_factors(list_min_val):
-    """ Calculates the boltzman percentage contribution of each conformer"""
+    """Compute Boltzmann populations at 298.15 K for the relative energies.
+
+    Args:
+        list_min_val (list[float]): Relative conformer energies (kcal/mol), as
+            returned by ``calc_rel_en``.
+
+    Returns:
+        tuple[numpy.ndarray, float, list[float]]:
+        ``(boltzmann_perc, partition_function_Q, list_boltzmann_factors)`` where
+        ``boltzmann_perc`` are the normalised populations, ``Q`` the partition
+        function (sum of the raw factors) and ``list_boltzmann_factors`` the
+        unnormalised ``exp(-E/kT)`` values.
+
+    Note:
+        The constants (k = 0.001987204 kcal/(mol*K), T = 298.15 K) assume that
+        the energies passed in are in kcal/mol.
+    """
     # Variables
     T = 298.15
     k = 0.001987204
@@ -242,7 +367,22 @@ def calculate_boltzmann_factors(list_min_val):
     return boltzmann_perc, partition_function_Q, list_boltzmann_factors
 
 def perform_boltzmann_averaging(shielding_tensors_list,list_boltzmann_factors,partition_function_Q):
-    """ update shielding tensors based on boltzmann averaging """
+    """Average the shielding values of all conformers per atom.
+
+    Args:
+        shielding_tensors_list (list[list]): Rows ``[label, energy, sh_1, ...]``
+            as produced by ``get_shielding_for_conformers``.
+        list_boltzmann_factors (list[float]): Unnormalised Boltzmann factors
+            from ``calculate_boltzmann_factors``.
+        partition_function_Q (float): Normalisation constant (sum of factors).
+
+    Returns:
+        list[float]: Boltzmann-weighted average shielding for every atom,
+        ordered exactly like the per-atom values inside each row.
+
+    Side effects:
+        None; builds temporary lists only.
+    """
 
     master_shielding_list = []
     for idx, shielding_list in enumerate(shielding_tensors_list):
@@ -258,6 +398,14 @@ def perform_boltzmann_averaging(shielding_tensors_list,list_boltzmann_factors,pa
 
 
 def calculate_nmr_shifts_from_shieldings(atom_list,boltzman_avg_shifts,C13_shift_exp,C13_shield_calc,H1_shield_calc,H1_shift_exp):
+    # Purpose: convert averaged shieldings to shifts using the solvent reference.
+    # Args: atom_list - element symbol per atom (same order as the shifts);
+    #   boltzman_avg_shifts - averaged shielding per atom (ppm);
+    #   C13_shift_exp / H1_shift_exp - experimental reference shift of the solvent;
+    #   C13_shield_calc / H1_shield_calc - computed mean shielding of the solvent.
+    # Returns: list[float] copy of the shifts converted to ppm, leaving atoms whose
+    #   symbol is not "C"/"H" at their original shielding value.
+    # Side effects: none - the input list is deep-copied, never mutated.
     """ This function corrects the carbon and hydrogen shifts based on the standards of 1H and 13C solvent DFT calculation to correct the 
     shift and saved the corrected shifts inplace in boltzman_avg_shifts """
     import copy
@@ -275,6 +423,13 @@ def calculate_nmr_shifts_from_shieldings(atom_list,boltzman_avg_shifts,C13_shift
 # Parameters from this website: http://cheshirenmr.info/Recommendations.htm
 # http://cheshirenmr.info/ScalingFactors.htm#table5dimethylsulfoxideheading
 def calculate_nmr_shifts_from_shieldings_slope_intercept(atom_list,boltzman_avg_shifts, slope_H, intercept_H, slope_C, intercept_C):
+    # Purpose: convert averaged shieldings to shifts with a linear scaling model.
+    # Args: atom_list - element symbol per atom; boltzman_avg_shifts - averaged
+    #   shieldings (ppm); slope_H/intercept_H/slope_C/intercept_C - linear
+    #   regression parameters of the 1H and 13C referencing (Cheshire NMR tables).
+    # Returns: list[float] copy of the shifts in ppm, with atoms that are neither
+    #   "C" nor "H" left at their original shielding value.
+    # Side effects: none - the input list is deep-copied.
     """ This function corrects the carbon and hydrogen shifts based on the standards of 1H and 13C solvent DFT calculation to correct the 
     shift and saved the corrected shifts inplace in boltzman_avg_shifts 
     based on: http://cheshirenmr.info/Instructions.htm"""
@@ -291,7 +446,23 @@ def calculate_nmr_shifts_from_shieldings_slope_intercept(atom_list,boltzman_avg_
     return boltzman_avg
 
 def save_results_sdf_file(conformer_energy_list, docline_list, boltzman_avg_shifts_corr_2, compound_path):
-    """ this function saves the final shift predictions into a SDF files with the lowest energy conformer"""
+    """Write the predicted shifts into an SDF built from the lowest-energy conformer.
+
+    Args:
+        conformer_energy_list (list[float]): Energies in the order the conformers
+            appear in the source file (used to locate the minimum).
+        docline_list (list[str]): Raw source-file lines; the block belonging to the
+            lowest-energy conformer is extracted via its ``0:0:<index>`` marker.
+        boltzman_avg_shifts_corr_2 (list[float]): Final shifts, one per atom.
+        compound_path (str): Source file path; the output is written next to it.
+
+    Returns:
+        str: Path of the written ``*_shifts.sdf`` file.
+
+    Side effects:
+        Creates/overwrites ``<compound_path without extension>_shifts.sdf`` and
+        appends the ``averaged_NMR_shifts`` property plus its conformer index.
+    """
     lowest_conformer_index = conformer_energy_list.index(min(conformer_energy_list))
     
     ### Select the lowest energy conformer
@@ -331,6 +502,29 @@ def save_results_sdf_file(conformer_energy_list, docline_list, boltzman_avg_shif
 # Calculate ref values from solvent
 def run_script(solvent_path, compound_path, C13_shift_exp, H1_shift_exp, \
                slope_H, intercept_H, slope_C, intercept_C, extra_info=True):
+    """End-to-end shift prediction for a single compound.
+
+    Runs the whole DFT post-processing chain: solvent reference -> molecule
+    parsing -> per-conformer shieldings -> relative energies -> Boltzmann
+    weights -> averaging -> shift conversion -> SDF export.
+
+    Args:
+        solvent_path (str): SDF file of the solvent used as DFT reference.
+        compound_path (str): SDF file of the compound to process.
+        C13_shift_exp (float): Experimental 13C shift of the solvent reference.
+        H1_shift_exp (float): Experimental 1H shift of the solvent reference.
+        slope_H, intercept_H, slope_C, intercept_C (float): Linear scaling
+            parameters used by the slope/intercept referencing.
+        extra_info (bool): If True, print every intermediate result.
+
+    Returns:
+        tuple[str, list[float]]: ``(save_path, boltzman_avg_shifts_corr_1)`` -
+        the path of the written SDF and the final per-atom shifts (ppm).
+
+    Side effects:
+        Writes the ``*_shifts.sdf`` file (through ``save_results_sdf_file``),
+        creates the intermediate ``.mol`` file and prints to stdout.
+    """
     
     C13_shield_calc, H1_shield_calc = get_solvent_ref_shifts(solvent_path)
 
@@ -383,6 +577,19 @@ def run_script(solvent_path, compound_path, C13_shift_exp, H1_shift_exp, \
 ###############################################################################################
 
 def get_HSQC_info_data(mol=None, smiles="", file_path="", extra_info = False):
+    # Purpose: build the C->H connectivity used to assemble HSQC peaks.
+    # Args: exactly one of mol (RDKit Mol), smiles (str) or file_path (str);
+    #   extra_info (bool) only triggers a debug display of the H-suppressed mol.
+    # Returns: (count_list, m, stereo_smi, am, elements):
+    #   count_list - {carbon_atom_index: [hydrogen_atom_index, ...]},
+    #   m          - molecule with explicit H and atom-map numbers,
+    #   stereo_smi - isomeric SMILES of the first stereoisomer,
+    #   am         - adjacency matrix (numpy array, H included),
+    #   elements   - [(element_symbol, atom_index), ...] in atom order.
+    # Side effects: when extra_info is True, renders and prints via IPython.
+    # NOTE (known issue, left unchanged): neither argument is validated, so calling
+    #   with all three empty returns "unbound local variable m" (the branch chain
+    #   silently falls through).
     """ This function takes a smiles and calculates the carbons that are connected
     to H that will be displayed in an HSQC spectrum and it returns a dict that
     has the labels of the C with connections to which H
@@ -440,6 +647,11 @@ def get_HSQC_info_data(mol=None, smiles="", file_path="", extra_info = False):
 
 # from utils.functions import mol_with_atom_index
 def mol_with_atom_index(mol, include_H=True):
+    # Purpose: make atom indices visible when the molecule is rendered.
+    # Args: mol (RDKit Mol); include_H (bool) - add explicit hydrogens first.
+    # Returns: a new RDKit Mol where every atom carries the property
+    #   "molAtomMapNumber" equal to its index (used for drawing/labels only).
+    # Side effects: adds H atoms and coordinates to the molecule when include_H.
     """ 
     Takes a mol as input and adds H to them
     Visualizes the number which is assigned to which atom as a mol
@@ -457,6 +669,15 @@ def mol_with_atom_index(mol, include_H=True):
 
 ### Get the chiral carbons from the compound
 def get_chiral_carbons(stereo_smi):
+    # Purpose: locate stereocentres in a SMILES string.
+    # Args: stereo_smi (str) - isomeric SMILES.
+    # Returns: list[int] - 0-based "heteroatom counter" positions of the atoms that
+    #   are immediately followed by "@" (carbon or nitrogen stereocentres).
+    # Side effects: none.
+    # NOTE (known issue, left unchanged): the counter skips only the characters in a
+    #   fixed ignore list; two-letter elements such as "Cl"/"Br" count as one atom,
+    #   and ring-closure digits above 8 are counted as atoms, so the returned
+    #   positions can be offset relative to the RDKit atom indices.
     """ this function gives the chiral carbons based on the stereo-smiles provided and returns the number of the chiral carbon
     based on the occurence of that hetero-atom within the smiles string"""
     chiral_centers = []
@@ -478,7 +699,20 @@ def get_chiral_carbons(stereo_smi):
 
 
 def check_terminal_chiral_center(chiral_C, am, elements):
-    """ This function checks if a given C atom has 3 different distinct neighbors"""
+    """Decide whether a stereocentre sits at the end of a chain.
+
+    A centre is treated as "terminal" when it has exactly three distinct
+    non-carbon neighbours (e.g. H, halogen, O, N), i.e. only one carbon
+    substituent.
+
+    Args:
+        chiral_C (int): Atom index of the stereocentre.
+        am (numpy.ndarray): Adjacency matrix including hydrogens.
+        elements (list[tuple[str, int]]): ``(symbol, index)`` per atom.
+
+    Returns:
+        bool: True if the centre has three distinct non-carbon substituents.
+    """
     surrounding_list = []
     for idx, j in enumerate(am[chiral_C]):
         #not refering to itself and no C because otherwise it is not a terminal steroecenter
@@ -496,6 +730,14 @@ def check_terminal_chiral_center(chiral_C, am, elements):
 # and check if it is a terminal chiral center and save it in a separate dict
 from collections import defaultdict
 def chiral_center_type(chiral_centers, elements, am):
+    # Purpose: split stereocentres into "terminal" and "chain" centres and collect
+    #   the carbon neighbours whose peaks are split by the stereocentre.
+    # Args: chiral_centers (list[int]) - positions from get_chiral_carbons;
+    #   elements - (symbol, index) pairs; am - adjacency matrix.
+    # Returns: (direct_neighbor_list, direct_neighbor_dict,
+    #           terminal_neighbor_list, terminal_neighbor_dict), where the lists
+    #   flatten the dicts and the dicts map centre -> carbon neighbour indices.
+    # Side effects: none.
     """This function checks if the chiral center is at the end of a chain (terminal) 
     or somewhere in the middle of the molecule"""
     direct_neighbor_dict = defaultdict(list)
@@ -523,7 +765,22 @@ def chiral_center_type(chiral_centers, elements, am):
 
 
 def get_bond_type(idx,ring_bound_list):
-    """ As the function name implies"""
+    """Return the bond type of the first ring bond that contains ``idx``.
+
+    Args:
+        idx (int): Atom index to look up.
+        ring_bound_list (list[list]): ``[atom_i, atom_j, bond_type_string]`` rows
+            for consecutive atoms of every ring.
+
+    Returns:
+        str: ``"AROMATIC"`` or ``"SINGLE"``.
+
+    NOTE (known issue, left unchanged):
+        The loop always exits after the first row (``break`` is unconditional), so
+        only the very first ring bond in the list is ever inspected. Every ring
+        bond after it is classified as ``"SINGLE"`` even when it is aromatic,
+        which can wrongly mark chiral centres as "not next to an aromatic ring".
+    """
     for i in ring_bound_list:
         if idx in i and i[2] == "AROMATIC":
             bond_type = "AROMATIC"
@@ -536,6 +793,13 @@ def get_bond_type(idx,ring_bound_list):
 # check if chiral center is next to aromatic ring then don't split the second layer distance
 # because if chiral center is next to aromatic ring the second layer doesn't split
 def get_exclude_second_degree_list(mol, chiral_centers, elements, am):
+    # Purpose: detect stereocentres adjacent to an aromatic ring, where the
+    #   second-layer splitting does not occur in real spectra.
+    # Args: mol (RDKit Mol) - needed for ring perception;
+    #   chiral_centers (list[int]); elements - (symbol, index) pairs; am - adjacency.
+    # Returns: (exclude_second_degree_list, ring_bound_list): the centre indices to
+    #   exclude and the ring bond rows [atom_i, atom_j, bond_type].
+    # Side effects: none.
     """This function checks if chiral centers are next to aromatic rings 
     in that case no second layer gets split"""
     ringinfo = mol.GetRingInfo()
@@ -562,6 +826,15 @@ def get_exclude_second_degree_list(mol, chiral_centers, elements, am):
 
 # remove the reference that is from the chiral center that is next to the ring
 def get_second_degree_neighbor(direct_neighbor_dict, exclude_second_degree_list, am, elements, direct_neighbor_list, chiral_centers, terminal_neighbor_list):
+    # Purpose: extend split positions from direct neighbours to second-layer carbons.
+    # Args: direct_neighbor_dict - centre -> direct carbon neighbours;
+    #   exclude_second_degree_list - centres next to aromatic rings (ignored);
+    #   am/elements - graph data; direct_neighbor_list/terminal_neighbor_list -
+    #   already known positions that must not be added again; chiral_centers.
+    # Returns: (sec_direct_neighbor, direct_neighbor_dict): the newly found second
+    #   layer indices and the updated mapping.
+    # Side effects: appends to the *caller's* dict in place (the deep copy is only
+    #   used to drop excluded centres); the caller therefore sees the mutation.
     """This function removes the chiral centers next to aromatic rings and addes the positions that
     with a distance of two to the list"""
     import copy
@@ -586,7 +859,15 @@ def get_second_degree_neighbor(direct_neighbor_dict, exclude_second_degree_list,
 
 
 def get_all_chiral_split_positions(direct_neighbor_dict, terminal_neighbor_dict):
-    """As the function says"""
+    """Flatten both neighbour dictionaries into one list of split positions.
+
+    Args:
+        direct_neighbor_dict (dict[int, list[int]]): Chain-centre mapping.
+        terminal_neighbor_dict (dict[int, list[int]]): Terminal-centre mapping.
+
+    Returns:
+        list[int]: All carbon atom indices whose peaks are split by a stereocentre.
+    """
     all_split_positions = []
     for k,v in direct_neighbor_dict.items():
         for i in v:
@@ -600,7 +881,26 @@ def get_all_chiral_split_positions(direct_neighbor_dict, terminal_neighbor_dict)
 
 # Check if those neighbors have symmetric substitutes - if so pop them because will not be duplicated
 def check_for_symmetric_substituents(all_split_positions, chiral_centers, elements, am):
-    """As the function says"""
+    """Drop split positions whose substituents are all identical (e.g. CH3).
+
+    Args:
+        all_split_positions (list[int]): Candidate positions (mutated in place).
+        chiral_centers (list[int]): Stereocentre indices.
+        elements (list[tuple[str, int]]): ``(symbol, index)`` per atom.
+        am (numpy.ndarray): Adjacency matrix.
+
+    Returns:
+        list[int]: Positions that were removed because they are symmetrical.
+
+    Side effects:
+        Pops symmetric entries from ``all_split_positions`` in place.
+
+    NOTE (known issue, left unchanged):
+        ``elements[idx][1] != chiral_centers`` compares an int with a *list*, so it
+        is always True. The intended test was "not in chiral_centers"; as written,
+        carbon neighbours that are themselves stereocentres are not excluded, so
+        a symmetric assignment can be produced for those positions.
+    """
     remove_neighbor_list = []
     for i in all_split_positions:
         surrounding_list=[]
@@ -628,7 +928,21 @@ def check_for_symmetric_substituents(all_split_positions, chiral_centers, elemen
 # # the second last C in the chain is also not split for some reason in ACD labs?!
 # # this has to do with the electronegativity next to the chiral center if polar F or benzo ring then no split
 def remove_symmetric_centers(all_split_positions, remove_neighbor_list, sec_direct_neighbor, elements, am):
-    """Just if it is e.g. CH3"""
+    """Remove second-layer positions that are equivalent to a CH3-like carbon.
+
+    Args:
+        all_split_positions (list[int]): Candidate split positions (mutated).
+        remove_neighbor_list (list[int]): Positions flagged as symmetric.
+        sec_direct_neighbor (list[int]): Second-layer positions found earlier.
+        elements (list[tuple[str, int]]): ``(symbol, index)`` per atom.
+        am (numpy.ndarray): Adjacency matrix.
+
+    Returns:
+        list[int]: The pruned ``all_split_positions`` list.
+
+    Side effects:
+        Pops entries from ``all_split_positions`` in place.
+    """
     for i in remove_neighbor_list:
         if (i in sec_direct_neighbor) and (i in all_split_positions):
             for idx, j in enumerate(am[i]):
@@ -646,7 +960,22 @@ def remove_symmetric_centers(all_split_positions, remove_neighbor_list, sec_dire
 # if not pop them as well
 # need to do a copy otherwise it doesn't loop over everything
 def check_for_two_H(all_split_positions, elements, am):
-    """ remove position if there is just one hydrogen connected to the carbon """
+    """Keep only split positions that carry exactly two hydrogens.
+
+    A CH2 group is the only case in which two distinguishable protons of the same
+    carbon produce separate HSQC peaks; CH, CH3 or quaternary carbons are dropped.
+
+    Args:
+        all_split_positions (list[int]): Candidate positions (mutated).
+        elements (list[tuple[str, int]]): ``(symbol, index)`` per atom.
+        am (numpy.ndarray): Adjacency matrix.
+
+    Returns:
+        list[int]: The pruned ``all_split_positions`` list.
+
+    Side effects:
+        Pops entries from ``all_split_positions`` in place.
+    """
     all_split_positions_ = all_split_positions.copy()
     for i in all_split_positions_:
         num_h = 0
@@ -661,7 +990,22 @@ def check_for_two_H(all_split_positions, elements, am):
 
 
 def find_symmetric_positions(stereo_smi):
-    """https://github.com/rdkit/rdkit/issues/1411"""
+    """Find groups of symmetry-equivalent atoms in a molecule.
+
+    Uses RDKit canonical ranking with ties kept (``breakTies=False``) and
+    self-substructure matches to group atoms that are equivalent under the
+    molecular symmetry.
+
+    Args:
+        stereo_smi (str): Isomeric SMILES of the compound.
+
+    Returns:
+        list[list[int]]: One inner list per group of equivalent atom indices;
+        empty when the molecule has no symmetry.
+
+    Side effects:
+        None; builds temporary RDKit molecules.
+    """
 
     mol = Chem.MolFromSmiles(stereo_smi)
     isomers = tuple(EnumerateStereoisomers(mol))
@@ -700,6 +1044,26 @@ def find_symmetric_positions(stereo_smi):
 
 
 def run_chiral_and_symmetry_finder(smiles="", compound_path="", extra_info=False):
+    """Run the full chirality/symmetry analysis for one compound.
+
+    Either builds a molecule from ``smiles`` or reads ``compound_path`` (exactly
+    one of the two should be given). The function chains all stereocentre,
+    second-layer and symmetry helpers and returns the two lists needed to build
+    the final peak table.
+
+    Args:
+        smiles (str): SMILES of the compound (mutually exclusive with path).
+        compound_path (str): Path to an SDF/MOL file.
+        extra_info (bool): Print every intermediate result to stdout.
+
+    Returns:
+        tuple[list[list[int]], list[int], Chem.Mol, str]:
+        ``(sym_dupl_lists, all_split_positions, mol, compound_path)``.
+
+    Side effects:
+        When ``smiles`` is given, writes a temporary SDF via ``smile2SDF`` and
+        prints debug output if ``extra_info`` is True.
+    """
 
     if compound_path != "":
         mol = Chem.MolFromMolFile(compound_path)
@@ -758,6 +1122,14 @@ def run_chiral_and_symmetry_finder(smiles="", compound_path="", extra_info=False
 
 # Get C-H connectivity dict with index starting from 0 to correct it to python convention
 def get_c_h_connectivity(connectivity_list, atom_list):
+    # Purpose: build the carbon -> hydrogens mapping from the SDF bond block.
+    # Args: connectivity_list (list[list[str]]) - bond rows [atom1, atom2, type, ...]
+    #   (1-based as in the file); atom_list (list[str]) - element per atom.
+    # Returns: dict[int, list[int]] - 0-based carbon index -> 0-based H indices.
+    # Side effects: none.
+    # Note: the "type(...) == list" line is not an assert; it deliberately raises
+    #   KeyError for a carbon that is not yet in the dict, which is caught to
+    #   initialise the list. It works, but reads like dead code.
     """ This function checks the connectifity list and creates a dictionary with all the 
     carbons that are connected to hydrogens with their labelled numbers"""
     c_h_connectivity_dict = {}
@@ -792,7 +1164,25 @@ def get_c_h_connectivity(connectivity_list, atom_list):
 
 
 def plot_dft_spectrum(shifts, amplifyer=850, transp=0.50):
-    """Plots scatter plot from dataframe"""
+    """Plot a quick 2D scatter view of the predicted peaks.
+
+    Args:
+        shifts (list[list]): Rows ``[C_shift, H_shift, intensity]``.
+        amplifyer (int): Kept for API compatibility; not used for sizing here.
+        transp (float): Marker transparency.
+
+    Returns:
+        None; the figure is shown via ``plt.show()``.
+
+    Side effects:
+        Creates a matplotlib figure and opens an interactive plot window.
+
+    NOTE (known issue, left unchanged):
+        ``match`` is computed once from ``group[0]`` and reused for every group,
+        so both the positive and the negative intensities are drawn from the same
+        subset of points and the legend colours therefore do not reflect the
+        actual sign of each peak.
+    """
     import matplotlib.pyplot as plt
 
     scatter_x_2 = np.array(shifts)[:,1]
@@ -822,6 +1212,15 @@ def plot_dft_spectrum(shifts, amplifyer=850, transp=0.50):
 # generating the HSQC spectrum including directions of the intensity
 
 def selecting_shifts(c_h_connectivity_dict, all_split_positions, boltzman_avg_shifts_corr_2):
+    # Purpose: turn per-atom shifts into HSQC peak rows.
+    # Args: c_h_connectivity_dict - carbon -> hydrogen indices;
+    #   all_split_positions - carbons whose two protons are resolved separately;
+    #   boltzman_avg_shifts_corr_2 - final per-atom shifts (ppm).
+    # Returns: list[list] rows [C_shift, H_shift, direction, carbon_index,
+    #   hydrogen_index_list], where direction is +1 for odd H counts (CH/CH3) and
+    #   -1 for even ones (CH2, phase inversion in HSQC-DEPT). A CH2 carbon in
+    #   all_split_positions produces one row per proton.
+    # Side effects: none.
     """This functions takes the connectifity list and the symmetry and chirality information and
     reconstructs the shifts including their splittings and returns it as a final list
     including the direction of the peak based on the number of H bound to C"""
@@ -852,6 +1251,14 @@ def selecting_shifts(c_h_connectivity_dict, all_split_positions, boltzman_avg_sh
 
 
 def perform_deduplication_if_symmetric(shifts, sym_dupl_lists):
+    # Purpose: average the shifts of symmetry-equivalent carbons and merge
+    #   duplicate rows, so that equivalent atoms yield a single peak.
+    # Args: shifts (list[list]) - rows from selecting_shifts;
+    #   sym_dupl_lists (list[list[int]]) - groups of equivalent atom indices.
+    # Returns: list[list] - deduplicated rows in the same format as the input.
+    # Side effects: none; new lists are built.
+    # Note: when no symmetry is found the original list object is returned (not a
+    #   copy), so the caller and this function would share the same list.
     """ This function performs deduplication based on the symmetries found in the compound
     and returns the new corrected shifts"""
     #shifts_arr = np.array(shifts)
@@ -918,6 +1325,17 @@ def perform_deduplication_if_symmetric(shifts, sym_dupl_lists):
 
 
 def generate_dft_dataframe(shifts):
+    """Wrap predicted peaks into the canonical dataframe layout.
+
+    Args:
+        shifts (list[list]): Rows ``[C_shift, H_shift, direction, atom_index,
+            hydrogen_index_list]`` as produced by ``selecting_shifts`` /
+            ``perform_deduplication_if_symmetric``.
+
+    Returns:
+        pandas.DataFrame: Columns ``F2 (ppm)`` (1H), ``F1 (ppm)`` (13C),
+        ``direction`` and ``atom_index`` (underscore-joined indices).
+    """
     # save shifts as dataframe
     df_dft = pd.DataFrame()
     c_shifts = np.array(shifts, dtype=object)[:,0]
@@ -943,6 +1361,21 @@ def generate_dft_dataframe(shifts):
 
 
 def check_num_peaks_in_acd(df_acd):
+    """Count the distinct (1H, 13C) peak pairs of an ACD spectrum.
+
+    Args:
+        df_acd (pandas.DataFrame): ACD dataframe with ``F2 (ppm)`` and
+            ``F1 (ppm)`` columns.
+
+    Returns:
+        int: Number of unique peak pairs.
+
+    NOTE (known issue, left unchanged):
+        Coordinates are concatenated as plain strings without a separator
+        (``str(F2) + str(F1)``), so different pairs can collide, e.g.
+        ("1.0", "23.0") and ("1.02", "3.0") both become "1.023.0" and are
+        counted as one peak. The count can therefore be too small.
+    """
     list_strings = []
     for i,j in zip(df_acd["F2 (ppm)"], df_acd["F1 (ppm)"]):
         string = str(i)+str(j)
@@ -951,7 +1384,23 @@ def check_num_peaks_in_acd(df_acd):
     return num_peaks
 
 def load_acd_dataframe(sample_id, acd_files):
-    """as the function says"""
+    """Load the ACD-predicted HSQC spectrum for a sample.
+
+    Args:
+        sample_id (str): Substring identifying the sample in the file list.
+        acd_files (list[str]): Candidate ACD SDF file paths.
+
+    Returns:
+        tuple[pandas.DataFrame, list[str]]: The deduplicated spectrum
+        (``F2 (ppm)``, ``F1 (ppm)``, ``direction``) and the matched path list.
+
+    Side effects:
+        None beyond reading the SDF file.
+
+    NOTE (known issue, left unchanged):
+        ``[i for i in acd_files if sample_id in i][0]`` raises ``IndexError`` when
+        no file matches the sample id.
+    """
     acd_file_path = [i for i in acd_files if sample_id in i ][0]
     data = PandasTools.LoadSDF(acd_file_path)#, smilesName='SMILES',molColName='Mol',includeFingerprints=False)
     data["HSQC_13C-1H"]
@@ -970,7 +1419,19 @@ def load_acd_dataframe(sample_id, acd_files):
 # df_acd, acd_file_path = load_acd_dataframe(sample_id, acd_files)
 
 def load_acd_dataframe_from_file(acd_file_path):
-    """as the function says"""
+    """Parse an ACD SDF file into a deduplicated HSQC dataframe.
+
+    The SDF property ``HSQC_13C-1H`` holds a semicolon/tab separated table; the
+    first row is used as the column header, and rows marked with ``<`` are
+    given a negative direction (DEPT phase).
+
+    Args:
+        acd_file_path (str): Path to the ACD SDF file.
+
+    Returns:
+        pandas.DataFrame: ``F2 (ppm)``, ``F1 (ppm)``, ``direction``, deduplicated
+        on the (1H, 13C) pair.
+    """
     data = PandasTools.LoadSDF(acd_file_path)#, smilesName='SMILES',molColName='Mol',includeFingerprints=False)
     data["HSQC_13C-1H"]
     string_data = str(data['HSQC_13C-1H'][0])
@@ -987,12 +1448,34 @@ def load_acd_dataframe_from_file(acd_file_path):
     return df_acd_dedup
 
 def load_real_dataframe_from_file(real_file_path):
+    """Load an experimental HSQC table from a whitespace/tab separated text file.
+
+    Args:
+        real_file_path (str): Text file with ``F2ppm`` and ``F1ppm`` columns.
+
+    Returns:
+        pandas.DataFrame: Same data with columns renamed to ``F2 (ppm)`` and
+        ``F1 (ppm)`` so it matches the canonical layout.
+    """
 
     df_real = pd.read_csv(real_file_path, sep="\t|\s+")
     df_real = df_real.rename(columns={"F2ppm": "F2 (ppm)", "F1ppm": "F1 (ppm)"})
     return df_real
 
 def load_real_dataframe(sample_id, real_files):
+    """Load the experimental HSQC table of a sample from a candidate file list.
+
+    Args:
+        sample_id (str): Substring identifying the sample.
+        real_files (list[str]): Candidate file paths.
+
+    Returns:
+        pandas.DataFrame: Columns renamed to ``F2 (ppm)`` / ``F1 (ppm)``.
+
+    NOTE (known issue, left unchanged):
+        Only files whose name also contains "two" are considered, and the first
+        match is used; a sample without such a file raises ``IndexError``.
+    """
     filter_id = [i for i in real_files if sample_id in i]
     real_file_path = [i for i in filter_id if "two" in i][0]
     df_real = pd.read_csv(real_file_path, sep="\t|\s+")
@@ -1000,6 +1483,19 @@ def load_real_dataframe(sample_id, real_files):
     return df_real
 
 def load_mnova_dataframe(sample_id, mnova_files):
+    """Load an MNova peak list for a sample from a candidate file list.
+
+    Args:
+        sample_id (str): Substring identifying the sample.
+        mnova_files (list[str]): Candidate MNova text file paths.
+
+    Returns:
+        tuple[pandas.DataFrame, str]: Peak table with columns
+        ``id, F2 (ppm), F1 (ppm), Intensity`` and the matched path.
+
+    NOTE (known issue, left unchanged):
+        Raises ``IndexError`` when no candidate matches the sample id.
+    """
     
     file_path = [i for i in mnova_files if sample_id in i][0]
     df_mnova = pd.read_csv(file_path, sep="\t|\s+", names=["id", "F2 (ppm)",  "F1 (ppm)", 'Intensity'])
@@ -1007,12 +1503,31 @@ def load_mnova_dataframe(sample_id, mnova_files):
     return df_mnova, file_path
 
 def load_mnova_dataframe_from_file(file_path):
+    """Load an MNova peak list directly from a given path.
+
+    Args:
+        file_path (str): MNova text file (tab/space separated, no header).
+
+    Returns:
+        pandas.DataFrame: Columns ``id, F2 (ppm), F1 (ppm), Intensity``.
+    """
     
     df_mnova = pd.read_csv(file_path, sep="\t|\s+", names=["id", "F2 (ppm)",  "F1 (ppm)", 'Intensity'])
     return df_mnova
 
 
 def load_sarotti_data(file_path, mode=["exp","calc1","calc2"], nmr_type=["HSQC", "1H", "13C"]):
+    # Purpose: read the Sarotti benchmark CSV and select a spectrum variant.
+    # Args: file_path (str) - CSV with exp_*/calc*_* ppm columns;
+    #   mode (str) - "exp", "calc1" or "calc2" (note: the default is a list, but
+    #   the body compares against strings, so the default call returns None);
+    #   nmr_type (str) - currently only "HSQC" is implemented.
+    # Returns: pandas.DataFrame with "F2 (ppm)" / "F1 (ppm)" for the requested
+    #   variant, or None for unsupported combinations.
+    # Side effects: none.
+    # NOTE (known issue, left unchanged): unsupported mode/nmr_type values fall
+    #   through without a return, so the caller receives None; and the
+    #   "1H"/"13C" branches advertised in the docstring are not implemented.
     """This function loads the HSQC data from the sarotti files and it can choose between experimental results and the calculated ones.
         To get the 1H and 13C still needs to be implemented"""   
     
@@ -1065,6 +1580,12 @@ def load_sarotti_data(file_path, mode=["exp","calc1","calc2"], nmr_type=["HSQC",
 
 
 def plot_spectra_together(df_list, labels, sample_id):
+    # NOTE (known issue, left unchanged): acd_num_peaks is only assigned when
+    #   "acd" appears in labels, but the else-branch below references it for every
+    #   non-acd dataframe. Calling this without an "acd" spectrum therefore raises
+    #   NameError. The first "if len(df_list)==2" is also not an "elif", so the
+    #   unpacking chain falls through for two dataframes (harmless, df_1/df_2 are
+    #   still bound).
     """
     Plot multiple 2D NMR spectra together, correcting for points that fall together in ACD Labs spectra.
 
@@ -1127,6 +1648,18 @@ def plot_spectra_together(df_list, labels, sample_id):
 
 
 def get_similarity_comparison_variations(df_1, df_2, sample_id, similarity_type=["euclidean", "cosine_similarity", "pearson_similarity"], error=["sum","avg"], display_img=False, sim_technique=None):
+    # Purpose: score two spectra under nine different assignment strategies.
+    # Args: df_1/df_2 - dataframes with "F2 (ppm)"/"F1 (ppm)";
+    #   sample_id - label used in plots; similarity_type - list of point
+    #   similarity measures passed to similarity_calculations; error - error
+    #   aggregation mode; display_img - draw the overlaid spectra; sim_technique -
+    #   optional assignment algorithm override.
+    # Returns: (result, input_dfs) where result is a 9-element list ordered as
+    #   [min_sum_zero, euc_dist_zero, hung_dist_zero, min_sum_trunc,
+    #    euc_dist_trunc, hung_dist_trunc, min_sum_nn, euc_dist_nn, hung_dist_nn]
+    #   and input_dfs maps each mode name to the [df_1, df_2] pair of aligned peak
+    #   sets that produced the score.
+    # Side effects: optional plotting; no printing.
 #"min_sum","euc_dist_zero","euc_dist_advanced","hungarian_zero","hungarian_advanced"
     """ This function calculates the similarities of two HSQC dataframes and returns all 4 different
     similarity measures in from of a list [minSum, euclidean, hungarian, adv_hungarian"""
@@ -1190,7 +1723,15 @@ def get_similarity_comparison_variations(df_1, df_2, sample_id, similarity_type=
 
 
 def load_shifts_from_sdf(sample_id, files):
-    """ This functions load the nmr_shifts from the shift-SDF file"""
+    """Load the ``averaged_NMR_shifts`` property from a matching shift-SDF file.
+
+    Args:
+        sample_id (str): Substring identifying the sample.
+        files (list[str]): Candidate SDF paths.
+
+    Returns:
+        tuple[list[float], str]: Per-atom shifts (ppm) and the matched file path.
+    """
     file_path = [i for i in files if sample_id in i][0]
     atom_list, connectivity_list, docline_list, name, mol = get_molecule_data(file_path)
     for idx, line in enumerate(docline_list):
@@ -1201,7 +1742,19 @@ def load_shifts_from_sdf(sample_id, files):
     return boltzman_avg_shifts_corr_2, file_path
 
 def load_shifts_from_sdf_file(file_path):
-    """ This functions load the nmr_shifts from the shift-SDF file"""
+    """Load the ``averaged_NMR_shifts`` property from a given SDF file.
+
+    Args:
+        file_path (str): Path to the SDF file.
+
+    Returns:
+        list[float]: Per-atom shifts (ppm). Both comma- and space-separated
+        encodings of the property are accepted.
+
+    NOTE (known issue, left unchanged):
+        ``data["averaged_NMR_shifts"].item()`` raises ValueError when the SDF
+        contains more than one record (the item() call requires exactly one).
+    """
     # file_path = [i for i in files if sample_id in i][0]
     data = PandasTools.LoadSDF(file_path)
     str_shifts = data["averaged_NMR_shifts"].item()
@@ -1222,6 +1775,11 @@ def load_shifts_from_sdf_file(file_path):
 
 
 def load_ml_dataframe(sample_id, ml_files):
+    # Side effects: none besides reading the SDF; the ML molecule is re-parsed by
+    #   run_chiral_and_symmetry_finder and get_molecule_data.
+    # NOTE (known issue, left unchanged): the SDF is loaded with
+    #   data["averaged_NMR_shifts"].item(), which raises ValueError if the matched
+    #   file contains more than one record.
     """
     Load an ML SDF file into a Pandas DataFrame.
 
@@ -1254,7 +1812,16 @@ def load_ml_dataframe(sample_id, ml_files):
 
 
 def load_ml_dataframe_from_file(ml_file_path):
-    """ Load ML sdf file to dataframe"""
+    """Load an ML-predicted shift SDF into a peak dataframe.
+
+    Args:
+        ml_file_path (str): Path to the ML SDF file. The property
+            ``averaged_NMR_shifts`` must contain space-separated per-atom shifts.
+
+    Returns:
+        pandas.DataFrame: Peak table with ``F2 (ppm)``, ``F1 (ppm)``,
+        ``direction`` and ``atom_index`` columns.
+    """
     
     data = PandasTools.LoadSDF(ml_file_path)
     str_shifts = data["averaged_NMR_shifts"].item()
@@ -1270,6 +1837,20 @@ def load_ml_dataframe_from_file(ml_file_path):
 
 
 def load_dft_dft_comparison(dft_file_path):
+    """Build a peak dataframe from a DFT-computed shift SDF.
+
+    Args:
+        dft_file_path (str): Path to the DFT SDF file.
+
+    Returns:
+        pandas.DataFrame: Peak table (``F2``/``F1``/``direction``/``atom_index``)
+        produced by the same chirality/symmetry/peak assembly chain used for ML
+        data.
+
+    Note:
+        The local variable ``dft_num_peaks`` is computed but never returned; the
+        number of peaks is simply ``len(df_dft)``.
+    """
     
 #     files = glob.glob('/projects/cc/knlr326/1_NMR_project/6_Paper_1_analysis/1_HMDB_conformer_analysis/1_HMDB_ICOLOS_DFT/*/*')
 
@@ -1291,6 +1872,16 @@ def load_dft_dft_comparison(dft_file_path):
     return df_dft
 
 def load_sdf_comparison(sdf_file_path):
+    """Build a peak dataframe from any shift SDF file.
+
+    Args:
+        sdf_file_path (str): Path to the SDF file.
+
+    Returns:
+        pandas.DataFrame: Peak table in the canonical layout, assembled via
+        ``run_chiral_and_symmetry_finder``, ``selecting_shifts`` and
+        ``perform_deduplication_if_symmetric``.
+    """
     
 #     files = glob.glob('/projects/cc/knlr326/1_NMR_project/6_Paper_1_analysis/1_HMDB_conformer_analysis/1_HMDB_ICOLOS_DFT/*/*')
 
@@ -1311,7 +1902,14 @@ def load_sdf_comparison(sdf_file_path):
 
 # ##### NOT sure where i used that one
 def load_real_dataframe_from_path(real_file_path):
-    """ for loading the real hmdb txt files"""
+    """Load an experimental HMDB text file without renaming any columns.
+
+    Args:
+        real_file_path (str): Path to the tab/space separated file.
+
+    Returns:
+        pandas.DataFrame: Raw table as read (typically ``F2ppm``/``F1ppm``).
+    """
     df_real = pd.read_csv(real_file_path, sep="\t|\s+")
     # df_real = pd.read_csv(real_file_path, sep="\t|\s+", names=["id", "F2 (ppm)",  "F1 (ppm)", 'Intensity'])
 
@@ -1319,7 +1917,19 @@ def load_real_dataframe_from_path(real_file_path):
 
 
 def load_real_df_from_file(path_txt):
-    """prepares the datafram from the txt file for plotting the real data"""
+    """Load an experimental peak list and derive the canonical ppm columns.
+
+    Args:
+        path_txt (str): Text file with ``F2ppm``/``F1ppm`` columns.
+
+    Returns:
+        tuple[pandas.DataFrame, str]: The dataframe (with added ``F2 (ppm)`` /
+        ``F1 (ppm)`` columns) and the first 11 characters of the file name.
+
+    Note:
+        If parsing with the mixed tab/space separator fails, the function retries
+        with a tab-only separator.
+    """
     try:
         df_real = pd.read_csv(path_txt, sep="\t|\s+")  
     except:
@@ -1333,13 +1943,34 @@ def load_real_df_from_file(path_txt):
 
 
 def load_shifts_from_dp_sdf_file(sdf_file_dp):
+    """Load the shift list stored in a DP4/DP5-style SDF file.
+
+    Args:
+        sdf_file_dp (str): SDF file whose ``averaged_NMR_shifts`` property is a
+            Python literal (e.g. ``"[1.2, 3.4, ...]"``).
+
+    Returns:
+        list[float]: Per-atom shifts parsed with ``ast.literal_eval``.
+
+    NOTE (known issue, left unchanged):
+        ``ast.literal_eval`` only accepts a syntactically valid Python literal.
+        A property written as space-separated numbers ("1.2 3.4 5.6") raises
+        SyntaxError/ValueError, so only DP files written with list syntax load.
+    """
     data = PandasTools.LoadSDF(sdf_file_dp)
     chemical_shifts = ast.literal_eval(data["averaged_NMR_shifts"][0])
     return chemical_shifts
 
 
 def load_dft_dp_comparison(dft_file_path):
-    """ Load dp sdf file to dataframe"""
+    """Build a peak dataframe from a DP5-style DFT shift SDF.
+
+    Args:
+        dft_file_path (str): Path to the DP SDF file.
+
+    Returns:
+        pandas.DataFrame: Peak table in the canonical layout.
+    """
     boltzman_avg_shifts_corr_2 = load_shifts_from_dp_sdf_file(dft_file_path)
     sym_dupl_lists, all_split_positions, mol, compound_path = run_chiral_and_symmetry_finder(compound_path=dft_file_path)
     atom_list, connectivity_list, docline_list, name, mol = get_molecule_data(dft_file_path)
@@ -1351,6 +1982,9 @@ def load_dft_dp_comparison(dft_file_path):
     return df_dft
 
 def load_dft_dp_dataframe(dft_file_path):
+    # This function duplicates load_dft_dp_comparison (same body, same result);
+    # kept as a separate name for callers that use the "dataframe" naming.
+    # Side effects: none besides reading the SDF.
     """Load a DFT (density functional theory) chemical shift file in SD format to a pandas DataFrame.
 
     Args:
@@ -1373,7 +2007,21 @@ def load_dft_dp_dataframe(dft_file_path):
 
 
 def load_all_df_from_id(sample_id, acd_files, real_files, mnova_files, ml_files, dft_files):
-    """ This function loads all the df from all 5 datasets if they exist -> from Notebook 6"""
+    """Load every available spectrum source for one sample id.
+
+    Args:
+        sample_id (str): Identifier used as a substring filter in all lists.
+        acd_files, real_files, mnova_files, ml_files, dft_files (list[str]):
+            Candidate paths for the five data sources.
+
+    Returns:
+        tuple[pandas.DataFrame, ...]: ``(df_real, df_acd, df_mnova, df_dft,
+        df_ml)`` in that order (note: not the order of the arguments).
+
+    Side effects:
+        Reads files only. Each source is resolved with the first substring match;
+        missing sources raise ``IndexError``.
+    """
     
     # Get acd df
     acd_file_path = [i for i in acd_files if sample_id in i][0]
@@ -1408,6 +2056,15 @@ def load_all_df_from_id(sample_id, acd_files, real_files, mnova_files, ml_files,
 
 
 def correct_dft_calc_sdf_file(file_path):
+    # Extra notes for the long docstring below:
+    # - The SDF property name is rewritten because the original spelling
+    #   ("sheilding") and the spaces in the tag are not accepted by RDKit writers.
+    # - NOTE (known issue, left unchanged): sdf_filename/movl_filename are only
+    #   assigned inside the "filename.startswith('NMR_SEL_')" loop; if the folder
+    #   contains no such file they stay unbound and the later open() raises
+    #   NameError. The code also calls rdkit.Chem.PandasTools while only
+    #   "from rdkit.Chem import PandasTools" is imported, which can raise
+    #   AttributeError/NameError depending on the import side effects.
     """Corrects an SDF file with DFT-calculated NMR data.
     
     This function opens an SDF file with DFT-calculated NMR data, replaces a specific line in the file, and

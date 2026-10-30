@@ -1,4 +1,46 @@
 
+"""Validation, scoring and molecule generation for the Multimodal Transformer (v15.4).
+
+This module bundles everything that happens *after* an MMT checkpoint exists:
+
+1. Model / data plumbing: ``load_data_and_MMT_model`` rebuilds a
+   ``TransformerMultiGPU`` Lightning wrapper from a checkpoint and wraps a
+   ``MultimodalData`` split in a ``DataLoader``; ``run_model`` performs the
+   no-grad forward pass that returns the encoder memory, the combined padding
+   mask, the tokenised target SMILES and the multimodal "fingerprint"
+   embedding.
+2. Scoring: ``predict_prop_correct_max_sequence*`` and
+   ``predict_performance_metric`` measure how probable the ground-truth token
+   and the arg-max token are at every decoding step, which is used as a
+   confidence / calibration metric.
+3. Decoding: ``greedy_sequence`` / ``evaluate_greedy`` (arg-max decoding),
+   ``multinomial_sequence`` / ``evaluate_multinomial`` (stochastic sampling)
+   and ``beam_search`` / ``beam_search_step`` (beam decoding) turn encoder
+   memory into SMILES strings.
+4. Evaluation: SMILES validity, Tanimoto similarity against the ground-truth
+   SMILES (``calculate_tanimoto_similarity``), molecular weights, and plotting
+   helpers for the aggregated metrics.
+
+Conventions and expectations
+----------------------------
+* All three decoding strategies share the same decoder contract: seed the
+  sequence with ``<SOS>``, append exactly one token per iteration, mask all
+  future positions with ``model.generate_square_subsequent_mask``.
+* Tensors are expected on ``config.device``; most helpers inspect
+  ``config.training_mode`` (a string such as ``"1H_13C_HSQC_MS"``) to decide
+  which spectra are available.
+* Large parts of this file are intentionally dead code kept inside
+  triple-quoted string literals or commented out (earlier ``run_model``
+  implementations, ``evaluate_beam_search``, ``run_full_analysis``,
+  ``calculate_corr_max_multinom_prob`` version 1). They are never executed
+  and are left untouched by this documentation pass.
+
+Note: at import time this module picks a random seed (``SEED =
+random.randint(0, 1000)``) and seeds torch / NumPy / ``random``, prints the
+seed, and loads the SGNN normalisation constants from disk. Importing it
+therefore has side effects and is not deterministic across processes.
+"""
+
 #sys.path.append('/projects/cc/knlr326/1_NMR_project/2_Notebooks/nmr_project/1_Dataexploration/2_paper_code/Experiments_SLURM/20.0_SLURM_MasterTransformer')
 import os
 import sys
@@ -55,12 +97,52 @@ torch.backends.cudnn.benchmark = False
 
 
 def worker_init_fn(worker_id):
+    """Seed NumPy and Python ``random`` inside a DataLoader worker process.
+
+    PyTorch already gives every worker a distinct, reproducible base seed via
+    ``torch.initial_seed()``; this callback propagates it to the two non-torch
+    RNGs so that shuffling / sampling inside ``Dataset`` code does not repeat
+    the same values in every worker.
+
+    Args:
+        worker_id (int): Index of the worker process. Unused, it is simply
+            the argument PyTorch passes to ``worker_init_fn``.
+
+    Returns:
+        None
+
+    Side effects:
+        Reseeds the global NumPy and ``random`` generators of the worker.
+    """
     np.random.seed(torch.initial_seed() % (2**32))
     random.seed(torch.initial_seed() % (2**32))
     
 
 def load_data_and_MMT_model(config, stoi, stoi_MF, single=True, mode="val"):
-    """Loads the dataset and Multimodal Transformer (MMT) model."""
+    """Load a trained MMT checkpoint and build a DataLoader over the data.
+
+    Args:
+        config (Namespace): Experiment configuration. ``config.checkpoint_path``
+            is forwarded to Lightning's ``load_from_checkpoint``,
+            ``config.batch_size`` is used when ``single=False``.
+        stoi (dict): Token-to-index vocabulary for SMILES.
+        stoi_MF (dict): Token-to-index vocabulary for molecular-formula tokens.
+        single (bool): ``True`` -> batch size 1 and ``drop_last=True`` (one
+            molecule per step, convenient for per-molecule analysis);
+            ``False`` -> ``config.batch_size`` with ``drop_last=False``.
+        mode (str): Split passed to ``MultimodalData`` ("val", "test", ...).
+
+    Returns:
+        tuple: ``(model, dataloader)``. ``model`` is the *inner*
+        ``MultimodalTransformer`` (``multi_gpu_model.model``), not the
+        Lightning wrapper; ``dataloader`` yields batches produced by
+        ``collate_fn``.
+
+    Side effects:
+        * Instantiates the Lightning wrapper and reads the checkpoint from disk.
+        * Moves the inner model to the hard-coded device ``"cuda"``, so this
+          fails on a CPU-only machine even when ``config.device == "cpu"``.
+    """
     # Initialize and load the multi-GPU model
     multi_gpu_model = TransformerMultiGPU(config)
     multi_gpu_model = multi_gpu_model.load_from_checkpoint(config.checkpoint_path, config=config)
@@ -86,13 +168,71 @@ def load_data_and_MMT_model(config, stoi, stoi_MF, single=True, mode="val"):
 
 
 def _generate_embeddings(model, src, mask, embedding_function):
-    """Helper function to generate embeddings."""
+    """Apply an embedding function only when the source tensor is present.
+
+    Small helper that keeps the "modality disabled" case explicit: when a
+    spectrum is not part of ``config.training_mode`` its ``src`` is ``None``
+    and the corresponding ``(None, None)`` placeholder is returned.
+
+    Args:
+        model (torch.nn.Module): Model that owns ``embedding_function``. Not
+            used directly, kept so the call sites read uniformly.
+        src (torch.Tensor | None): Raw source features.
+        mask (torch.Tensor | None): Padding mask belonging to ``src``.
+        embedding_function (Callable): Bound ``model._embed_*`` method.
+
+    Returns:
+        tuple: Whatever ``embedding_function(src, mask)`` returns -- normally
+        ``(embedding, padding_mask)`` -- or ``(None, None)`` when ``src`` is
+        ``None``.
+    """
     if src is not None:
         return embedding_function(src, mask)
     return None, None
 
 
 def run_model(model, data_dict, config):
+    """Run the MMT encoder stack on one collated batch (inference only).
+
+    Builds one embedding per modality enabled in ``config.training_mode``
+    ("1H", "13C", "HSQC", "COSY", "IR", "MF", "MS", "MW"), fills disabled
+    modalities with zero embeddings plus an all-"padding" mask, concatenates
+    everything along the sequence axis, lets ``encoder_cross`` mix the
+    modalities, mean-pools over the sequence axis and projects the pooled
+    vector into the fingerprint space.
+
+    Args:
+        model (MultimodalTransformer): Inner model returned by
+            ``load_data_and_MMT_model``.
+        data_dict (dict): One collated batch produced by ``collate_fn``. The
+            keys ``src_*`` / ``mask_*`` are read for every modality and
+            ``src_HSQC_`` / ``src_COSY_`` are always required.
+        config (Namespace): Configuration providing ``device`` and
+            ``training_mode``.
+
+    Returns:
+        tuple: ``(memory, src_padding_mask, trg_enc_SMI, fingerprint,
+        src_HSQC, src_COSY)``:
+            * ``memory``: cross-modal encoder output ``(seq, batch, d_model)``
+            * ``src_padding_mask``: concatenated mask ``(batch, seq)``
+            * ``trg_enc_SMI``: target token ids moved to the device
+            * ``fingerprint``: pooled embedding ``(batch, fp_dim)``
+            * ``src_HSQC`` / ``src_COSY``: raw 2D spectra for the HSQC/COSY
+              losses; when the modality is disabled the underscore-suffixed
+              key is returned instead so downstream code still gets a tensor.
+
+    Side effects:
+        Runs the decoder/encoder stack under ``torch.no_grad()`` and copies
+        all inputs to ``config.device``. Dropout is not switched off here,
+        which is a no-op in eval mode but not in train mode.
+
+    NOTE (known issue, left unchanged):
+        ``trg_MW`` is set to ``None`` whenever "MW" is absent from
+        ``config.training_mode``, yet ``trg_MW = trg_MW.unsqueeze(1)`` runs
+        unconditionally right after the ``with torch.no_grad()`` block. Any
+        configuration without "MW" therefore fails with
+        ``AttributeError: 'NoneType' object has no attribute 'unsqueeze'``.
+    """
     # Model preparation and data loading for GPU
     x = data_dict
     src_1H = x['src_1H'].to(config.device) if "1H" in config.training_mode else None
@@ -138,12 +278,16 @@ def run_model(model, data_dict, config):
 
         embedding_src_MW, src_padding_mask_MW = model._embed_MW(trg_MW) if "MW" in config.training_mode else (None, None)
 
+        # IR embeddings are returned without the leading sequence/batch axes,
+        # so they are re-inserted here to match the other modalities.
         if embedding_src_IR != None:
             embedding_src_IR, src_padding_mask_IR = embedding_src_IR.unsqueeze(0), src_padding_mask_IR.unsqueeze(-1)
 
         if embedding_src_MW != None:
             embedding_src_MW = embedding_src_MW.unsqueeze(0) 
 
+        # Fixed sequence sizes of the checkpoint; only used to zero-fill the
+        # modalities that are disabled for this training mode.
         feature_dim = 193 if "MS" in config.training_mode else 129
         feature_dim_IR = 130 if "MS" in config.training_mode else 66
 
@@ -250,6 +394,8 @@ def run_model(model, data_dict, config):
             embedding_src.append(embedding_src_IR)
             src_padding_mask.append(src_padding_mask_IR)  
 
+        # Modalities are stacked along the sequence axis, their masks along the
+        # feature axis; the cross-modal encoder then mixes all of them.
         memory = torch.cat(memory, dim=0) 
         #import IPython; IPython.embed();
         embedding_src = torch.cat(embedding_src, dim=0) 
@@ -259,6 +405,8 @@ def run_model(model, data_dict, config):
 
         fingerprint = model.fp1(average_memory)        
 
+        # When the HSQC/COSY encoder input was skipped, fall back to the raw
+        # spectra so downstream losses still receive a tensor.
         if src_HSQC==None:
             src_HSQC = src_HSQC_
         if src_COSY==None:
@@ -308,21 +456,42 @@ def run_model(model, data_dict, config):
 
 def predict_prop_correct_max_sequence(model, stoi, memory, src_padding_mask, trg_enc_SMI, gen_num, config):
     """
-    Predicts the properties of each token in a sequence generated by a transformer model.
+    Teacher-forced scoring of next-token probabilities.
 
-    Parameters:
-    model (torch.nn.Module): The transformer model used for prediction.
-    stoi (dict): Dictionary mapping tokens to indices.
-    memory (torch.Tensor): The memory tensor output from the transformer's encoder.
-    src_padding_mask (torch.Tensor): The source padding mask.
-    trg_enc_SMI (torch.Tensor): The target encoded Simplified Molecular Input Line Entry System (SMILES).
-    gen_num (int): Number of generations for multinomial sampling.
-    config (obj): Configuration object containing model and operation settings.
+    Starting from a single ``<SOS>`` the decoder is fed the *ground-truth*
+    prefix, and at every step the function records (a) the probability the
+    model assigns to the correct next token (``corr_token_prob``) and (b) the
+    probability of its own arg-max token (``max_token_prob``). A second loop
+    then performs multinomial sampling and keeps the run with the highest
+    average probability.
+
+    Args:
+        model (torch.nn.Module): Trained MMT decoder.
+        stoi (dict): Token-to-index vocabulary; must contain "<SOS>" and
+            "<EOS>".
+        memory (torch.Tensor): Encoder memory ``(seq, batch, d_model)``.
+        src_padding_mask (torch.Tensor): Memory padding mask.
+        trg_enc_SMI (torch.Tensor): Ground-truth token ids ``(seq, batch)``
+            with ``<SOS>`` at position 0.
+        gen_num (int): Requested number of multinomial runs (ignored, see the
+            note below).
+        config (Namespace): Provides ``device`` and ``temperature``.
 
     Returns:
-    tuple: Contains tensors for target sequence, correct token probabilities, 
-           maximum probability sequence, maximum token probabilities, 
-           and multinomial token probabilities.
+        tuple: ``(trg_tensor, corr_token_prob, trg_tensor_max, max_token_prob,
+        multinom_token_prob)``.
+
+    Side effects:
+        Calls ``model.eval()``, so the model is left in evaluation mode;
+        consumes the global torch RNG in the sampling loop.
+
+    NOTE (known issue, left unchanged):
+        * ``gen_num`` is overwritten with ``1`` immediately before the
+          sampling loop, so the argument has no effect.
+        * In that loop ``trg_tensor`` is advanced with the *ground-truth*
+          token (``real_trg[idx]``) instead of the token that was just
+          sampled, so ``multinom_token_prob`` describes the teacher-forced
+          prefix rather than the sampled sequence.
     """
 
     # Ensure the model is in evaluation mode
@@ -433,21 +602,27 @@ def predict_prop_correct_max_sequence(model, stoi, memory, src_padding_mask, trg
 
 def predict_prop_correct_max_sequence_2(model, stoi, memory, src_padding_mask, trg_enc_SMI, config):
     """
-    Predicts the properties of each token in a sequence generated by a transformer model.
+    Teacher-forced scoring of next-token probabilities (no sampling).
 
-    Parameters:
-    model (torch.nn.Module): The transformer model used for prediction.
-    stoi (dict): Dictionary mapping tokens to indices.
-    memory (torch.Tensor): The memory tensor output from the transformer's encoder.
-    src_padding_mask (torch.Tensor): The source padding mask.
-    trg_enc_SMI (torch.Tensor): The target encoded Simplified Molecular Input Line Entry System (SMILES).
-    gen_num (int): Number of generations for multinomial sampling.
-    config (obj): Configuration object containing model and operation settings.
+    Identical to ``predict_prop_correct_max_sequence`` but without the
+    multinomial branch: the decoder is fed the ground-truth prefix and the
+    function returns the probability of the correct token and of the arg-max
+    token at every step.
+
+    Args:
+        model (torch.nn.Module): Trained MMT decoder.
+        stoi (dict): Token-to-index vocabulary; must contain "<SOS>".
+        memory (torch.Tensor): Encoder memory ``(seq, batch, d_model)``.
+        src_padding_mask (torch.Tensor): Memory padding mask.
+        trg_enc_SMI (torch.Tensor): Ground-truth token ids ``(seq, batch)``.
+        config (Namespace): Provides ``device`` and ``temperature``.
 
     Returns:
-    tuple: Contains tensors for target sequence, correct token probabilities, 
-           maximum probability sequence, maximum token probabilities, 
-           and multinomial token probabilities.
+        tuple: ``(trg_tensor, corr_token_prob, trg_tensor_max,
+        max_token_prob)``.
+
+    Side effects:
+        Leaves the model in ``eval()`` mode.
     """
 
     # Ensure the model is in evaluation mode
@@ -510,16 +685,35 @@ def predict_prop_correct_max_sequence_2(model, stoi, memory, src_padding_mask, t
 
 def predict_performance_metric(trg_tensor, corr_token_prob, max_token_prob, multinom_token_prob, stoi):
     """
-    Calculates performance metrics for token predictions in sequences.
+    Aggregate per-token probabilities into six summary metrics.
 
-    Parameters:
-    trg_tensor (torch.Tensor): The target tensor containing sequences.
-    corr_token_prob (torch.Tensor): Probabilities of correct tokens.
-    max_token_prob (torch.Tensor): Probabilities of tokens with maximum likelihood.
-    multinom_token_prob (torch.Tensor): Probabilities of tokens chosen via multinomial sampling.
+    Walks the first token sequence until ``<EOS>`` and combines the
+    probabilities of the correct token, the arg-max token and the
+    multinomial-sampled token. ``*_multi`` is the product (joint probability
+    of the whole SMILES), ``*_avg`` the arithmetic mean.
+
+    Args:
+        trg_tensor (torch.Tensor): Token ids of the generated/reference
+            sequence; only row 0 of the batch is used.
+        corr_token_prob (torch.Tensor): Per-step probability of the correct
+            token.
+        max_token_prob (torch.Tensor): Per-step probability of the arg-max
+            token.
+        multinom_token_prob (torch.Tensor): Per-step probability of the
+            multinomial-sampled token.
+        stoi (dict): Vocabulary; ``stoi["<EOS>"]`` terminates the walk.
 
     Returns:
-    tuple: Contains two dictionaries - one with aggregated probabilities and another with sample-wise probabilities.
+        tuple[dict, dict]: ``(prop_dict, sample_dict)``. ``prop_dict`` holds
+        ``prob_corr_multi/avg``, ``prob_max_multi/avg`` and
+        ``prob_multinom_multi/avg``; ``sample_dict`` holds the three
+        per-token probability lists under ``sample_prob_list_*``.
+
+    NOTE (known issue, left unchanged):
+        ``trg_tensor[0]`` is always used, so for a batch with several
+        molecules only the first sequence contributes. The four tensors are
+        combined with ``zip``, which silently truncates to the shortest one if
+        their lengths differ.
     """
 
     # Initialize dictionaries for storing results
@@ -618,6 +812,33 @@ def calculate_corr_max_multinom_prob(model, stoi, val_dataloader, gen_num, confi
 
 '''
 def calculate_corr_max_multinom_prob(model, stoi, val_dataloader, gen_num, config):
+    """Aggregate teacher-forced token-probability statistics over the loader.
+
+    For every batch this runs ``run_model`` and
+    ``predict_prop_correct_max_sequence`` and collects the six summary
+    metrics of ``predict_performance_metric`` (correct / arg-max /
+    multinomial, each as product and mean). The per-molecule values are
+    returned as flat lists.
+
+    Args:
+        model (torch.nn.Module): Trained MMT.
+        stoi (dict): Token-to-index vocabulary.
+        val_dataloader (DataLoader): Validation batches.
+        gen_num (int): Forwarded to ``predict_prop_correct_max_sequence``,
+            where it is currently ignored (see that function's note).
+        config (Namespace): Model configuration.
+
+    Returns:
+        tuple[dict, dict]: ``(prob_dict_results, sample_dict)``.
+        ``prob_dict_results`` contains ``aggregated_corr_prob_multi``,
+        ``aggregated_corr_prob_avg``, ``aggregated_max_prob_multi``,
+        ``aggregated_max_prob_avg``, ``aggregated_multinom_prob_multi`` and
+        ``aggregated_multinom_prob_avg``; ``sample_dict`` is the one produced
+        by the last batch.
+
+    Side effects:
+        Iterates the dataloader with a tqdm bar and runs the model (GPU).
+    """
     
     prob_dict_results = {}
     aggregated_corr_prob_multi = []
@@ -654,6 +875,34 @@ def calculate_corr_max_multinom_prob(model, stoi, val_dataloader, gen_num, confi
 
 
 def calculate_corr_max_prob(model, stoi, val_dataloader, gen_num, config):
+    """Aggregate correct / arg-max token probabilities (no sampling) over a loader.
+
+    Same aggregation contract as ``calculate_corr_max_multinom_prob`` but
+    uses ``predict_prop_correct_max_sequence_2``, so no multinomial
+    probabilities are produced.
+
+    Args:
+        model (torch.nn.Module): Trained MMT.
+        stoi (dict): Token-to-index vocabulary.
+        val_dataloader (DataLoader): Validation batches.
+        gen_num (int): Accepted for API symmetry; not used by the scoring
+            function.
+        config (Namespace): Model configuration.
+
+    Returns:
+        tuple[dict, dict]: ``(prob_dict_results, sample_dict)`` with the same
+        six ``aggregated_*`` keys as the multinomial variant.
+
+    NOTE (known issue, left unchanged):
+        The call
+        ``predict_prop_correct_max_sequence_2(model, stoi, memory,
+        src_padding_mask, trg_enc_SMI, gen_num, config)`` passes seven
+        positional arguments to a function that accepts six, so this raises
+        ``TypeError`` before any batch is processed. Even if that were fixed,
+        ``multinom_token_prob`` is never defined in this function and is
+        passed to ``predict_performance_metric``, which would raise
+        ``NameError``.
+    """
     
     prob_dict_results = {}
     aggregated_corr_prob_multi = []
@@ -690,14 +939,28 @@ def calculate_corr_max_prob(model, stoi, val_dataloader, gen_num, config):
          
 def calculate_tanimoto_similarity(gen_conv_SMI_list, trg_conv_SMI_list):
     """
-    Calculates the Tanimoto similarity between generated and target SMILES strings.
+    Tanimoto similarity between generated and reference SMILES.
 
-    Parameters:
-    gen_conv_SMI_list (list): List of generated SMILES strings.
-    trg_conv_SMI_list (list): List of target SMILES strings.
+    Each generated SMILES is parsed and canonicalised with RDKit and then
+    compared to the target SMILES using a 512-bit Morgan fingerprint
+    (``hf.calculate_tanimoto_from_two_smiles``).
+
+    Args:
+        gen_conv_SMI_list (list[str]): Decoded SMILES strings.
+        trg_conv_SMI_list (list[str]): Reference SMILES, index-aligned with
+            ``gen_conv_SMI_list``.
 
     Returns:
-    tuple: Mean and standard deviation of Tanimoto similarities, failed pairs, and all Tanimoto scores.
+        tuple: ``(tanimoto_mean, tanimoto_std_dev, failed_pairs,
+        tanimoto_scores)``. Zeros are excluded when computing the mean and the
+        standard deviation; ``failed_pairs`` holds the ``(gen, trg)`` pairs
+        that could not be scored.
+
+    NOTE (known issue, left unchanged):
+        The bare ``except`` also hides programming bugs. Unparsable generated
+        SMILES are scored 0 and appended to ``failed_pairs``; because they are
+        removed before averaging, the reported mean and standard deviation
+        describe valid molecules only.
     """
     tanimoto_scores = []
     failed_pairs = []
@@ -712,6 +975,8 @@ def calculate_tanimoto_similarity(gen_conv_SMI_list, trg_conv_SMI_list):
             tanimoto_scores.append(0)
             failed_pairs.append((gen_smi, trg_smi))
 
+    # Invalid generated SMILES and genuine zero similarities both yield 0 and
+    # are excluded from the mean / standard deviation below.
     tanimoto_scores_cleaned = [i for i in tanimoto_scores if i!=0]
     tanimoto_mean = statistics.mean(tanimoto_scores_cleaned) if tanimoto_scores_cleaned else 0
     tanimoto_std_dev = statistics.stdev(tanimoto_scores_cleaned) if len(tanimoto_scores_cleaned) > 1 else 0
@@ -722,18 +987,37 @@ def calculate_tanimoto_similarity(gen_conv_SMI_list, trg_conv_SMI_list):
     
 def greedy_sequence(model, stoi, itos, memory, src_padding_mask, config):
     """
-    Generates a sequence of tokens using a greedy approach.
+    Arg-max ("greedy") decoding of one batch of encoder memories.
 
-    Parameters:
-    model (torch.nn.Module): The trained model for sequence generation.
-    stoi (dict): Mapping of tokens to indices.
-    itos (dict): Mapping of indices to tokens.
-    memory (Tensor): Memory tensor from the model.
-    src_padding_mask (Tensor): Source padding mask.
-    config (object): Configuration containing model parameters.
+    Seeds the decoder with ``<SOS>`` and repeatedly appends the
+    highest-probability token until ``config.max_len`` steps are done or every
+    sequence in the batch predicts token id ``0``.
+
+    Args:
+        model (torch.nn.Module): Trained decoder.
+        stoi (dict): Token-to-index vocabulary (uses "<SOS>").
+        itos (dict): Index-to-token vocabulary. Accepted for API symmetry, not
+            used here.
+        memory (torch.Tensor): Encoder memory ``(seq, batch, d_model)``.
+        src_padding_mask (torch.Tensor): Memory padding mask.
+        config (Namespace): Provides ``device``, ``max_len`` and
+            ``temperature`` (logits are divided by it before the softmax).
 
     Returns:
-    tuple: Tensor of generated tokens and their probabilities.
+        tuple: ``(greedy_tensor, greedy_token_prob)`` - generated token ids
+        ``(seq, batch)`` without the leading ``<SOS>`` and the per-token
+        probabilities.
+
+    Side effects:
+        Sets the model to ``eval()`` mode.
+
+    NOTE (known issue, left unchanged):
+        * Stopping is detected with ``(next_word == 0).all()``, i.e. token id
+          0 is assumed to be ``<EOS>``; ``stoi["<EOS>"]`` is never consulted.
+        * Both ``greedy_tensor`` and ``greedy_token_prob`` are sliced with
+          ``[1:]``. The token list loses ``<SOS>`` (correct), but the
+          probability list loses its first *generated* probability, so it is
+          one element shorter than the sequence it annotates.
     """
     model.eval()
     N = memory.size(1)
@@ -760,6 +1044,8 @@ def greedy_sequence(model, stoi, itos, memory, src_padding_mask, config):
             next_word = next_word.unsqueeze(0)
 
             greedy_tensor = torch.cat((greedy_tensor, next_word), dim=0)
+            # Token id 0 is the EOS/padding id of this vocabulary (see the
+            # NOTE in the docstring); stoi["<EOS>"] is not consulted.
             if (next_word == 0).all():
                 break
                 
@@ -778,14 +1064,23 @@ def greedy_sequence(model, stoi, itos, memory, src_padding_mask, config):
 
 def evaluate_greedy(model, stoi, itos, val_dataloader, config, randomize=False):
     """
-    Evaluates the greedy generation approach over a dataset.
+    Run greedy decoding over the whole validation loader and score it.
 
-    Parameters:
-    model (torch.nn.Module): The trained model for sequence generation.
-    stoi (dict), itos (dict): Mappings for tokens and indices.
-    val_dataloader (DataLoader): DataLoader for validation dataset.
-    config (object): Configuration containing model parameters.
-    randomize (bool): Whether to randomize the generated SMILES for comparison.
+    For every batch the encoder memory is computed, the molecules are decoded
+    greedily and converted to SMILES; the generated strings are then compared
+    with the reference SMILES (validity and Tanimoto similarity).
+
+    Args:
+        model (torch.nn.Module): Trained MMT.
+        stoi (dict), itos (dict): Token/index vocabularies.
+        val_dataloader (DataLoader): Iterable of collated batches.
+        config (Namespace): Model/generation settings used by ``run_model``
+            and ``greedy_sequence``.
+        randomize (bool): Shuffle the generated SMILES before scoring, which
+            yields the "random pairing" baseline.
+
+    Side effects:
+        Optionally shuffles ``gen_conv_SMI_list`` in place (global RNG).
 
     Returns:
     tuple: Metrics and results from greedy evaluation, structured in results_dict.
@@ -840,17 +1135,29 @@ def evaluate_greedy(model, stoi, itos, val_dataloader, config, randomize=False):
 
 def multinomial_sequence(model, stoi, memory, src_padding_mask, config):
     """
-    Generates a sequence using multinomial sampling from the model's predictions.
+    Sample one token per step with ``torch.multinomial``.
 
-    Parameters:
-    model (torch.nn.Module): The trained model.
-    stoi (dict): Mapping from string tokens to indices.
-    memory (torch.Tensor): The memory tensor from the model's encoder.
-    src_padding_mask (torch.Tensor): Source padding mask.
-    config (object): Configuration object with model and generation settings.
+    Args:
+        model (torch.nn.Module): Trained decoder.
+        stoi (dict): Token-to-index vocabulary (uses "<SOS>").
+        memory (torch.Tensor): Encoder memory ``(seq, batch, d_model)``.
+        src_padding_mask (torch.Tensor): Memory padding mask.
+        config (Namespace): Provides ``device``, ``max_len`` and
+            ``temperature``.
 
     Returns:
-    tuple: Tuple containing the generated tensor sequence and the token probabilities.
+        tuple: ``(multinom_tensor, multinom_token_prob)`` - sampled token ids
+        without the leading ``<SOS>`` and the probability of every sampled
+        token ``(seq, batch)``.
+
+    Side effects:
+        Consumes the global torch RNG, so repeated calls produce different
+        molecules unless the seed is reset; sets the model to ``eval()``.
+
+    NOTE (known issue, left unchanged):
+        Sampling always runs ``config.max_len`` steps and never stops at
+        ``<EOS>``, so the returned tensors contain the trailing ``<EOS>`` /
+        padding tokens together with their probabilities.
     """
     model.eval()
     batch_size = memory.size(1)
@@ -882,11 +1189,15 @@ def multinomial_sequence(model, stoi, memory, src_padding_mask, config):
 
 def find_best_amongst_all_runs(results_dict):
     """
-    Iterates over each molecule index across all runs to find the highest Tanimoto 
-    similarity score and the corresponding SMILES string for each molecule.
+    Pick, for every molecule, the run with the highest Tanimoto similarity.
 
-    Parameters:
-    results_dict (dict): Dictionary containing results from multiple runs.
+    The input has the shape ``results_dict[run][0][key]`` (a ``defaultdict``
+    filled by ``evaluate_multinomial``); every run holds the same molecules in
+    the same order, so runs can be compared index by index.
+
+    Args:
+        results_dict (dict): ``{run_index: [{gen_conv_SMI_list, tanimoto_sim,
+            token_probs_list, ...}]}``.
 
     Returns:
     dict: Dictionary with the highest Tanimoto similarity scores, selected SMILES strings, 
@@ -930,19 +1241,38 @@ def find_best_amongst_all_runs(results_dict):
 
 def evaluate_multinomial(model, stoi, itos, val_dataloader, config, runs, randomize=False):
     """
-    Evaluates the performance of multinomial sequence predictions over multiple runs.
+    Sample ``runs`` decodings per molecule and keep the best one.
 
-    Parameters:
-    model (Torch Model): The trained model for prediction.
-    stoi (dict): Dictionary mapping string to index.
-    itos (dict): Dictionary mapping index to string.
-    val_dataloader (DataLoader): Validation data loader.
-    config (object): Configuration object with model and evaluation settings.
-    runs (int): Number of runs for evaluation.
-    randomize (bool): If True, randomizes the order of generated SMILES.
+    For every run the whole validation set is decoded with
+    ``multinomial_sequence``; for each molecule index the run with the highest
+    Tanimoto score is kept (``find_best_amongst_all_runs``) and the aggregate
+    Tanimoto statistics are recomputed on those selected molecules.
+
+    Args:
+        model (torch.nn.Module): Trained MMT.
+        stoi (dict), itos (dict): Token/index vocabularies.
+        val_dataloader (DataLoader): Validation batches.
+        config (Namespace): Model/generation settings.
+        runs (int): Number of independent sampling runs.
+        randomize (bool): Shuffle generated SMILES together with their
+            probabilities before scoring (random-pairing baseline).
 
     Returns:
-    tuple: A tuple containing the new results dictionary and the src_HSQC list.
+        tuple: ``(new_results_dict, src_HSQC_list)``. ``new_results_dict``
+        contains ``highest_tanimoto_sim``, ``gen_conv_SMI_list``,
+        ``token_probs_list``, ``trg_conv_SMI_list``, ``tanimoto_sim``,
+        ``tanimoto_mean``, ``tanimoto_std_dev`` and ``failed``.
+
+    Side effects:
+        Consumes the global RNG (sampling and optional shuffling).
+
+    NOTE (known issue, left unchanged):
+        ``src_HSQC_list`` (and ``trg_conv_SMI_list``) are overwritten in every
+        run, so the returned spectra belong to the *last* run only, even when
+        the selected molecules come from an earlier run. With
+        ``randomize=True`` the shuffled generated SMILES no longer correspond
+        to the reference SMILES they are scored against, which is the intended
+        random baseline but makes ``highest_tanimoto_sim`` meaningless.
     """
     results_dict = defaultdict(list)
 
@@ -994,19 +1324,28 @@ def evaluate_multinomial(model, stoi, itos, val_dataloader, config, runs, random
 
 def beam_search_step(model, stoi, beam, memory, src_padding_mask, config, beam_size):
     """
-    Performs a single step of the beam search algorithm.
+    Expand the current beams by one token and keep the ``beam_size`` best.
 
-    Parameters:
-    model (Torch Model): The trained model for sequence prediction.
-    stoi (dict): Dictionary mapping string to index.
-    beam (list): List of tuples representing the current beams.
-    memory (Tensor): Encoded memory tensor from the model.
-    src_padding_mask (Tensor): Source padding mask.
-    config (object): Configuration object with model settings.
-    beam_size (int): The number of beams to keep.
+    Args:
+        model (torch.nn.Module): Trained decoder.
+        stoi (dict): Token-to-index vocabulary (uses "<EOS>").
+        beam (list): ``(cumulative_score, token_sequence, prob_sequence)``
+            tuples describing the current beams.
+        memory (torch.Tensor): Encoder memory for a *single* molecule.
+        src_padding_mask (torch.Tensor): Matching padding mask.
+        config (Namespace): Provides ``device`` and ``temperature``.
+        beam_size (int): Number of candidates kept per beam and number of
+            top tokens considered per expansion.
 
     Returns:
-    list: A list of updated beams for the next iteration.
+        list: Beams sorted by score (best first), truncated to ``beam_size``.
+
+    Note:
+        Beams whose last token is ``<EOS>`` are passed through unchanged
+        instead of being extended, and exact duplicates are suppressed via
+        ``seen_sequences``. ``probabilities`` (softmax over the whole output)
+        is computed but never used; the separately computed ``probs`` for the
+        last position is what feeds ``torch.topk``.
     """
     new_beam = []
     seen_sequences = set()  # A set to keep track of sequences that have already been extended
@@ -1055,18 +1394,31 @@ def beam_search_step(model, stoi, beam, memory, src_padding_mask, config, beam_s
 
 def beam_search(model, stoi, memory, src_padding_mask, config, beam_size):
     """
-    Performs beam search for sequence prediction using a trained model.
+    Beam search for a whole batch of encoder memories.
 
-    Parameters:
-    model (Torch Model): The trained model for sequence prediction.
-    stoi (dict): Dictionary mapping string to index.
-    memory (Tensor): Encoded memory tensor from the model.
-    src_padding_mask (Tensor): Source padding mask.
-    config (object): Configuration object with model settings.
-    beam_size (int): The number of beams to keep.
+    Runs ``config.gen_len`` expansion steps; in each step every molecule's
+    beams are expanded independently on its own slice of ``memory``.
+
+    Args:
+        model (torch.nn.Module): Trained decoder.
+        stoi (dict): Token-to-index vocabulary.
+        memory (torch.Tensor): Encoder memory ``(seq, batch, d_model)``.
+        src_padding_mask (torch.Tensor): Padding mask ``(batch, seq)`` or
+            ``None``.
+        config (Namespace): Provides ``device``, ``gen_len`` and
+            ``temperature``.
+        beam_size (int): Beams kept per molecule.
 
     Returns:
-    list: A list of final beam sequences after the search.
+        list: ``beams`` - for every batch element a list of
+        ``(score, token_sequence, prob_sequence)`` tuples, best first.
+
+    Side effects:
+        Sets the model to ``eval()`` mode.
+
+    Note:
+        ``beam_sequences`` and ``beam_scores`` are materialised at the end but
+        never used or returned (leftover from an earlier API).
     """
     model.eval()
     N = memory.size(1)
@@ -1210,13 +1562,18 @@ sgnn_means_stds = (train_y_mean_C, train_y_std_C, train_y_mean_H, train_y_std_H)
 
 def calculate_molecular_weights(smiles_list):
     """
-    Calculates molecular weights for a list of SMILES strings.
+    Exact molecular weight for every SMILES (``None`` when it is invalid).
 
-    Parameters:
-    smiles_list (list): List of SMILES strings.
+    Args:
+        smiles_list (list[str]): SMILES strings.
 
     Returns:
-    list: Molecular weights corresponding to each SMILES string. None for invalid SMILES.
+        list[float | None]: ``Chem.Descriptors.ExactMolWt`` per SMILES, with
+        ``None`` in the positions that could not be parsed.
+
+    Side effects:
+        Wrapped in a tqdm progress bar and prints one error line for every
+        SMILES that RDKit cannot parse; does not raise.
     """
     molecular_weights = []
 
@@ -1237,13 +1594,20 @@ def calculate_molecular_weights(smiles_list):
 
 def prepare_HSQC_data_from_src(src_HSQC_list):
     """
-    Processes and scales HSQC spectral data from the source list.
+    Flatten and rescale HSQC peak lists for the SGNN comparison.
 
-    Parameters:
-    src_HSQC_list (list): List containing HSQC spectral data.
+    ``src_HSQC_list`` is a list of batches (one per dataloader step), each
+    holding a tensor of ``(n_peaks, 2)`` 1H/13C ppm pairs per molecule. Rows
+    where both coordinates are zero (padding) are dropped and the remaining
+    1H / 13C values are multiplied by 10 and 200 respectively, matching the
+    normalisation used when the SGNN was trained.
+
+    Args:
+        src_HSQC_list (list): Nested list/tensor structure described above.
 
     Returns:
-    list: A list of processed HSQC tensors.
+        list[torch.Tensor]: One ``(n_peaks, 2)`` tensor per molecule and per
+        batch; a completely padded molecule yields ``torch.tensor([])``.
     """
     processed_HSQC = []
 
@@ -1265,12 +1629,22 @@ def prepare_HSQC_data_from_src(src_HSQC_list):
 
 def display_gen_and_trg_molecules(selected_best_SMI_list, trg_conv_SMI_list, show_number):
     """
-    Visualizes pairs of generated and target molecules along with their Tanimoto similarity.
+    Show up to ``show_number`` pairs of generated vs. reference molecules.
 
-    Parameters:
-    selected_best_SMI_list (list): List of SMILES strings for the selected best generated molecules.
-    trg_conv_SMI_list (list): List of SMILES strings for the target molecules.
-    show_number (int): Number of molecule pairs to display.
+    Each pair is rendered side by side in a 1x3 Matplotlib figure whose third
+    panel reports the Tanimoto similarity of the two Morgan fingerprints.
+
+    Args:
+        selected_best_SMI_list (list[str]): Generated (best-of-run) SMILES.
+        trg_conv_SMI_list (list[str]): Reference SMILES, index-aligned.
+        show_number (int): Maximum number of pairs to render.
+
+    Returns:
+        None
+
+    Side effects:
+        Creates one figure per pair, calls ``plt.show()`` and prints
+        ``An error occurred for index ...`` for pairs that cannot be drawn.
     """
     # Convert SMILES strings to RDKit Mol objects
     selected_best_mol_list = [Chem.MolFromSmiles(smiles) for smiles in selected_best_SMI_list]
@@ -1477,11 +1851,24 @@ def display_gen_and_trg_molecules(selected_best_SMI_list, trg_conv_SMI_list, sho
 
 def plot_val_tani_failed_hsqcErr(total_results):
     """
-    Plots bar charts for various evaluation metrics from the total_results.
+    Four bar charts, one per metric, comparing the six evaluation variants.
 
-    Parameters:
-    total_results (dict): Dictionary containing the results of different evaluation methods.
+    Args:
+        total_results (dict): Mapping from method name (for example
+            ``"greedy_randomized_False"``) to a 4-element list
+            ``[validity, tanimoto, failed_count, hsqc_error]``.
 
+    Returns:
+        None
+
+    Side effects:
+        Opens Matplotlib figures and calls ``plt.show()``.
+
+    NOTE (known issue, left unchanged):
+        ``data[key]`` raises ``KeyError`` as soon as one of the six hard-coded
+        method names is missing from ``total_results``; the caller's bare
+        ``except`` swallows that error. The "failed compounds" metric is
+        plotted as ``-log10(n + 1)``.
     """
     data = total_results
     keys_of_interest = ['greedy_randomized_False', 'greedy_randomized_True', 
@@ -1516,10 +1903,18 @@ def plot_val_tani_failed_hsqcErr(total_results):
 
 def plot_corr_max_multinom_stats(total_results):
     """
-    Plots bar charts for different statistical measures across correct, max, and multinomial methods.
+    Three bar charts for the correct / arg-max / multinomial probability metrics.
 
-    Parameters:
-    total_results (dict): Dictionary containing the results of different statistical methods.
+    Args:
+        total_results (dict): Must contain ``statistics_multiplication_avg``,
+            ``statistics_multiplication_sum`` and ``statistics_avg_avg``, each
+            a 3-element list ordered (correct, max, multinomial).
+
+    Returns:
+        None
+
+    Side effects:
+        Opens Matplotlib figures and calls ``plt.show()``.
     """
     data = total_results
 
@@ -1552,17 +1947,36 @@ def plot_corr_max_multinom_stats(total_results):
     
 def run_one_config(config, model, val_dataloader, stoi, itos):
     """
-    Executes a series of analysis steps for a given model configuration.
+    Full evaluation pipeline for one already-loaded model / configuration.
 
-    Parameters:
-    config (Config): Configuration object for the model.
-    model (Model): Trained model.
-    val_dataloader (DataLoader): Validation data loader.
-    stoi (dict): String-to-Index mapping.
-    itos (dict): Index-to-String mapping.
+    Steps: print the training mode and the parameter counts, compute the
+    teacher-forced probability statistics, run the generation analysis, attach
+    the probability statistics to ``total_results``, then plot the aggregated
+    metrics and display a few molecule pairs.
+
+    Args:
+        config (Namespace): Model configuration; ``config.training_mode`` is
+            printed.
+        model (torch.nn.Module): Loaded MMT.
+        val_dataloader (DataLoader): Validation batches.
+        stoi (dict), itos (dict): Token/index vocabularies.
 
     Returns:
-    tuple: Contains results of analysis, molecule data, sample probabilities, and probability dictionary.
+        tuple: ``(total_results, molecules, sample_prob_lists, sample_dict)``.
+
+    Side effects:
+        Prints diagnostics, opens Matplotlib figures and calls ``plt.show()``.
+
+    NOTE (known issue, left unchanged):
+        All three stages are wrapped in bare ``except`` blocks that only print
+        a message, so failures leave partially unbound names:
+        * ``run_full_analysis`` is commented out in this module, hence the
+          first call raises ``NameError`` and ``total_results`` becomes ``{}``;
+          the later plotting calls then fail as well.
+        * If the statistics block fails, ``final_prob_*`` is never bound and
+          the second ``try`` raises ``NameError``.
+        * If the second ``try`` fails, ``molecules`` is unbound when the third
+          ``try`` indexes it (``molecules[...]``).
     """
     print(config.training_mode)
     #model, val_dataloader = load_data_and_model(config, stoi, stoi_MF)

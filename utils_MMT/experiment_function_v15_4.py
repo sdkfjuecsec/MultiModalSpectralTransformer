@@ -1,5 +1,31 @@
 # Experimental Function
 
+"""Exploratory utility functions for the v15.4 Multimodal Transformer project.
+
+Sections (kept from the original notebook-style layout):
+
+5.1  SMILES sampling, Morgan fingerprinting and t-SNE / PCA / UMAP plots of
+     ZINC vs PubChem libraries.
+5.2  Vector-database creation from a trained MMT encoder (CSV or pickle),
+     loading it back, fingerprint helpers and KNN / cosine / dot-product /
+     radius-based similarity search, molecule grid plots and Tanimoto averages.
+5.3  Plotting helpers for t-SNE / PCA / UMAP comparisons of train vs test sets.
+5.4  Post-processing of experiment pickles: ranking molecules by simulated
+     HSQC / COSY error, de-duplication, molecular-formula filtering, top-k
+     accuracy, CSV export and train-vs-test embedding plots.
+5.5  Ranking utilities reshared with 5.4 plus CSV export helpers and histogram
+     plotting.
+
+The module is a scratchpad: some functions depend on module globals created at
+import time (``itos``/``stoi``/``stoi_MF``/``itos_MF`` from ``load_json_dics()``
+and ``rand_num``), and three names are defined twice
+(``perform_dimensionality_reduction``, ``generate_random_id``,
+``save_examples_as_csv``) so the later definition silently shadows the earlier
+one. Imports are repeated per section on purpose and are harmless.
+Nothing here trains a model: functions either read pickles/CSVs, compute
+similarities or draw plots.
+"""
+
 import pandas as pd
 import numpy as np
 from rdkit import Chem
@@ -17,6 +43,19 @@ from typing import List, Dict, Any, Union, Tuple
 ################################ 5.1 ###################################
 ########################################################################
 def load_data_smi_list(file_path, sample_size=None):
+    """Load SMILES from a CSV column and optionally subsample them.
+
+    Args:
+        file_path (str): CSV containing a ``'SMILES'`` column.
+        sample_size (int | None, optional): If set and smaller than the list,
+            draw an unseeded random subset without replacement. Defaults to None.
+
+    Returns:
+        list[str] | numpy.ndarray: The full list of SMILES, or the random subset.
+
+    Side effects:
+        Reads the CSV; consumes NumPy's global RNG when sampling.
+    """
     df = pd.read_csv(file_path)
     smiles_list = df['SMILES'].tolist()
     if sample_size and sample_size < len(smiles_list):
@@ -24,6 +63,19 @@ def load_data_smi_list(file_path, sample_size=None):
     return smiles_list
 
 def calculate_fingerprints(smiles_list):
+    """Morgan (radius 2, 1024-bit) fingerprints for every parseable SMILES.
+
+    Args:
+        smiles_list (list[str]): SMILES strings.
+
+    Returns:
+        numpy.ndarray: 2-D int array of shape (n_valid, 1024) built from the
+        fingerprint bit strings. Unparseable SMILES are skipped, so the rows do
+        not necessarily align with the input list.
+
+    Side effects:
+        Prints a tqdm progress bar.
+    """
     fingerprints = []
     for smiles in tqdm(smiles_list, desc="Calculating fingerprints"):
         mol = Chem.MolFromSmiles(smiles)
@@ -33,6 +85,21 @@ def calculate_fingerprints(smiles_list):
     return np.array([list(map(int, fp)) for fp in fingerprints])
 
 def perform_dimensionality_reduction(fingerprints):
+    """Project fingerprints to 2-D with t-SNE, PCA and UMAP.
+
+    Args:
+        fingerprints (numpy.ndarray): Feature matrix (n_samples, n_features).
+
+    Returns:
+        tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The three 2-D
+        embeddings, in t-SNE / PCA / UMAP order.
+
+    Side effects:
+        Prints progress messages. UMAP is instantiated without
+        ``n_components``, so it relies on the library default (2). This
+        definition is shadowed later by
+        ``perform_dimensionality_reduction(vectors)``.
+    """
     print("Performing t-SNE...")
     tsne = TSNE(n_components=2, random_state=42)
     tsne_result = tsne.fit_transform(fingerprints)
@@ -49,6 +116,29 @@ def perform_dimensionality_reduction(fingerprints):
 
 
 def plot_tsne_umap_pca(results, labels, title, methods, save_folder):
+    """Scatter the three embeddings side by side, colouring ZINC vs PubChem.
+
+    Args:
+        results (list[numpy.ndarray]): The 2-D embeddings to plot.
+        labels (numpy.ndarray): Per-point labels compared against ``'ZINC'`` /
+            ``'PubChem'``.
+        title (str): Figure suptitle; also used to build the file name.
+        methods (list[str]): Subplot titles (e.g. ``['t-SNE', 'PCA', 'UMAP']``).
+        save_folder (str): Output directory, created if missing.
+
+    Returns:
+        None
+
+    Side effects:
+        Writes/overwrites ``<title with underscores>.png`` in ``save_folder`` and
+        closes the figure.
+
+    NOTE (known issue, left unchanged):
+        ``labels`` is compared to the string with ``labels == 'ZINC'``. For a
+        plain Python list this yields a single ``False`` and the following
+        ``result[mask, 0]`` raises ``IndexError``/``TypeError``; only a NumPy
+        array of strings works.
+    """
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
     fig.suptitle(title, fontsize=16)
 
@@ -112,6 +202,17 @@ import utils_MMT.helper_functions_pl_v15_4 as hf
 
 
 def load_json_dics():
+    """Read the four token maps from JSON files in the current directory.
+
+    Returns:
+        tuple[dict, dict, dict, dict]: ``(itos, stoi, stoi_MF, itos_MF)``.
+
+    Side effects:
+        Opens ``./itos.json``, ``./stoi.json``, ``./stoi_MF.json`` and
+        ``./itos_MF.json``. The results are bound to module globals at import
+        time, so importing this module raises ``FileNotFoundError`` unless those
+        files exist in the working directory.
+    """
     with open('./itos.json', 'r') as f:
         itos = json.load(f)
     with open('./stoi.json', 'r') as f:
@@ -127,6 +228,25 @@ rand_num = str(random.randint(1, 10000000))
 
 
 def vectorize_db(config, stoi, stoi_MF, type_data, mode):
+    """Encode a whole dataset into a SMILES + fingerprint CSV "vector database".
+
+    Args:
+        config: Experiment namespace with ``vector_db`` (output path) and the
+            dataset fields consumed by ``vgmmt.load_data_and_MMT_model``.
+        stoi (dict): SMILES token-to-index map.
+        stoi_MF (dict): Molecular-formula token map.
+        type_data (str): ``"db"`` writes the path back to ``config.vector_db``;
+            ``"unknown"`` writes it to ``config.secret_csv_SMI_vectors``.
+        mode (str): Dataset split passed to the loader (e.g. ``"val"``).
+
+    Returns:
+        config: The mutated namespace.
+
+    Side effects:
+        Loads the MMT checkpoint, runs inference over the full loader, writes the
+        CSV and mutates ``config``. Fingerprints are exported as plain lists, not
+        as tensors, so the CSV stays human-readable.
+    """
     path = config.vector_db
     model_MMT, dataloader = vgmmt.load_data_and_MMT_model(config, stoi, stoi_MF, single=False, mode=mode)
     len(dataloader)
@@ -170,6 +290,22 @@ def vectorize_db(config, stoi, stoi_MF, type_data, mode):
 
 # Load Vector database
 def load_vector_db(path, number):
+    """Load the CSV vector database into a tensor plus SMILES list.
+
+    Args:
+        path (str): CSV written by :func:`vectorize_db` (``SMILES`` and
+            ``Fingerprints`` columns).
+        number (int): Number of leading rows to keep.
+
+    Returns:
+        tuple[torch.Tensor, numpy.ndarray, list[str]]: Fingerprint tensor of
+        shape (number, 1024), its NumPy copy (``database_vectors``) and the
+        SMILES strings.
+
+    Side effects:
+        Prints progress; parses the stringified fingerprint lists with
+        ``ast.literal_eval``.
+    """
 
     # Load the DataFrame from CSV
     print("Load Vector Database")
@@ -201,6 +337,24 @@ def load_vector_db(path, number):
     return fp_tensor, database_vectors, smi_list
 
 def vectorize_db_pkl(config, stoi, stoi_MF, type_data, mode):
+    """Like :func:`vectorize_db`, but stores the frame as a pickle of tensors.
+
+    Args:
+        config: Experiment namespace; ``config.vector_db`` is the output path.
+        stoi (dict): SMILES token-to-index map.
+        stoi_MF (dict): Molecular-formula token map.
+        type_data (str): ``"db"`` -> ``config.vector_db``; ``"unknown"`` ->
+            ``config.secret_pkl_SMI_vectors``.
+        mode (str): Dataset split passed to the loader.
+
+    Returns:
+        config: The mutated namespace.
+
+    Side effects:
+        Loads the MMT checkpoint, runs full-loader inference, writes the pickle
+        and mutates ``config``. ``pickle`` is imported later in the file but all
+        module-level imports run before any call, so this is safe.
+    """
     path = config.vector_db
     model_MMT, dataloader = vgmmt.load_data_and_MMT_model(config, stoi, stoi_MF, single=False, mode=mode)
     len(dataloader)
@@ -240,6 +394,23 @@ def vectorize_db_pkl(config, stoi, stoi_MF, type_data, mode):
 
 
 def load_vector_db_pkl(pickle_file, number):
+    """Load a pickled vector database and draw a random sample of rows.
+
+    Args:
+        pickle_file (str): Pickle written by :func:`vectorize_db_pkl`.
+        number (int): Exact sample size handed to ``DataFrame.sample``.
+
+    Returns:
+        tuple[torch.Tensor, list[str]]: Stacked fingerprint tensor and SMILES.
+
+    Side effects:
+        Reads the pickle and prints the load time; the subset is deterministic
+        because ``sample`` uses ``random_state=42``.
+
+    NOTE (known issue, left unchanged):
+        ``DataFrame.sample(n=number)`` raises ``ValueError`` when ``number``
+        exceeds the number of stored rows; there is no clamping.
+    """
     start_time_pickle = time.time()
     
     with open(pickle_file, 'rb') as f:
@@ -260,6 +431,17 @@ def load_vector_db_pkl(pickle_file, number):
     return fp_tensor, smi_list
 
 def plot_smis_in_rows(similar_compounds_smiles):
+    """Draw a grid of molecule images, five per row.
+
+    Args:
+        similar_compounds_smiles (list[str]): SMILES strings to render.
+
+    Returns:
+        None
+
+    Side effects:
+        Opens a blocking matplotlib window.
+    """
     # Convert SMILES to RDKit molecule objects
     molecules = [Chem.MolFromSmiles(smile) for smile in similar_compounds_smiles]
 
@@ -281,6 +463,15 @@ def plot_smis_in_rows(similar_compounds_smiles):
     plt.show()
 
 def get_fingerprint_vector(smiles):
+    """1024-bit Morgan fingerprint of a single SMILES string.
+
+    Args:
+        smiles (str): SMILES string.
+
+    Returns:
+        rdkit.DataStructs.ExplicitBitVect | None: The fingerprint, or ``None``
+        when RDKit cannot parse the input.
+    """
     mol = Chem.MolFromSmiles(smiles)
     if mol:
         return AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024)
@@ -289,6 +480,22 @@ def get_fingerprint_vector(smiles):
 from rdkit import DataStructs
 
 def numpy_to_bitvect(fp_numpy):
+    """Convert a 0/1 NumPy array into an RDKit ``ExplicitBitVect``.
+
+    Args:
+        fp_numpy (numpy.ndarray | list): Binary fingerprint values; bit ``i`` is
+            set when the value is truthy.
+
+    Returns:
+        rdkit.DataStructs.ExplicitBitVect: Bit vector of the same length.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged):
+        This relies on ``ExplicitBitVect.SetBit``; RDKit builds that expose
+        bit vectors as immutable raise ``AttributeError`` here.
+    """
     bitvect = DataStructs.ExplicitBitVect(len(fp_numpy))
     for i, bit in enumerate(fp_numpy):
         if bit:
@@ -297,6 +504,25 @@ def numpy_to_bitvect(fp_numpy):
 
 # Function to find KNN
 def find_knn(database_vectors, smi_list, new_compound_vector, neighbors, extra_num):
+    """Exact k-nearest-neighbour retrieval of a query plus random negatives.
+
+    Args:
+        database_vectors (list | numpy.ndarray): Reference vectors.
+        smi_list (list[str]): SMILES aligned with ``database_vectors``.
+        new_compound_vector (numpy.ndarray): Query vector.
+        neighbors (int): Number of nearest neighbours to return.
+        extra_num (int): Number of random non-neighbours returned as negatives.
+
+    Returns:
+        tuple[list[str], list, list[str], list, numpy.ndarray]: Neighbour
+        SMILES, neighbour vectors, random other SMILES, their vectors and the
+        neighbour distances.
+
+    Side effects:
+        Fits a ``ball_tree`` ``NearestNeighbors`` model and consumes the global
+        ``random`` state when picking negatives; the negatives are sampled by
+        index and may collide with a true neighbour.
+    """
     nn_model = NearestNeighbors(n_neighbors=neighbors, algorithm='ball_tree')
     nn_model.fit(np.array(list(database_vectors)))
 
@@ -317,6 +543,24 @@ def find_knn(database_vectors, smi_list, new_compound_vector, neighbors, extra_n
 
 
 def find_cos_sim_incremental(database_vectors, smi_list, new_compound_vector, k, batch_size=10000):
+    """Cosine similarity of every database vector against one query, in batches.
+
+    Args:
+        database_vectors (list | numpy.ndarray): Reference vectors.
+        smi_list (list[str]): SMILES aligned with the reference vectors.
+        new_compound_vector (numpy.ndarray): Query vector.
+        k (int): Number of best matches to return.
+        batch_size (int, optional): Chunk size of the distance loop. Defaults to
+            10000.
+
+    Returns:
+        tuple[list[str], numpy.ndarray, numpy.ndarray, numpy.ndarray]: Top-k
+        SMILES, their vectors, their similarities and the full similarity array
+        indexed like the database.
+
+    Side effects:
+        Allocates one float per database entry (full scan, no index).
+    """
     # Ensure inputs are NumPy arrays
     database_vectors = np.asarray(database_vectors)
     new_compound_vector = np.asarray(new_compound_vector).reshape(1, -1)  # Ensure it's 2D
@@ -342,6 +586,22 @@ def find_cos_sim_incremental(database_vectors, smi_list, new_compound_vector, k,
 
 # Similarly, update find_knn_incremental and find_dot_product_incremental
 def find_knn_incremental(database_vectors, smi_list, new_compound_vector, k, extra_num, batch_size=10000):
+    """Euclidean k-NN over the whole database, processed in batches.
+
+    Args:
+        database_vectors (list | numpy.ndarray): Reference vectors.
+        smi_list (list[str]): SMILES aligned with the reference vectors.
+        new_compound_vector (numpy.ndarray): Query vector.
+        k (int): Number of nearest neighbours to return.
+        extra_num (int): Unused; kept for signature parity with :func:`find_knn`.
+        batch_size (int, optional): Chunk size of the distance loop. Defaults to
+            10000.
+
+    Returns:
+        tuple: ``(similar_smiles, similar_vectors, None, None, distances)``; the
+        two ``None`` slots mirror the random-negative outputs of
+        :func:`find_knn`.
+    """
     database_vectors = np.asarray(database_vectors)
     new_compound_vector = np.asarray(new_compound_vector).reshape(1, -1)
 
@@ -362,6 +622,19 @@ def find_knn_incremental(database_vectors, smi_list, new_compound_vector, k, ext
     return similar_compounds_smiles, similar_compounds_vectors, None, None, euc_distances
 
 def find_dot_product_incremental(database_vectors, smi_list, new_compound_vector, k, batch_size=10000):
+    """Dot-product ranking of all database vectors against one query, in batches.
+
+    Args:
+        database_vectors (list | numpy.ndarray): Reference vectors.
+        smi_list (list[str]): SMILES aligned with the reference vectors.
+        new_compound_vector (numpy.ndarray): Query vector.
+        k (int): Number of top-scoring matches to return.
+        batch_size (int, optional): Chunk size of the scan. Defaults to 10000.
+
+    Returns:
+        tuple[list[str], numpy.ndarray, numpy.ndarray]: Top-k SMILES, their
+        vectors and their dot products.
+    """
     database_vectors = np.asarray(database_vectors)
     new_compound_vector = np.asarray(new_compound_vector).reshape(1, -1)
 
@@ -384,6 +657,17 @@ def find_dot_product_incremental(database_vectors, smi_list, new_compound_vector
     
 # Function to get Morgan fingerprint vector
 def get_Mfingerprint(smiles):
+    """Morgan fingerprint (radius 2, 1024 bits) as a plain NumPy array.
+
+    Args:
+        smiles (str): SMILES string.
+
+    Returns:
+        numpy.ndarray | None: 1024-element array, or ``None`` if unparseable.
+
+    Side effects:
+        None.
+    """
     mol = Chem.MolFromSmiles(smiles)
     if mol:
         return np.array(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024))
@@ -392,10 +676,36 @@ def get_Mfingerprint(smiles):
 
 # Function to calculate Euclidean distance
 def euclidean_distance(vector1, vector2):
+    """L2 distance between two vectors.
+
+    Args:
+        vector1, vector2 (array-like): Vectors of equal length.
+
+    Returns:
+        float: ``numpy.linalg.norm(vector1 - vector2)``.
+    """
     return np.linalg.norm(vector1 - vector2)
 
 
 def find_optimal_radius(database_vectors, new_compound_vector, target_neighbors=30, tolerance=5, max_iterations=100):
+    """Search for a neighbourhood radius producing ``target_neighbors`` matches.
+
+    Args:
+        database_vectors (numpy.ndarray): Reference vectors used to build the
+            radius model.
+        new_compound_vector (numpy.ndarray): Query vector.
+        target_neighbors (int, optional): Desired neighbour count. Defaults to 30.
+        tolerance (int, optional): Accepted deviation from the target. Defaults
+            to 5.
+        max_iterations (int, optional): Iteration cap. Defaults to 100.
+
+    Returns:
+        float: The last radius tried, even if the target was never reached.
+
+    Side effects:
+        Fits one ``RadiusNeighborsRegressor`` per iteration (the estimator is
+        used only to obtain neighbour indices, which makes the search slow).
+    """
     radius = 1.0  # Initial radius guess
     step_size = 0.5  # Initial step size for adjusting the radius
 
@@ -422,6 +732,23 @@ def find_optimal_radius(database_vectors, new_compound_vector, target_neighbors=
     return radius
 
 def find_neighbors_within_threshold(database_vectors, smi_list, new_compound_vector, radius, extra_num):
+    """Return every database entry within ``radius`` plus ``extra_num`` others.
+
+    Args:
+        database_vectors (numpy.ndarray): Reference vectors (2-D).
+        smi_list (list[str]): SMILES aligned with ``database_vectors``.
+        new_compound_vector (numpy.ndarray): Query vector.
+        radius (float): Neighbourhood radius.
+        extra_num (int): How many non-neighbour SMILES/vectors to return.
+
+    Returns:
+        tuple[list[str], list, list[str], list]: Neighbour SMILES, neighbour
+        vectors, other SMILES and their vectors.
+
+    Side effects:
+        None; ``extra_num`` non-neighbours are taken from the start of the
+        database, so the "negative" set is deterministic and not random.
+    """
     
     # Using RadiusNeighbors from scikit-learn
     nn_model = NearestNeighbors(radius=radius, algorithm='ball_tree')
@@ -446,6 +773,19 @@ def find_neighbors_within_threshold(database_vectors, smi_list, new_compound_vec
 
 # Plotting function
 def plot_smiles(smiles_list, per_row=5):
+    """Draw a molecule grid with ``per_row`` molecules per row.
+
+    Args:
+        smiles_list (list[str]): SMILES strings to render.
+        per_row (int, optional): Column count. Defaults to 5.
+
+    Returns:
+        None
+
+    Side effects:
+        Opens a blocking matplotlib window; unparseable SMILES leave an empty
+        subplot in place.
+    """
     mols = [Chem.MolFromSmiles(smile) for smile in smiles_list]
     rows = len(smiles_list) // per_row + int(len(smiles_list) % per_row != 0)
     
@@ -465,6 +805,23 @@ def plot_smiles(smiles_list, per_row=5):
 
 
 def calculate_average_tanimoto(smiles_list, target_smiles):
+    """Average Tanimoto similarity of a SMILES list against one target.
+
+    Args:
+        smiles_list (list[str]): Generated SMILES strings.
+        target_smiles (str): Ground-truth SMILES.
+
+    Returns:
+        tuple[float, list[float]]: Mean similarity (unparseable molecules count
+        as 0) and the per-molecule scores.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged):
+        The target fingerprint is built without a ``None`` guard, so an
+        unparseable ``target_smiles`` raises before any score is computed.
+    """
     # Convert target SMILES to molecule and then to fingerprint
     target_mol = Chem.MolFromSmiles(target_smiles)
     target_fp = AllChem.GetMorganFingerprintAsBitVect(target_mol, 2)  # Using bit vector fingerprints
@@ -490,6 +847,17 @@ def calculate_average_tanimoto(smiles_list, target_smiles):
 
 
 def plot_hist_of_results_greedy_new(results_dict):
+    """Histogram of the Tanimoto scores stored in a greedy results dictionary.
+
+    Args:
+        results_dict (dict): Must carry a ``'tanimoto_sim'`` list.
+
+    Returns:
+        float: Mean Tanimoto score (0 for an empty list).
+
+    Side effects:
+        Opens a blocking matplotlib window.
+    """
     # Extract the Tanimoto similarities
     tani_list = results_dict.get('tanimoto_sim', [])
 
@@ -511,6 +879,22 @@ def plot_hist_of_results_greedy_new(results_dict):
 
 
 def load_pickle_data(file_path, sample_size=None):
+    """Load fingerprints/SMILES from a pickled DataFrame or from a dict.
+
+    Args:
+        file_path (str): Pickle path.
+        sample_size (int | None, optional): Subsample the DataFrame when set.
+            Defaults to None.
+
+    Returns:
+        tuple[numpy.ndarray, list[str]]: Vectors and SMILES. The DataFrame branch
+        reads the ``Fingerprints``/``SMILES`` columns; the dict branch treats the
+        keys as SMILES and the values as tensors.
+
+    Side effects:
+        Reads the pickle; ``DataFrame.sample(random_state=42)`` makes the
+        subsample deterministic.
+    """
     with open(file_path, 'rb') as f:
         df = pickle.load(f)
     
@@ -528,6 +912,27 @@ def load_pickle_data(file_path, sample_size=None):
 
 
 def plot_tsne_umap_pca_train_test(results, labels, title, methods, save_folder):
+    """ZINC-vs-test embedding plot with large fonts, written to disk.
+
+    Args:
+        results (list[numpy.ndarray]): Three 2-D embeddings.
+        labels (list[str]): Per-point class labels; only two classes receive a
+            colour/alpha entry.
+        title (str): Figure title, also used as the file stem.
+        methods (list[str]): Subplot titles.
+        save_folder (str): Output folder, which must already exist.
+
+    Returns:
+        None
+
+    Side effects:
+        Writes ``<title>.png``, closes the figure and changes the global
+        matplotlib ``rcParams`` font size to 22.
+
+    NOTE (known issue, left unchanged):
+        ``save_folder`` is never created, so a missing directory makes
+        ``plt.savefig`` fail (or, on the Agg backend, silently skip the write).
+    """
     plt.rcParams.update({'font.size': 22})  # Set base font size
     fig, axes = plt.subplots(1, 3, figsize=(20, 8))
     fig.suptitle(title, fontsize=22)
@@ -554,6 +959,22 @@ def plot_tsne_umap_pca_train_test(results, labels, title, methods, save_folder):
 
 
 def plot_tsne_umap_pca_train_test_folder(results, labels, title, methods, save_folder):
+    """Same as :func:`plot_tsne_umap_pca_train_test`, but creates the folder.
+
+    Args:
+        results (list[numpy.ndarray]): Three 2-D embeddings.
+        labels (list[str]): Per-point labels; classes beyond the fourth are
+            silently left without a colour.
+        title (str): Figure title, also used as the file stem.
+        methods (list[str]): Subplot titles.
+        save_folder (str): Output folder, created with ``os.makedirs``.
+
+    Returns:
+        None
+
+    Side effects:
+        Writes the PNG, closes the figure and prints the path.
+    """
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
     fig.suptitle(title, fontsize=16)
     colors = ['blue', 'red', 'green', 'orange']
@@ -603,12 +1024,37 @@ import random
 import string
 
 def load_data_results(file_path):
+    """Extract ``results_dict_bl_ZINC`` from an experiment pickle.
+
+    Args:
+        file_path (str): Pickle path.
+
+    Returns:
+        dict: The nested results mapping.
+
+    Side effects:
+        Reads the pickle; raises ``KeyError`` when the expected key is absent.
+    """
     with open(file_path, 'rb') as f:
         data = pickle.load(f)
     return data["results_dict_bl_ZINC"]
 
 
 def process_pkl_files_baseline(folder_path, ranking_method):
+    """Rank every ``*.pkl`` in a folder and group the rows by target SMILES.
+
+    Args:
+        folder_path (str): Folder containing experiment pickles.
+        ranking_method (str): ``'HSQC & COSY'``, ``'HSQC'`` or ``'COSY'``.
+
+    Returns:
+        dict[str, list]: Target SMILES -> concatenated ranking rows.
+
+    Side effects:
+        Reads all pickles and prints the file name of every one that fails
+        (bare ``except`` then ``continue``), so malformed pickles are silently
+        skipped.
+    """
     pkl_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
                  if f.endswith('.pkl')]
     #print(f"Processing {len(pkl_files)} files in {folder_path}")
@@ -634,6 +1080,24 @@ def process_pkl_files_baseline(folder_path, ranking_method):
 
 
 def analyze_molecules_by_sim_rank(all_rankings):
+    """Split targets into "top hit is exact" vs "not exact" buckets.
+
+    Args:
+        all_rankings (dict[str, list]): Output of :func:`rank_molecules_in_file`.
+
+    Returns:
+        tuple[int, list[str], list[str]]: Number of targets whose first ranked
+        molecule has Tanimoto 1.0, the SMILES of those molecules, and the SMILES
+        of the remaining targets' first molecules.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged):
+        The unconditional ``break`` at the end of the inner loop means only the
+        first ranked row of each target is inspected; any later perfect match is
+        ignored.
+    """
     count_rank_one = 0
     smiles_rank_one = []
     smiles_not_rank_one = []
@@ -651,6 +1115,20 @@ def analyze_molecules_by_sim_rank(all_rankings):
     return count_rank_one, smiles_rank_one, smiles_not_rank_one
 
 def perform_dimensionality_reduction(vectors):
+    """Project vectors to 2-D with t-SNE, PCA and UMAP (random state 42).
+
+    Args:
+        vectors (numpy.ndarray): Feature matrix (n_samples, n_features).
+
+    Returns:
+        tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: t-SNE, PCA and UMAP
+        embeddings.
+
+    Side effects:
+        None. This definition overrides the earlier
+        ``perform_dimensionality_reduction(fingerprints)`` because it is bound
+        later in the module.
+    """
     tsne = TSNE(n_components=2, random_state=42)
     pca = PCA(n_components=2, random_state=42)
     umap_reducer = umap.UMAP(n_components=2, random_state=42)
@@ -662,6 +1140,22 @@ def perform_dimensionality_reduction(vectors):
     return tsne_result, pca_result, umap_result
 
 def plot_results(results, labels, title, methods, output_folder):
+    """Three-panel embedding plot with up to three coloured classes, saved to disk.
+
+    Args:
+        results (list[numpy.ndarray]): Three 2-D embeddings.
+        labels (list[str]): Per-point class labels; a fourth class silently
+            receives no colour.
+        title (str): Title, also used as the file stem.
+        methods (list[str]): Subplot titles.
+        output_folder (str): Output folder, which must already exist.
+
+    Returns:
+        None
+
+    Side effects:
+        Writes the PNG, closes the figure and prints the path.
+    """
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
     fig.suptitle(title, fontsize=16)
 
@@ -686,11 +1180,31 @@ def plot_results(results, labels, title, methods, output_folder):
 
 
 def generate_random_id(length=10):
-    """Generate a random alphanumeric ID."""
+    """Generate a random uppercase-alphanumeric identifier.
+
+    Args:
+        length (int, optional): Character count. Defaults to 10.
+
+    Returns:
+        str: Random ID drawn from the global ``random`` state.
+    """
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 def save_examples_as_csv(smiles_list, output_path, prefix):
-    """Save SMILES as CSV with random sample IDs."""
+    """Write a SMILES list to CSV with generated sample ids.
+
+    Args:
+        smiles_list (list[str]): SMILES to export.
+        output_path (str): Destination CSV.
+        prefix (str): Prefix for every generated ``sample_id``.
+
+    Returns:
+        None
+
+    Side effects:
+        Writes/overwrites ``output_path``, prints the row count and consumes the
+        global ``random`` state.
+    """
     data = {
         'sample_id': [f"{prefix}_{generate_random_id()}" for _ in smiles_list],
         'SMILES': smiles_list
@@ -700,6 +1214,27 @@ def save_examples_as_csv(smiles_list, output_path, prefix):
     print(f"Saved {len(smiles_list)} examples to {output_path}")
     
 def process_dataset(data_config, train_vectors, train_smiles, output_folder, ranking_method):
+    """Rank pickles, filter them and plot train-vs-test embeddings.
+
+    Args:
+        data_config (dict): Keys ``weight_range``, ``pkl_folder``, ``file_path``.
+        train_vectors (numpy.ndarray): Reference (ZINC) embeddings.
+        train_smiles (list[str]): Accepted but unused.
+        output_folder (str): Destination folder for the plot.
+        ranking_method (str): HSQC/COSY ranking mode.
+
+    Returns:
+        None
+
+    Side effects:
+        Reads pickles, computes t-SNE/PCA/UMAP and writes one PNG.
+
+    NOTE (known issue, left unchanged):
+        Positive/negative vectors come from ``np.stack`` over possibly empty
+        frames, so when no molecule is a perfect hit for that weight range the
+        call raises ``ValueError`` and no plot is produced. ``vectors`` from
+        ``load_pickle_data_df`` is also unused.
+    """
     weight_range = data_config['weight_range']
     pkl_folder = data_config['pkl_folder']
     file_path = data_config['file_path']
@@ -731,6 +1266,24 @@ def process_dataset(data_config, train_vectors, train_smiles, output_folder, ran
                  output_folder)
 
 def process_dataset_(data_config, train_vectors, train_smiles, output_folder, ranking_method):
+    """Same pipeline as :func:`process_dataset`, but filters by SMILES index.
+
+    Args:
+        data_config (dict): Keys ``weight_range``, ``pkl_folder``, ``file_path``.
+        train_vectors (numpy.ndarray): Reference (ZINC) embeddings.
+        train_smiles (list[str]): Accepted but unused.
+        output_folder (str): Destination folder for the plot.
+        ranking_method (str): HSQC/COSY ranking mode.
+
+    Returns:
+        None
+
+    Side effects:
+        Reads pickles, computes the embeddings and writes one PNG. Unlike
+        :func:`process_dataset` the vector lookup goes through
+        :func:`filter_vectors_by_smiles`, so missing SMILES do not crash the
+        stack operation.
+    """
     weight_range = data_config['weight_range']
     pkl_folder = data_config['pkl_folder']
     file_path = data_config['file_path']
@@ -766,6 +1319,10 @@ def process_dataset_(data_config, train_vectors, train_smiles, output_folder, ra
 def filter_vectors_by_smiles(vectors, smiles_list, smiles_positive, smiles_negative):
     """
     Filter vectors by finding the indices of SMILES in the original lists.
+
+    Matching is exact string equality on the raw SMILES, so canonicalisation
+    differences prevent a molecule from being found; SMILES that are present in
+    neither target set are ignored and appear in neither output.
     
     Args:
         vectors: numpy array of vectors
@@ -805,6 +1362,20 @@ def filter_vectors_by_smiles(vectors, smiles_list, smiles_positive, smiles_negat
 def filter_vectors_by_smiles_verbose(vectors, smiles_list, smiles_positive, smiles_negative):
     """
     Filter vectors by finding the indices of SMILES in the original lists with verbose logging.
+
+    Args:
+        vectors (numpy.ndarray): Feature matrix (n_samples, n_features).
+        smiles_list (list[str]): SMILES aligned with ``vectors``.
+        smiles_positive (list[str]): SMILES that belong to the positive set.
+        smiles_negative (list[str]): SMILES that belong to the negative set.
+
+    Returns:
+        tuple[numpy.ndarray, numpy.ndarray]: Positive and negative vectors; an
+        empty ``(0, n_features)`` array is returned when nothing matched.
+
+    Side effects:
+        Prints totals plus the number (and first five examples) of SMILES that
+        could not be located.
     """
     # Convert to sets for faster lookup
     smiles_positive_set = set(smiles_positive)
@@ -852,6 +1423,28 @@ def filter_vectors_by_smiles_verbose(vectors, smiles_list, smiles_positive, smil
     
 
 def rank_molecules_in_file(file_data, ranking_method):
+    """Rank every target's generated molecules by simulated HSQC/COSY error.
+
+    Args:
+        file_data (dict): ``{target SMILES: [[[gen, ..., tanimoto,
+            [err1, err2]], ...]]}`` as stored in the experiment pickles.
+        ranking_method (str): ``'HSQC & COSY'`` (mean of the two error ranks),
+            ``'HSQC'`` or ``'COSY'``.
+
+    Returns:
+        list[tuple]: Rows ``(trg_smi, gen_smi, tanimoto, rank, error1, error2)``
+        sorted best-first, or ``[]`` when no row could be parsed.
+
+    Side effects:
+        None; malformed sublists are skipped silently (bare ``except``) and an
+        error value of ``9`` is expanded to ``[9, 9]`` so those molecules rank
+        last. An unknown ``ranking_method`` raises ``ValueError``.
+
+    NOTE (known issue, left unchanged):
+        The result mixes *all* targets found in the pickle into a single ranking
+        (``molecule_data`` is never reset per target), so rank ``0`` is not
+        necessarily the target's ground-truth molecule.
+    """
     molecule_data = []
     for trg_smi, value_list in file_data.items():
         try:
@@ -903,11 +1496,31 @@ def rank_molecules_in_file(file_data, ranking_method):
 
 
 def generate_random_id(length=10):
-    """Generate a random alphanumeric ID."""
+    """Generate a random uppercase-alphanumeric identifier.
+
+    Args:
+        length (int, optional): Character count. Defaults to 10.
+
+    Returns:
+        str: Random ID drawn from the global ``random`` state.
+    """
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 def save_examples_as_csv(smiles_list, output_path, prefix):
-    """Save SMILES as CSV with random sample IDs."""
+    """Write a SMILES list to CSV with generated sample ids.
+
+    Args:
+        smiles_list (list[str]): SMILES to export.
+        output_path (str): Destination CSV.
+        prefix (str): Prefix for every generated ``sample_id``.
+
+    Returns:
+        None
+
+    Side effects:
+        Writes/overwrites ``output_path``, prints the row count and consumes the
+        global ``random`` state.
+    """
     data = {
         'sample_id': [f"{prefix}_{generate_random_id()}" for _ in smiles_list],
         'SMILES': smiles_list
@@ -917,6 +1530,20 @@ def save_examples_as_csv(smiles_list, output_path, prefix):
     print(f"Saved {len(smiles_list)} examples to {output_path}")
 
 def process_dataset_and_save_csv(data_config, output_folder, ranking_method):
+    """Rank pickles and export the positive/negative SMILES sets as CSV.
+
+    Args:
+        data_config (dict): Keys ``weight_range`` and ``pkl_folder``.
+        output_folder (str): Destination folder for the two CSV files.
+        ranking_method (str): HSQC/COSY ranking mode.
+
+    Returns:
+        tuple[str, str]: Paths of the positive and negative CSV files.
+
+    Side effects:
+        Reads pickles and writes two CSV files; ``file_path`` from
+        ``data_config`` is intentionally unused here.
+    """
     weight_range = data_config['weight_range']
     pkl_folder = data_config['pkl_folder']
     #file_path = data_config['file_path']
@@ -939,7 +1566,29 @@ def process_dataset_and_save_csv(data_config, output_folder, ranking_method):
 
 
 def deduplicate_smiles_from_ranking(all_rankings):
+    """Drop duplicate generated molecules (canonical SMILES) inside each target.
+
+    Args:
+        all_rankings (dict[str, list[tuple]]): Target SMILES -> ranked rows.
+
+    Returns:
+        tuple[dict, dict]: The deduplicated rankings (first occurrence kept) and
+        the removed SMILES per target.
+
+    Side effects:
+        None; the nested ``canonicalize`` falls back to the raw string when RDKit
+        cannot parse a molecule, so such molecules are compared verbatim.
+    """
     def canonicalize(smiles):
+        """Canonical SMILES of ``smiles``, falling back to the raw string.
+
+        Args:
+            smiles (str): SMILES string to canonicalise.
+
+        Returns:
+            str: ``Chem.MolToSmiles`` output when RDKit parses the input,
+            otherwise the unchanged input string.
+        """
         mol = Chem.MolFromSmiles(smiles)
         return Chem.MolToSmiles(mol) if mol else smiles
         #return Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True) if mol else smiles
@@ -964,6 +1613,20 @@ def deduplicate_smiles_from_ranking(all_rankings):
 
 
 def filter_rankings_by_molecular_formula(all_rankings):
+    """Keep only rows whose generated molecule has the target's formula.
+
+    Args:
+        all_rankings (dict[str, list]): Target SMILES -> ranking rows, where
+            ``row[0]`` is the target SMILES and ``row[1]`` the generated one.
+
+    Returns:
+        tuple[defaultdict, defaultdict]: Accepted rows and rejected rows, both
+        keyed by target SMILES (keys with no rows are omitted).
+
+    Side effects:
+        None; rows shorter than two elements are dropped without being counted
+        in either output.
+    """
     filtered_rankings = defaultdict(list)
     filtered_out_rankings = defaultdict(list)
 
@@ -993,6 +1656,16 @@ def filter_rankings_by_molecular_formula(all_rankings):
 
 
 def get_molecular_formula(smiles):
+    """Molecular formula of a SMILES string.
+
+    Args:
+        smiles (str): SMILES string.
+
+    Returns:
+        str | None: Formula such as ``"C6H6"`` via
+        ``Chem.rdMolDescriptors.CalcMolFormula``, or ``None`` if the input cannot
+        be parsed.
+    """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
@@ -1000,6 +1673,18 @@ def get_molecular_formula(smiles):
 
 
 def calculate_top_k_accuracy_BL(all_rankings, k_range=[1, 3, 5, 10, 20]):
+    """Top-k accuracy of the ranked generation results.
+
+    Args:
+        all_rankings (dict[str, list]): Target -> ranking rows; ``row[2]`` is the
+            Tanimoto score.
+        k_range (list[int], optional): Cut-offs. Defaults to
+            ``[1, 3, 5, 10, 20]``.
+
+    Returns:
+        list[float]: Accuracy per cut-off, in the same order as ``k_range``
+        (``len(k_range)`` values).
+    """
     accuracies = []
     total_molecules = len(all_rankings)
     for k in k_range:
@@ -1012,6 +1697,25 @@ def calculate_top_k_accuracy_BL(all_rankings, k_range=[1, 3, 5, 10, 20]):
     return accuracies
 
 def calculate_top_k_accuracy(all_rankings, k_range=[1, 3, 5, 10, 20]):
+    """Top-k accuracy with an "all molecules" accuracy appended at the end.
+
+    Args:
+        all_rankings (dict[str, list]): Target -> ranking rows.
+        k_range (list[int], optional): Cut-offs. Defaults to
+            ``[1, 3, 5, 10, 20]``.
+
+    Returns:
+        list[float]: ``len(k_range) + 1`` values; the last element is the hit rate
+        over the complete ranking, not another k.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged):
+        Callers that zip the result with ``k_range`` (plot helpers do) silently
+        drop the final value, and a zero-length ``all_rankings`` raises
+        ``ZeroDivisionError``.
+    """
     accuracies = []
     total_molecules = len(all_rankings)
     for k in k_range:
@@ -1032,6 +1736,21 @@ def calculate_top_k_accuracy(all_rankings, k_range=[1, 3, 5, 10, 20]):
 
 
 def rank_molecules(file_data, ranking_method):
+    """Rank each target's molecules by simulated error and key them by target.
+
+    Args:
+        file_data (dict): ``{target SMILES: [[[gen, ..., tanimoto,
+            [err1, err2]], ...]]}``.
+        ranking_method (str): ``'HSQC & COSY'``, ``'HSQC'`` or ``'COSY'``.
+
+    Returns:
+        dict[str, list[tuple]]: Target -> rows ``(trg_smi, gen_smi, tanimoto,
+        rank, error1, error2)`` sorted best-first.
+
+    Side effects:
+        Prints a message for every malformed sublist; an unknown ranking method
+        raises ``ValueError``; targets with no usable row are omitted.
+    """
     all_rankings = {}
     for trg_smi, value_list in file_data.items():
         molecule_data = []
@@ -1079,6 +1798,18 @@ def rank_molecules(file_data, ranking_method):
 
 
 def process_pkl_files_BL(file_paths_dict, ranking_method):
+    """Rank one pickle per data type and collect the results.
+
+    Args:
+        file_paths_dict (dict[str, str]): Data type -> pickle path.
+        ranking_method (str): HSQC/COSY ranking mode.
+
+    Returns:
+        dict[str, dict]: Data type -> ``{target SMILES: ranking rows}``.
+
+    Side effects:
+        Reads every pickle listed in ``file_paths_dict``.
+    """
     all_rankings = {}
     for data_type, file_path in file_paths_dict.items():
         file_data = load_data_results(file_path)
@@ -1089,6 +1820,14 @@ def process_pkl_files_BL(file_paths_dict, ranking_method):
 
 
 def count_molecules_with_sim_rank_one(all_rankings):
+    """Count targets that contain at least one perfect Tanimoto match.
+
+    Args:
+        all_rankings (dict[str, list]): Target -> ranking rows.
+
+    Returns:
+        int: Number of targets with any ``row[2] == 1.0``.
+    """
     count = sum(
         any(molecule[2] == 1.0 for molecule in rankings)
         for rankings in all_rankings.values()
@@ -1097,6 +1836,20 @@ def count_molecules_with_sim_rank_one(all_rankings):
 
 
 def load_pickle_data_df(file_path, sample_size=None):
+    """Load a pickled fingerprint DataFrame and return its vectors and SMILES.
+
+    Args:
+        file_path (str): Pickle path.
+        sample_size (int | None, optional): Subsample size; ``random_state=42``.
+            Defaults to None.
+
+    Returns:
+        tuple[numpy.ndarray, list[str], pandas.DataFrame]: Vectors, SMILES and the
+        (possibly subsampled) frame.
+
+    Side effects:
+        Reads the pickle.
+    """
     with open(file_path, 'rb') as f:
         df = pickle.load(f)
     
@@ -1110,12 +1863,19 @@ def load_pickle_data_df(file_path, sample_size=None):
 
 
 def rename_column_in_csv(file_path, old_column_name, new_column_name):
-    """
-    Rename a column in a CSV file and save it back to the same file.
-    
-    :param file_path: Path to the CSV file
-    :param old_column_name: Current name of the column
-    :param new_column_name: New name for the column
+    """Rename one column of a CSV and overwrite the file in place.
+
+    Args:
+        file_path (str): CSV path.
+        old_column_name (str): Existing column name.
+        new_column_name (str): Replacement name.
+
+    Returns:
+        None
+
+    Side effects:
+        Rewrites ``file_path`` (index column dropped) and prints the path; a
+        missing column leaves the data unchanged but the file is still rewritten.
     """
     # Read the CSV file
     df = pd.read_csv(file_path)
@@ -1132,7 +1892,31 @@ def rename_column_in_csv(file_path, old_column_name, new_column_name):
     
     
 def process_and_save_histogram(experiment_results, save_dir, title_label):
+    """Histogram of the per-target average ``similar_compounds`` scores.
+
+    Args:
+        experiment_results (dict): ``{SMILES: {'similar_compounds':
+            [(smi, score), ...]}}``.
+        save_dir (str): Output folder, created if needed.
+        title_label (str): Title suffix and file-name stem.
+
+    Returns:
+        tuple[list[float], float]: The per-target averages and their mean.
+
+    Side effects:
+        Writes ``histogram_<label>.png`` at 300 dpi and closes the figure.
+        ``np.mean`` of an empty list yields ``nan`` with a RuntimeWarning rather
+        than raising.
+    """
     def calculate_average(tuple_list):
+        """Mean of the second element of every (SMILES, score) tuple.
+
+        Args:
+            tuple_list (list[tuple]): Pairs whose index 1 is the numeric score.
+
+        Returns:
+            float: ``numpy.mean`` of the scores.
+        """
         return np.mean([t[1] for t in tuple_list])
     
     averages = []
@@ -1185,6 +1969,27 @@ def process_and_save_histogram(experiment_results, save_dir, title_label):
 
 
 def process_spectrum_data(config: Any, sample_ids: List[str], data_type: str) -> None:
+    """Rewrite the spectrum CSVs so that they carry a ``sample-id`` column.
+
+    Args:
+        config: Experiment namespace holding ``csv_<spectrum>_path_<data_type>``
+            and ``IR_data_folder*`` attributes.
+        sample_ids (list[str]): IDs used to select rows (forwarded to
+            ``select_relevant_samples``).
+        data_type (str): ``"ACD"``, ``"sim"`` or ``"exp"``.
+
+    Returns:
+        None
+
+    Side effects:
+        Writes the filtered CSVs and restores ``config.IR_data_folder`` from the
+        matching backup attribute.
+
+    NOTE (known issue, left unchanged):
+        ``select_relevant_samples`` and ``save_and_update_config`` are neither
+        defined in this module nor imported, so the first spectrum iteration
+        raises ``NameError``.
+    """
     spectrum_types = ['1H', '13C', 'HSQC', 'COSY']
     for spectrum in spectrum_types:
         csv_path = getattr(config, f'csv_{spectrum}_path_{data_type}')
