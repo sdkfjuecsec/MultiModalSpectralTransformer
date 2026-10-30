@@ -1,3 +1,19 @@
+"""Data loading and similarity scoring for NMR spectra comparison.
+
+This module complements ``functions_HSQC_sim_v15_4`` with:
+    * loaders that turn ACD, MNova, DFT, ML/DP and COSY output files into
+      DataFrames with uniform ``F2 (ppm)``/``F1 (ppm)`` columns,
+    * ``similarity_calculations`` (a rescaled 1H/13C variant of the scorer in
+      ``functions_HSQC_sim``) plus the alignment helpers it dispatches to,
+    * ``get_similarity_comparison_variations`` which runs every alignment
+      mode and collects the scores and aligned point sets.
+
+Peak coordinates are normalised with 1H = ``ppm/10 - 0.5`` and
+13C = ``ppm/200 - 0.5`` (note the different divisors from the sibling module).
+Importing this module has no side effects beyond importing the RDKit/SciPy
+stack and the local COSY/HSQC reconstruction helpers.
+"""
+
 import collections
 import glob
 import math
@@ -33,11 +49,23 @@ def load_acd_dataframe_from_file(acd_file_path):
     """
     Loads a dataframe from an ACD file.
 
+    Parses the tab-separated ``HSQC_13C-1H`` property of the first SDF record,
+    derives a ``direction`` column from the ``F2 Atom`` column, and removes
+    duplicate (F2, F1) peaks.
+
     Parameters:
     acd_file_path (str): Path to the ACD file.
 
     Returns:
-    DataFrame: Processed dataframe with deduplicated entries.
+    DataFrame: Processed dataframe with deduplicated entries, or an empty
+    DataFrame on error/missing data.
+
+    Side effects:
+        Reads the file and prints an error message on failure.
+
+    NOTE (known issue, left unchanged): this definition is later shadowed by a
+    second ``load_acd_dataframe_from_file`` in the same module (see below).
+    Only the second (less defensive, no try/except) version is reachable.
     """
     try:
         # Load data from the ACD file
@@ -200,7 +228,11 @@ def load_acd_dataframe_from_file(acd_file_path):
 def get_similarity_comparison_variations(df_1, df_2, mode, sample_id, similarity_type=["euclidean", "cosine_similarity", "pearson_similarity"], error=["sum", "avg"], display_img=False):
     """
     Calculates various similarity measures for two HSQC dataframes.
-    
+
+    Runs ``similarity_calculations`` for each of the nine built-in alignment
+    modes, optionally plotting the assignment only for the requested ``mode``,
+    and collects both the scores and the aligned point DataFrames.
+
     Parameters:
     df_1, df_2 (DataFrame): Input dataframes for similarity calculations.
     mode (str): Mode of similarity calculation.
@@ -208,9 +240,18 @@ def get_similarity_comparison_variations(df_1, df_2, mode, sample_id, similarity
     similarity_type (list): Types of similarity measures to calculate.
     error (list): Types of error calculation methods.
     display_img (bool): Flag to display a scatter plot.
-    
+
     Returns:
     tuple: A tuple containing the list of similarity results and input dataframes.
+
+    Side effects:
+        May draw scatter/assignment plots via the helper functions.
+
+    NOTE (known issue, left unchanged): unlike ``similarity_calculations``
+    (which compares scalars with strings), ``similarity_type``/``error`` here
+    are lists. Passing the defaults means the inner strings never match, so
+    Euclidean modes return ``None`` and the results list contains Nones.
+    Callers are expected to pass single strings.
     """
 
     input_dfs = {}
@@ -247,12 +288,20 @@ def get_similarity_comparison_variations(df_1, df_2, mode, sample_id, similarity
 def load_acd_dataframe_from_file(acd_file_path):
     """
     Loads and processes an ACD/Labs SDF file into a deduplicated pandas DataFrame.
-    
+
+    This is the effective definition (it shadows the earlier try/except
+    version). It parses ``HSQC_13C-1H``, derives ``direction`` from
+    ``F2 Atom`` and deduplicates on (F2, F1).
+
     Parameters:
     acd_file_path (str): File path to the ACD/Labs SDF file.
 
     Returns:
     DataFrame: Processed DataFrame with deduplicated entries.
+
+    Side effects:
+        Reads the SDF file; malformed/blank lines are not filtered, so
+        ``pd.DataFrame`` can raise instead of returning an empty frame.
     """
     # Load SDF file into a DataFrame
     data = PandasTools.LoadSDF(acd_file_path)
@@ -283,7 +332,11 @@ def load_real_dataframe_from_file(real_file_path):
     real_file_path (str): File path to the real dataset.
 
     Returns:
-    DataFrame: Processed DataFrame with renamed columns.
+    DataFrame: Processed DataFrame with renamed columns
+    (``F2ppm``/``F1ppm`` -> ``F2 (ppm)``/``F1 (ppm)``), or ``None`` on error.
+
+    Side effects:
+        Reads the text file; prints an error message on failure.
     """
     try:
         # Attempt to read the file with flexible separators (tab or whitespace)
@@ -306,7 +359,11 @@ def load_mnova_dataframe_from_file(file_path):
     file_path (str): File path to the MNOVA dataset.
 
     Returns:
-    DataFrame: Processed DataFrame with specified column names.
+    DataFrame: Processed DataFrame with columns
+    ``id``/``F2 (ppm)``/``F1 (ppm)``/``Intensity``, or ``None`` on error.
+
+    Side effects:
+        Reads the text file; prints an error message on failure.
     """
     try:
         # Read the file with flexible separators (tab or whitespace) and specified column names
@@ -322,11 +379,19 @@ def load_HSQC_dataframe_from_file(ml_file_path):
     """
     Loads HSQC data from an ML SDF file into a DataFrame.
 
+    Reads the averaged shifts, recovers chirality/symmetry information via
+    ``hsqc_nmr_reconstruction``, deduplicates symmetry-equivalent shifts and
+    builds the peak DataFrame.
+
     Parameters:
     ml_file_path (str): Path to the ML SDF file.
 
     Returns:
-    DataFrame: A DataFrame containing the processed HSQC data.
+    DataFrame: A DataFrame containing the processed HSQC data, or ``None``
+    if processing fails.
+
+    Side effects:
+        Reads the file; prints the error message on failure.
     """
 
     try:
@@ -357,11 +422,18 @@ def load_COSY_dataframe_from_file(ml_file_path):
     """
     Loads COSY data from an ML SDF file into a DataFrame.
 
+    Enumerates stereoisomers, extracts averaged shifts, averages symmetric
+    positions, and generates the sorted COSY cross-peak DataFrame.
+
     Parameters:
     ml_file_path (str): Path to the ML SDF file.
 
     Returns:
-    DataFrame: A DataFrame containing the processed COSY data.
+    DataFrame: A DataFrame containing the processed COSY data, or ``None``
+    on error.
+
+    Side effects:
+        Reads the file; prints the error message on failure.
     """
 
     try:
@@ -412,6 +484,9 @@ def load_shifts_from_dp_sdf_file(sdf_file_dp):
 
     Returns:
     list: A list of chemical shifts, or None if an error occurs.
+
+    Side effects:
+        Reads the SDF file; prints an error message on failure.
     """
 
     try:
@@ -434,6 +509,11 @@ def load_dft_dataframe_from_file(dft_file_path):
         dft_file_path (str): The path to the DFT file in SD format.
     Returns:
         pandas.DataFrame: A DataFrame containing the chemical shifts and corresponding atomic positions for the DFT file.
+
+    Side effects:
+        Reads the file and delegates to the ``hsqc_nmr_reconstruction``
+        helpers; a missing/unparsable shift property propagates from
+        ``load_shifts_from_dp_sdf_file`` (which returns ``None``).
     """
     boltzman_avg_shifts_corr_2 = load_shifts_from_dp_sdf_file(dft_file_path)
     sym_dupl_lists, all_split_positions, mol, compound_path = hnr.run_chiral_and_symmetry_finder(compound_path=dft_file_path)
@@ -458,6 +538,10 @@ def load_real_df_from_txt_path(path_txt):
 
     try:
         # Attempt to read the file with multiple separators
+        # NOTE (known issue, left unchanged): the separator is not a raw string,
+        # so ``\t`` becomes a real tab while ``\s+`` stays a literal regex
+        # escape. It happens to work with the Python engine but emits a
+        # SyntaxWarning ("invalid escape sequence '\\s'") on modern Python.
         df_real = pd.read_csv(path_txt, sep="\t|\s+", engine='python')
 
     except Exception as e:
@@ -488,7 +572,28 @@ def similarity_calculations(df_1, df_2, mode=["min_sum_zero", "min_sum_nn", "min
     """This function calculates the cosine similarity of xy of two spectra provided by dataframes
     by first normalizing it and then choosing one of two modes
     min_sum: takes the minimum sum of x + y as a sorting criteria
-    euc_dist: compares every point with each other point of the spectra and matches them to minimize the error"""
+    euc_dist: compares every point with each other point of the spectra and matches them to minimize the error
+
+    Args:
+        df_1: experimental DataFrame with ``F2 (ppm)``/``F1 (ppm)``.
+        df_2: simulated DataFrame with the same columns.
+        mode: one alignment mode string from the list in the signature.
+        similarity_type: ``"cosine_similarity"`` or ``"euclidean"``.
+        error: for Euclidean, ``"sum"`` or ``"avg"`` (single string).
+        assignment_plot: draw the assignment plot when True.
+
+    Returns:
+        Tuple ``(score, points_1, points_2)`` (rescaled back to ppm), or
+        ``None`` when an unsupported ``similarity_type``/``error`` is given.
+
+    Side effects:
+        May open a matplotlib window via ``plot_assignment_points``.
+
+    NOTE (known issue, left unchanged): the signature defaults are lists but
+    the body compares scalars with strings. Calling without explicit
+    ``mode``/``error`` skips every alignment branch and, for Euclidean, every
+    ``error`` branch, so the function falls off the end and returns ``None``.
+    """
 
     h_dim_1 = list(np.array(df_1['F2 (ppm)'].astype(float))/10-0.5)
     c_dim_1 = list(np.array(df_1['F1 (ppm)'].astype(float))/200-0.5)
@@ -618,12 +723,23 @@ def plot_assignment_points(input_list_orig, input_list_sim, mode, similarity_typ
     """
     Plots experimental and simulated data points with assignment lines.
 
+    Pairs are drawn by list position (``range(len(input_list_orig))``), so the
+    caller must pass already-aligned arrays.
+
     Parameters:
     input_list_orig (numpy array): Original (experimental) data points.
     input_list_sim (numpy array): Simulated data points.
     mode (str): The mode of similarity calculation.
     similarity_type (str): Type of similarity measure used.
     error (float): Calculated error or similarity score.
+
+    Returns:
+        None.
+
+    Side effects:
+        Opens a matplotlib figure via ``plt.show()``. Uses the
+        ``seaborn-whitegrid`` style, which was removed in recent matplotlib
+        versions; on those versions this raises ValueError.
     """
 
     # Assuming assignments are made in order
@@ -664,13 +780,21 @@ def euclidean_distance_zero_padded(input_list_1, input_list_2, num_pad):
     """
     Aligns points from two lists based on Euclidean distance, matching remaining ones with zero padding.
 
+    Winsorises duplicate coordinates by adding a tiny random offset, sorts all
+    pairwise distances ascending, and greedily accepts pairs whose endpoints are
+    still unused.
+
     Parameters:
     input_list_1 (numpy array): First list of points.
     input_list_2 (numpy array): Second list of points.
-    num_pad (int): Number of padding zeros.
+    num_pad (int): Number of padding zeros (kept for API compatibility; the
+        zero rows are simply left unmatched rather than filtered here).
 
     Returns:
-    Tuple: Aligned dataset arrays.
+    Tuple: Aligned dataset arrays of matched points.
+
+    Side effects:
+        Consumes random numbers when duplicate coordinates are jittered.
     """
 
     x = []
@@ -733,7 +857,21 @@ def euclidean_distance_zero_padded(input_list_1, input_list_2, num_pad):
 
 
 def hungarian_zero_padded(input_list_1,input_list_2):
-    """ From https://stackoverflow.com/questions/39016821/minimize-total-distance-between-two-sets-of-points-in-python
+    """Optimal one-to-one point assignment via the Hungarian algorithm.
+
+    From https://stackoverflow.com/questions/39016821/
+    minimize-total-distance-between-two-sets-of-points-in-python
+
+    Args:
+        input_list_1: first set of points, shape ``(n, 2)``.
+        input_list_2: second set of points, shape ``(m, 2)``.
+
+    Returns:
+        Tuple of two numpy arrays of matched points, length ``min(n, m)``.
+
+    Side effects:
+        None. ``b`` is the row index array from ``linear_sum_assignment`` but is
+        immediately rebound by ``enumerate``; this is intentional.
     """
     C = cdist(input_list_1, input_list_2)
     b, assigment = linear_sum_assignment(C)
@@ -766,6 +904,11 @@ def filter_out_zeros(input_list_1, input_list_2):
                   close to zero.
     - new_list_2: A list containing the elements from input_list_2 that correspond
                   to the elements in new_list_1 and are not close to zero.
+
+    Side effects:
+        None. A pair is dropped when either point has |x|+|y| < 0.001 (the
+        zero-padding sentinel); note that this also drops genuine peaks near
+        the origin of the normalised coordinate space.
     """
     new_list_1, new_list_2 = [],[]
     for i,j in zip(input_list_1, input_list_2 ):
@@ -785,12 +928,20 @@ def min_sum_nn(input_list_1, input_list_2):
     """
     Aligns two lists of points using a combination of minimum sum and Euclidean distance.
 
+    Sorts both sets by decreasing ``x + y`` and pairs the first
+    ``min(len)`` points by index; the leftover points of the longer set are
+    matched again with ``euclidean_distance_uneven`` against the full shorter
+    set and appended.
+
     Parameters:
     input_list_1 (numpy array): First list of points.
     input_list_2 (numpy array): Second list of points.
 
     Returns:
     Tuple: Arrays of aligned points from input_list_1 and input_list_2.
+
+    Side effects:
+        May consume random numbers in the Euclidean re-matching step.
     """
     input_list_1 = np.array(sorted(input_list_1, key = lambda x: -(x[0]+x[1])))
     input_list_2 = np.array(sorted(input_list_2, key = lambda x: -(x[0]+x[1])))
@@ -821,9 +972,27 @@ def min_sum_nn(input_list_1, input_list_2):
 
 
 def euclidean_distance_nn(input_list_1,input_list_2):
-    """The Euclidean-Distance-Advanced first matches each point from one set to the second and then picks the
+    """Two-pass nearest-neighbour Euclidean matching for unequal set sizes.
+
+    Jitters duplicate peaks, matches all points with
+    ``euclidean_distance_uneven``, then re-matches the unmatched points of the
+    larger set against the full smaller set and concatenates both passes.
+
+    The Euclidean-Distance-Advanced first matches each point from one set to the second and then picks the
     remaining points that were not matched because of a mismatch of number of points and matches them again
-    to the shorter set. """
+    to the shorter set.
+
+    Args:
+        input_list_1: first set of points, shape ``(n, 2)``.
+        input_list_2: second set of points, shape ``(m, 2)``.
+
+    Returns:
+        Tuple of two equal-length numpy arrays with all points of the larger
+        set paired (smaller-set points may be reused).
+
+    Side effects:
+        Consumes random numbers when jittering duplicate coordinates.
+    """
     ################### For duplicated simulated datapoints #################
     # do correction when peaks fall on the exact same spot in the simulated spectrum
     # Because otherwise when I do the matching later it will see that the peak is already in the list and will not consider it
@@ -893,8 +1062,21 @@ def euclidean_distance_nn(input_list_1,input_list_2):
 
 
 def euclidean_distance_uneven(input_list_1,input_list_2):
-    """This function aligns the closest points with each other based on euclidean distance
-    and matches the remaining ones with the zero padding"""
+    """Greedy Euclidean pairing for input sets of different length.
+
+    This function aligns the closest points with each other based on euclidean distance
+    and matches the remaining ones with the zero padding
+
+    Args:
+        input_list_1: first set of points, shape ``(n, 2)``.
+        input_list_2: second set of points, shape ``(m, 2)``.
+
+    Returns:
+        Tuple of two matched numpy arrays (only accepted pairs).
+
+    Side effects:
+        Consumes random numbers when duplicate coordinates are jittered.
+    """
 
     ################### For duplicated simulated datapoints #################
     # do correction when peaks fall on the exact same spot in the simulated spectrum
@@ -956,13 +1138,40 @@ def euclidean_distance_uneven(input_list_1,input_list_2):
     return np.array(dataset_1), np.array(dataset_2)
 
 def hungarian_advanced_euc(input_list_1,input_list_2):
+    """Nearest-neighbour Euclidean matching followed by Hungarian assignment.
+
+    Args:
+        input_list_1: first set of points, shape ``(n, 2)``.
+        input_list_2: second set of points, shape ``(m, 2)``.
+
+    Returns:
+        Tuple of two aligned numpy arrays.
+
+    Side effects:
+        May consume random numbers inside ``euclidean_distance_nn``.
+    """
     #Hungarian advanced
     input_list_1_euc,input_list_2_euc = euclidean_distance_nn(input_list_1,input_list_2)
     input_list_1_euc_hung,input_list_2_euc_hung = hungarian_zero_padded(input_list_1_euc,input_list_2_euc)
     return np.array(input_list_1_euc_hung),np.array(input_list_2_euc_hung)
 
 def load_shifts_from_sdf_file(file_path):
-    """ This functions load the nmr_shifts from the shift-SDF file"""
+    """Load the ``averaged_NMR_shifts`` property of an SDF file as floats.
+
+    This functions load the nmr_shifts from the shift-SDF file
+
+    Args:
+        file_path: path to an SDF file that has an ``averaged_NMR_shifts``
+            property.
+
+    Returns:
+        List of floats. Values are first split on commas; if that fails they
+        are split on whitespace (bare except fallback).
+
+    Side effects:
+        Reads the SDF file via ``PandasTools.LoadSDF``. Raises if the property
+        is missing (``.item()`` on an empty series).
+    """
     # file_path = [i for i in files if sample_id in i][0]
     data = PandasTools.LoadSDF(file_path)
     str_shifts = data["averaged_NMR_shifts"].item()

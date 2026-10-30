@@ -1,3 +1,22 @@
+"""Similarity and plotting utilities for 2D HSQC spectra.
+
+The module compares an experimental HSQC spectrum with simulated spectra
+(ACD, ML, DFT, etc.). Peak positions are taken from DataFrames with columns
+``F2 (ppm)`` (1H) and ``F1 (ppm)`` (13C), rescaled into a unit-ish range,
+aligned with several point-matching strategies, and finally scored with a
+cosine, Euclidean, or Pearson metric.
+
+Typical workflow:
+    1. ``similarity_calculations`` selects an alignment ``mode`` and a
+       ``similarity_type`` and returns the score plus rescaled point pairs.
+    2. ``plot_assignment_points`` / ``plot_all_similarities`` visualise the
+       matching for debugging.
+    3. Small RDKit/MolVS helpers convert SMILES and fingerprints.
+
+All plotting functions call ``plt.show()`` and therefore have visible side
+effects. No module-level state is modified.
+"""
+
 # Standard library imports
 import os
 import random
@@ -29,11 +48,48 @@ from molvs import Standardizer
 
 
 def calculate_weight(smiles_str):
-    """ used in compare_molformer input smiles string"""
+    """Return the exact molecular weight of a SMILES string.
+
+    Args:
+        smiles_str: A SMILES string.
+
+    Returns:
+        The exact molecular weight in Dalton (float). If the SMILES cannot be
+        parsed, RDKit raises/propagates an exception because no None check is
+        performed.
+
+    Side effects:
+        None.
+    """
     m = Chem.MolFromSmiles(smiles_str)
     return ExactMolWt(m)
 
 def generate_fingerprint(input_df_or_smiles, output_type = ["list","tensor", "array"], nbits = 512):
+    """Compute a Morgan (ECFP4-like, radius 2) bit fingerprint.
+
+    Accepts either a DataFrame with a ``SMILES`` column or a raw SMILES
+    string. The fingerprint is returned as a Python list by default; if
+    ``output_type`` is exactly ``"array"`` it is returned as a float16 numpy
+    array.
+
+    Args:
+        input_df_or_smiles: DataFrame containing ``SMILES``, or a SMILES str.
+        output_type: ``"array"`` selects numpy output; anything else yields a
+            list. (The default is a list, not a scalar string.)
+        nbits: Fingerprint length in bits.
+
+    Returns:
+        list or numpy.ndarray of fingerprint bits.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged): the ``output_type == "tensor"`` branch
+    calls ``torch.Tensor`` but ``torch`` is never imported in this module, so
+    that path raises NameError. Also, ``output_type`` defaults to the list
+    ``["list", "tensor", "array"]``, which never equals the string ``"array"``,
+    so a plain list is always returned unless the caller passes a string.
+    """
     # just calculate Morgan fingerprint of single example
     try:
         sample = input_df_or_smiles['SMILES']
@@ -53,9 +109,25 @@ def generate_fingerprint(input_df_or_smiles, output_type = ["list","tensor", "ar
 
   
 def mol2mol_file(mol, folder=None, name=None):
-    """ Saves a smile to a given folder with a given name/ID in sdf format
-    adding the H is crutial for the ICOLOS workflow
-    ir no name is provided then it saves it under a random number"""
+    """Write a single RDKit molecule to ``<folder>/<name>.mol``.
+
+    Adds explicit hydrogens and 3D coordinates before embedding, which the
+    downstream ICOLOS workflow requires. The file is written as a one-record
+    MDL mol/SDF file (SDWriter with a single molecule).
+
+    Args:
+        mol: RDKit ``Mol`` object (2D/3D coordinates not required).
+        folder: destination directory; defaults to a hard-coded absolute Linux
+            path if omitted.
+        name: file stem; a random 4-digit number if omitted.
+
+    Returns:
+        The full path of the written ``.mol`` file.
+
+    Side effects:
+        Creates the output file on disk and runs ETKDG embedding (random
+        seed fixed to ``0xf00d``).
+    """
     if name==None:
         rand_num = random.randint(0,1000)
         name = "%04d" % (rand_num)
@@ -105,11 +177,44 @@ def similarity_calculations(df_1, df_2, mode=["min_sum_zero", "min_sum_nn", "min
                             similarity_type=["euclidean","cosine_similarity","pearson_similarity"],  \
                             error=["sum","avg", "avg_scaled"], \
                             assignment_plot = True, sim_technique=None):
-    """This function calculates the cosine similarity of xy of two spectra provided by dataframes
-    by first normalizing it and then choosing one of two modes
-    min_sum: takes the minimum sum of x + y as a sorting criteria
-    euc_dist: compares every point with each other point of the spectra and matches them to minimize the 
-    error"""
+    """Align two HSQC peak lists and score their similarity.
+
+    Both DataFrames are rescaled (1H by ``ppm/11 - 0.5``, 13C by
+    ``ppm/180 - 0.5``), transposed into ``(n, 2)`` point arrays, aligned
+    according to ``mode`` and then scored according to ``similarity_type``.
+
+    Alignment modes:
+        * ``min_sum_*``: sort by decreasing ``x + y`` (optionally pad to the
+          longer list / truncate to the shorter / nearest-neighbour).
+        * ``euc_dist_*``: greedy nearest Euclidean matching (zero padding,
+          truncation, or advanced re-matching).
+        * ``hung_dist_*``: Hungarian (linear sum assignment) matching.
+
+    Args:
+        df_1: experimental peak DataFrame with ``F2 (ppm)``/``F1 (ppm)``.
+        df_2: simulated peak DataFrame with the same columns.
+        mode: alignment mode name (a single string, despite the list default).
+        similarity_type: ``"cosine_similarity"``, ``"euclidean"`` or
+            ``"pearson_similarity"`` (single string despite list default).
+        error: Euclidean error aggregation: ``"sum"``, ``"avg"`` or
+            ``"avg_scaled"``.
+        assignment_plot: when True, calls ``plot_assignment_points``.
+        sim_technique: optional label used to jitter duplicate ACD/ML/DFT peaks.
+
+    Returns:
+        Tuple ``(score, rescaled_points_1, rescaled_points_2)`` for the
+        selected metric. ``score`` is a numpy scalar/float. Returns ``None``
+        if an unsupported ``similarity_type`` is supplied.
+
+    Side effects:
+        May open a matplotlib window (``assignment_plot=True``).
+
+    NOTE (known issue, left unchanged): the defaults are lists, but the body
+    compares them with strings (``mode == "min_sum_zero"`` etc.). Calling the
+    function without explicit ``mode``/``similarity_type``/``error`` therefore
+    performs no alignment and falls through every branch, returning ``None``.
+    """
+    # Rescale and transpose both peak lists into (n, 2) coordinate arrays.
 
     h_dim_1 = list(np.array(df_1['F2 (ppm)'].astype(float))/11-0.5)
     c_dim_1 = list(np.array(df_1['F1 (ppm)'].astype(float))/180-0.5)
@@ -216,12 +321,22 @@ def similarity_calculations(df_1, df_2, mode=["min_sum_zero", "min_sum_nn", "min
 def calculate_pearson_similarity(spectrum1, spectrum2):
     """Computes the Pearson correlation similarity between two 2D HSQC spectra.
 
+    The coefficient is computed independently for the 1H and 13C coordinates
+    and then averaged.
+
     Parameters:
     spectrum1 (numpy.ndarray): The first spectrum, with shape (n, 2).
     spectrum2 (numpy.ndarray): The second spectrum, with shape (m, 2).
 
     Returns:
-    float: The Pearson correlation similarity between the two spectra.
+    float: The mean Pearson correlation of the two coordinate axes.
+
+    Side effects:
+        None.
+
+    NOTE (known issue, left unchanged): ``scipy.stats.pearsonr`` requires the
+    two inputs to have the same length. When the spectra have different peak
+    counts (n != m) this raises a ValueError; callers must pad/truncate first.
     """
     # Extract the x and y coordinates from the spectra
     x1 = spectrum1[:, 0]
@@ -237,8 +352,20 @@ def calculate_pearson_similarity(spectrum1, spectrum2):
 
 
 def padding_to_max_length(input_list_1,input_list_2,  dim = 2):
-    """ Takes in a nparray of both items
-        Perform padding to the longer list"""
+    """Zero-pad the shorter of two point arrays to match the longer one.
+
+    Args:
+        input_list_1: numpy array of shape ``(n, dim)``.
+        input_list_2: numpy array of shape ``(m, dim)``.
+        dim: number of coordinates per point (2 for HSQC).
+
+    Returns:
+        Tuple ``(input_list_1, input_list_2, pad_num)`` where both arrays have
+        equal length and ``pad_num`` is the number of appended zero rows.
+
+    Side effects:
+        None (new arrays are allocated).
+    """
     
     if len(input_list_2) > len(input_list_1):
         pad_num = len(input_list_2)-len(input_list_1)
@@ -256,7 +383,25 @@ def padding_to_max_length(input_list_1,input_list_2,  dim = 2):
 
 
 def plot_assignment_points(input_list_orig, input_list_sim, mode):
-    """This function takes the sorted orig and sim inputs and plots them with assignment lines for the point matching algorithms"""
+    """Plot the two matched point sets and draw lines between paired points.
+
+    Args:
+        input_list_orig: array of experimental points, shape ``(n, 2)``.
+        input_list_sim: array of simulated points, same length as the original
+            (padding should already have been applied).
+        mode: alignment mode label used as the plot title.
+
+    Returns:
+        None.
+
+    Side effects:
+        Opens a matplotlib figure via ``plt.show()``.
+
+    NOTE (known issue, left unchanged): pairing is by list position
+    (``assignment = range(len(input_list_orig))``), not by the actual
+    alignment computed by the caller, so the drawn lines need not correspond
+    to the real point assignment.
+    """
     assignment = list(range(len(input_list_orig)))
 
     points1 = input_list_orig
@@ -277,8 +422,25 @@ def plot_assignment_points(input_list_orig, input_list_sim, mode):
 
 
 def min_sum_adv(input_list_1,input_list_2, sim_technique=None):
-    """ This function uses min sum for matching the first  points that are up to the same length of t the two 
-    sets and then euclidean distance for the remaining points that will be matched twice"""
+    """Match by min-sum order, then re-match unmatched extra points.
+
+    The first ``min(len(a), len(b))`` points of each set are sorted by
+    decreasing ``x + y`` and paired by index. Points left over in the longer
+    set are matched again against the full shorter set with
+    ``euclidean_distance_uneven`` and appended to both arrays so the outputs
+    have equal length.
+
+    Args:
+        input_list_1: array of points, shape ``(n, 2)``.
+        input_list_2: array of points, shape ``(m, 2)``.
+        sim_technique: passed through for duplicate-peak jittering.
+
+    Returns:
+        Tuple of two equal-length numpy arrays with the aligned points.
+
+    Side effects:
+        None.
+    """
     input_list_1 = np.array(sorted(input_list_1, key = lambda x: -(x[0]+x[1])))
     input_list_2 = np.array(sorted(input_list_2, key = lambda x: -(x[0]+x[1])))
     min_length = min(len(input_list_1),len(input_list_2))
@@ -307,7 +469,27 @@ def min_sum_adv(input_list_1,input_list_2, sim_technique=None):
 
 
 def hungarian_zero_padded(input_list_1,input_list_2):
-    """ From https://stackoverflow.com/questions/39016821/minimize-total-distance-between-two-sets-of-points-in-python
+    """Optimal one-to-one assignment of two point sets (Hungarian algorithm).
+
+    A cost matrix of pairwise Euclidean distances is built with ``cdist`` and
+    solved with ``scipy.optimize.linear_sum_assignment``; each point is then
+    reordered so both output arrays list the matched pairs in the same order.
+
+    Adapted from https://stackoverflow.com/questions/39016821/
+    minimize-total-distance-between-two-sets-of-points-in-python
+
+    Args:
+        input_list_1: array of points, shape ``(n, 2)``.
+        input_list_2: array of points, shape ``(m, 2)``.
+
+    Returns:
+        Tuple of two numpy arrays, each of length ``min(n, m)``, containing
+        the assigned points.
+
+    Side effects:
+        None. The local name ``b`` shadows the row index returned by
+        ``linear_sum_assignment`` but is re-bound by ``enumerate``, which is
+        intentional here.
     """
     C = cdist(input_list_1, input_list_2)
     b, assigment = linear_sum_assignment(C)
@@ -327,6 +509,21 @@ def hungarian_zero_padded(input_list_1,input_list_2):
 
 
 def hungarian_advanced_euc(input_list_1,input_list_2):
+    """Combine advanced Euclidean matching with Hungarian re-assignment.
+
+    Runs ``euclidean_distance_advanced`` first to equalise the number of
+    points, then applies the Hungarian assignment to the resulting arrays.
+
+    Args:
+        input_list_1: array of points, shape ``(n, 2)``.
+        input_list_2: array of points, shape ``(m, 2)``.
+
+    Returns:
+        Tuple of two aligned numpy arrays.
+
+    Side effects:
+        None.
+    """
     #Hungarian advanced
     input_list_1_euc,input_list_2_euc = euclidean_distance_advanced(input_list_1,input_list_2)
     input_list_1_euc_hung,input_list_2_euc_hung = hungarian_zero_padded(input_list_1_euc,input_list_2_euc)
@@ -336,8 +533,28 @@ def hungarian_advanced_euc(input_list_1,input_list_2):
 #######################################################################################################
     
 def euclidean_distance_zero_padded(input_list_1,input_list_2, num_pad, sim_technique=None):
-    """This function aligns the closest points with each other based on euclidean distance
-    and matches the remaining ones with the zero padding"""
+    """Greedily pair points by ascending Euclidean distance.
+
+    Every pair ``(i, j)`` is scored with ``distance.euclidean`` and sorted.
+    Walking the sorted list, a pair is accepted only if neither endpoint has
+    been used before. Unmatched points (including zero-padded rows) are
+    dropped, so the outputs contain only the accepted pairs and are therefore
+    shorter than the padded inputs.
+
+    Args:
+        input_list_1: array of points, shape ``(n, 2)`` (may contain zero rows).
+        input_list_2: array of points, shape ``(m, 2)`` (may contain zero rows).
+        num_pad: number of zero rows that were added by padding. Kept for API
+            compatibility; it is not used by the (commented-out) padding logic.
+        sim_technique: ``"ACD"`` triggers tiny random jitter on duplicate
+            coordinates so repeated peaks can still be matched separately.
+
+    Returns:
+        Tuple ``(dataset_1, dataset_2)`` of paired points (numpy arrays).
+
+    Side effects:
+        May consume random numbers when ``sim_technique == "ACD"``.
+    """
     
     ################### For duplicated simulated datapoints #################
     # do correction when peaks fall on the exact same spot in the simulated spectrum
@@ -413,8 +630,25 @@ def euclidean_distance_zero_padded(input_list_1,input_list_2, num_pad, sim_techn
 
 
 def euclidean_distance_uneven(input_list_1,input_list_2, sim_technique=None):
-    """This function aligns the closest points with each other based on euclidean distance
-    and matches the remaining ones with the zero padding"""
+    """Greedy Euclidean pairing of two sets with different sizes.
+
+    Like ``euclidean_distance_zero_padded`` but without padding bookkeeping:
+    it sorts all pairwise distances and accepts each pair whose endpoints are
+    still unused. The returned arrays are equal length and contain only the
+    matched pairs.
+
+    Args:
+        input_list_1: array of points, shape ``(n, 2)``.
+        input_list_2: array of points, shape ``(m, 2)``.
+        sim_technique: one of ``"ACD"``, ``"ML"``, ``"DFT"``, ``"DFT1"``,
+            ``"DFT2"`` enables duplicate-coordinate jitter.
+
+    Returns:
+        Tuple of two matched numpy arrays.
+
+    Side effects:
+        May consume random numbers when jittering is enabled.
+    """
     
     ################### For duplicated simulated datapoints #################
     # do correction when peaks fall on the exact same spot in the simulated spectrum
@@ -477,9 +711,26 @@ def euclidean_distance_uneven(input_list_1,input_list_2, sim_technique=None):
     return np.array(dataset_1), np.array(dataset_2)
 
 def euclidean_distance_advanced(input_list_1,input_list_2, sim_technique=None):
-    """The Euclidean-Distance-Advanced first matches each point from one set to the second and then picks the 
-    remaining points that were not matched because of a mismatch of number of points and matches them again 
-    to the shorter set. """
+    """Two-pass Euclidean matching for sets of unequal size.
+
+    First matches as many points as possible with ``euclidean_distance_uneven``
+    and then collects the points left unmatched in the larger set. Those
+    leftovers are matched again against the full smaller set, and both passes
+    are concatenated so every point of the larger set is paired exactly once
+    and some points of the smaller set are reused.
+
+    Args:
+        input_list_1: array of points, shape ``(n, 2)``.
+        input_list_2: array of points, shape ``(m, 2)``.
+        sim_technique: jitter label for duplicate peaks (see
+            ``euclidean_distance_uneven``).
+
+    Returns:
+        Tuple of two equal-length numpy arrays with the aligned points.
+
+    Side effects:
+        May consume random numbers when jittering is enabled.
+    """
     ################### For duplicated simulated datapoints #################
     # do correction when peaks fall on the exact same spot in the simulated spectrum
     # Because otherwise when I do the matching later it will see that the peak is already in the list and will not consider it
@@ -556,7 +807,36 @@ def plot_all_similarities(min_sum_1, min_sum_2, \
                           hungarian_zero_1, hungarian_zero_2,\
                           hungarian_advanced_1, hungarian_advanced_2,\
                           similarities, label, value):
-    """ from Notbook 6 - this plots all the comparisons with point assignments to analyse the misassignments. """
+    """Plot all six alignment variants side-by-side with assignment lines.
+
+    Builds a 3x2 grid of scatter plots (MinSum-Zero/NN, EucDist-Zero/NN,
+    HungDist-Zero/NN), drawing a black line between each pair of matched
+    points and annotating the score from ``similarities``.
+
+    Args:
+        min_sum_1/2: points from the min-sum-zero alignment.
+        min_sum_adv_1/2: points from the min-sum nearest-neighbour alignment.
+        euc_dist_zero_1/2: points from the Euclidean zero-padded alignment.
+        euc_dist_advanced_1/2: points from the advanced Euclidean alignment.
+        hungarian_zero_1/2: points from the Hungarian zero-padded alignment.
+        hungarian_advanced_1/2: points from the Hungarian nearest-neighbour
+            alignment.
+        similarities: sequence of six score values indexed in the same order.
+        label: two labels for the real and simulated point sets.
+        value: molecule/spectrum identifier used in subplot titles.
+
+    Returns:
+        None.
+
+    Side effects:
+        Opens a matplotlib figure via ``plt.show()``.
+
+    NOTE (known issue, left unchanged): a single ``assigment`` array based on
+    ``len(min_sum_1)`` is reused for every subplot. When other alignment
+    variants have a different number of points, indexing them with it either
+    misaligns the lines or raises IndexError.
+    """
+
     assigment = np.array(range(len(min_sum_1)))
     fig, axs = plt.subplots(3, 2)
 
@@ -637,8 +917,31 @@ def plot_all_similarities(min_sum_1, min_sum_2, \
 
     
 def calculate_tanimoto_from_two_smiles(smi1, smi2, nbits, extra_info = True):
-    """This function takes two smile_stings and 
-    calculates the Tanimoto similarity and returns it and prints it out"""
+    """Compute (and optionally print) the Tanimoto similarity of two SMILES.
+
+    Builds Morgan fingerprints (radius 2, ``nbits`` bits) for both molecules
+    and returns a rounded Tanimoto coefficient together with a combined ID.
+
+    Args:
+        smi1: first SMILES string.
+        smi2: second SMILES string.
+        nbits: fingerprint length in bits.
+        extra_info: when True, also prints the score (see NOTE below).
+
+    Returns:
+        Tuple ``(ids_compared, tan_sim)`` where ``ids_compared`` is
+        ``smi1 + "_" + smi2`` and ``tan_sim`` is rounded to four decimals.
+
+    Side effects:
+        Prints a summary when ``extra_info`` is True.
+
+    NOTE (known issue, left unchanged): both the print statement and the
+    ``ids_compared`` expression reference ``selection_list``, which is not
+    defined in this module. With ``extra_info == True`` the function raises
+    NameError on the print line; with ``extra_info == False`` it raises
+    NameError on the ID line. The function is therefore unusable as written
+    and appears to be a leftover from a notebook global.
+    """
     
     pattern1 = Chem.MolFromSmiles(smi1)
     pattern2 = Chem.MolFromSmiles(smi2)
@@ -655,7 +958,24 @@ def calculate_tanimoto_from_two_smiles(smi1, smi2, nbits, extra_info = True):
     
     
 def plot_correlation_plot_conf(all_H_data_non_zero_T, all_C_data_non_zero_T, conf_num, mode):
-    """ This function plots a correlation plot of H and C comparing real to simulated datapoints"""
+    """Plot H and C correlation scatter plots for a given conformer index.
+
+    For both nuclei it scatters real vs simulated shifts, fits a linear
+    regression, and annotates R² and MAE. ``conf_num`` is only used in the
+    title; the plot order is fixed (H first, then C).
+
+    Args:
+        all_H_data_non_zero_T: two-row array ``[real_H, simulated_H]``.
+        all_C_data_non_zero_T: two-row array ``[real_C, simulated_C]``.
+        conf_num: conformer number shown in the titles.
+        mode: alignment mode shown in the titles.
+
+    Returns:
+        None (the function falls through after the second ``plt.show()``).
+
+    Side effects:
+        Opens two matplotlib figures via ``plt.show()``.
+    """
     plt.scatter(all_H_data_non_zero_T[0], all_H_data_non_zero_T[1], alpha=0.15)
     m, b = np.polyfit(all_H_data_non_zero_T[0], all_H_data_non_zero_T[1], 1)
     plt.plot(all_H_data_non_zero_T[0], m*all_H_data_non_zero_T[0]+b, color='red')
@@ -690,7 +1010,24 @@ def plot_correlation_plot_conf(all_H_data_non_zero_T, all_C_data_non_zero_T, con
     
     
 def plot_correlation_plot(all_H_data_non_zero_T, all_C_data_non_zero_T, sim_tech, mode):
-    """ This function plots a correlation plot of H and C comparing real to simulated datapoints"""
+    """Plot H/C correlation scatter plots for a simulation technique.
+
+    Identical to ``plot_correlation_plot_conf`` but titles mention
+    ``sim_tech`` instead of a conformer number, and the H/C MAE values are
+    returned.
+
+    Args:
+        all_H_data_non_zero_T: two-row array ``[real_H, simulated_H]``.
+        all_C_data_non_zero_T: two-row array ``[real_C, simulated_C]``.
+        sim_tech: simulation technique label used in the titles.
+        mode: alignment mode used in the titles.
+
+    Returns:
+        Tuple ``(MAE_H, MAE_C)`` of mean absolute errors.
+
+    Side effects:
+        Opens two matplotlib figures via ``plt.show()``.
+    """
     plt.scatter(all_H_data_non_zero_T[0], all_H_data_non_zero_T[1], alpha=0.15)
     m, b = np.polyfit(all_H_data_non_zero_T[0], all_H_data_non_zero_T[1], 1)
     plt.plot(all_H_data_non_zero_T[0], m*all_H_data_non_zero_T[0]+b, color='red')
@@ -727,7 +1064,22 @@ def plot_correlation_plot(all_H_data_non_zero_T, all_C_data_non_zero_T, sim_tech
 
     
 def plot_compare_scatter_plot_without_direction(df_orig, df_sim, name="Plot", transp=0.50):
-    """Plots scatter plot from two dataframes on top of each other.
+    """Overlay two HSQC peak sets as scatter plots (real vs simulated).
+
+    Axes are fixed to 1H 0-11 ppm and 13C 0-200 ppm and inverted so the usual
+    NMR orientation is preserved.
+
+    Args:
+        df_orig: real spectrum DataFrame with ``F2 (ppm)``/``F1 (ppm)``.
+        df_sim: simulated spectrum DataFrame with the same columns.
+        name: plot title.
+        transp: alpha (opacity) for the scatter points.
+
+    Returns:
+        None.
+
+    Side effects:
+        Opens a matplotlib figure via ``plt.show()``.
     """
     fig, ax = plt.subplots(figsize=(10,5), dpi=80)
     scatter_x_1 = list(np.array(df_orig['F2 (ppm)'].astype(float)))
@@ -751,7 +1103,22 @@ def plot_compare_scatter_plot_without_direction(df_orig, df_sim, name="Plot", tr
 
     
 def plot_compare_scatter_plot_without_direction_all(df_real, df_acd, df_mnova, df_dft, df_ml, labels, transp=0.50):
-    """Plots scatter plot from all simulation techniques on top of each other.
+    """Overlay real and four simulated HSQC peak sets in one scatter plot.
+
+    Args:
+        df_real: experimental spectrum DataFrame (``F2``/``F1`` ppm columns).
+        df_acd: ACD-simulated spectrum DataFrame.
+        df_mnova: MNova-simulated spectrum DataFrame.
+        df_dft: DFT-simulated spectrum DataFrame.
+        df_ml: ML-predicted spectrum DataFrame.
+        labels: five legend labels ordered as real, ACD, MNova, DFT, ML.
+        transp: alpha (opacity) for the simulated points.
+
+    Returns:
+        None.
+
+    Side effects:
+        Opens a matplotlib figure via ``plt.show()``.
     """
     fig, ax = plt.subplots(figsize=(10,5), dpi=80)
     scatter_x_1 = list(np.array(df_real['F2 (ppm)'].astype(float)))
@@ -788,21 +1155,36 @@ def plot_compare_scatter_plot_without_direction_all(df_real, df_acd, df_mnova, d
     
      
 def correct_dft_calc_sdf_file(file_path):
-    """Corrects an SDF file with DFT-calculated NMR data.
-    
+    """Correct an SDF file containing DFT-calculated NMR data.
+
+    Rewrites the ``atom.dprop.Isotropic sheilding`` property tag into a
+    Python-attribute-safe name, strips surrounding brackets from the
+    ``averaged_NMR_shifts`` (and shielding) properties, adds explicit
+    hydrogens with coordinates, and writes the record back to the same file.
+
     This function opens an SDF file with DFT-calculated NMR data, replaces a specific line in the file, and
     saves the modified file. It also corrects the averaged NMR shifts property if necessary. Finally, it adds
     the H atoms to the SDF file from the corresponding .mol file and saves the modified SDF file under the
     same name.
-    
+
     Parameters:
     -----------
     file_path: str
         The path to the SDF file to be corrected.
-        
+
     Returns:
     --------
     None
+
+    Side effects:
+        Overwrites ``file_path`` in place. Reads and then rewrites the file
+        twice (raw text edit, then SDF write).
+
+    NOTE (known issue, left unchanged): this function uses ``PandasTools`` and
+    ``rdkit.Chem.PandasTools`` but neither ``PandasTools`` nor the ``rdkit``
+    package name is imported at module level (only ``from rdkit import Chem,
+    ...``). At runtime it therefore raises NameError as soon as it reaches
+    ``PandasTools.LoadSDF``.
     """
     
     # Open the SDF file
@@ -850,11 +1232,25 @@ def correct_dft_calc_sdf_file(file_path):
 
 
 def copy_specific_files(src, dst):
-    """Parameters:
+    """Recursively copy selected NMR files from ``src`` into ``dst``.
+
+    Creates ``dst`` (and each visited sub-directory) if needed, recurses into
+    sub-folders except ``nmr``, ``e``, ``opt`` and ``conf``, and copies only
+    files whose name starts with ``HMDB`` or starts with ``SEL_`` and ends with
+    ``.sdf``.
+
+    Parameters:
 
     src: str - The path to the source directory.
     dst: str - The path to the destination directory.
     The function creates the destination directory if it doesn't exist. Then it iterates through the subfolders and files in the source directory. If the item is a subfolder, it calls this function recursively. If the item is a file and matches the desired filename pattern (starting with "HMDB" or starting with "SEL_" and ending with ".sdf"), it copies the file to the corresponding location in the destination directory.
+
+    Returns:
+        None.
+
+    Side effects:
+        Creates directories and copies files with ``shutil.copy2`` (preserving
+        metadata). ``nmr``, ``e``, ``opt`` and ``conf`` sub-trees are skipped.
     """
     
     # Create the destination directory if it doesn't exist
@@ -887,9 +1283,22 @@ def copy_specific_files(src, dst):
 
 def convert_to_standardized_smiles(smiles):
     """
-    Standardize smiles for Molformer
-    param smiles: A SMILES string.
-    return: A SMILES string.
+    Standardize smiles for Molformer.
+
+    Parses without sanitisation, takes the charge parent, standardises with
+    ``molvs`` and re-serialises with isomeric information retained. Explicit
+    hydrogens ``[H]`` are removed by recursion.
+
+    Args:
+        smiles: A SMILES string.
+
+    Returns:
+        A standardised SMILES string with no explicit ``[H]``. Note that this
+        variant keeps stereochemistry (``isomericSmiles=True``), unlike the
+        copy in ``molformer_functions``.
+
+    Side effects:
+        None.
     """
     mol = MolFromSmiles(smiles, sanitize=False)
     mol = ChargeParent(mol)

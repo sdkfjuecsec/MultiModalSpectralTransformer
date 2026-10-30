@@ -1,3 +1,24 @@
+"""Molformer-based molecule generation helpers.
+
+This module wraps the external ``deep-molecular-optimization`` (Molformer)
+code base so that the NMR pipeline can generate structurally related
+molecules ("analogues") for a given input SMILES string.
+
+Responsibilities:
+    * resolve the path to the vendored Molformer package at import time,
+    * define the ``GenerateRunner`` class that loads a trained Molformer
+      checkpoint and samples valid, drug-like analogues,
+    * provide small RDKit utility helpers (standardisation, Murcko scaffolds,
+      Lipinski filtering),
+    * expose ``main_molformer(config)`` as the single entry point used by the
+      rest of the project.
+
+The module performs import-time side effects (``sys.path`` mutation,
+``argparse`` parser construction, global matplotlib/warnings settings).
+Importing it therefore requires the vendored package and RDKit dependencies
+to be installed.
+"""
+
 import argparse
 import copy
 import glob
@@ -68,10 +89,21 @@ warnings.filterwarnings('ignore')
 IPythonConsole.ipython_useSVG = True
 
 def convert_to_standardized_smiles(smiles):
-    """
-    Standardize smiles for Molformer
-    param smiles: A SMILES string.
-    return: A SMILES string.
+    """Standardize a SMILES string into the form expected by Molformer.
+
+    The molecule is parsed without sanitisation, reduced to its charge parent,
+    then standardised with ``molvs`` and re-serialised without stereo
+    information. If explicit hydrogens ``[H]`` remain in the output the
+    function recurses until they disappear.
+
+    Args:
+        smiles: A (possibly non-canonical) SMILES string.
+
+    Returns:
+        A standardised, non-isomeric SMILES string (no explicit ``[H]``).
+
+    Side effects:
+        None. Recursion depth is bounded by the number of explicit hydrogens.
     """
     mol = MolFromSmiles(smiles, sanitize=False)
     mol = ChargeParent(mol)
@@ -84,6 +116,15 @@ def convert_to_standardized_smiles(smiles):
     
 
 def calculate_scaffold(smile):
+    """Return the canonical Murcko scaffold SMILES of a molecule.
+
+    Args:
+        smile: SMILES string of the full molecule.
+
+    Returns:
+        The canonical SMILES of the Murcko scaffold, or an empty string when
+        the molecule cannot be parsed or its scaffold is invalid/empty.
+    """
     mol = Chem.MolFromSmiles(smile)
     if mol:
         try:
@@ -97,6 +138,18 @@ def calculate_scaffold(smile):
 
     
 def follows_lipinski(smiles):
+    """Check whether a molecule passes a relaxed Lipinski "rule of five".
+
+    Rules evaluated: H-bond donors <= 5, H-bond acceptors <= 10,
+    exact molecular weight < 550 (relaxed from 500), and logP <= 5.
+    The molecule is accepted when it violates at most one rule.
+
+    Args:
+        smiles: SMILES string to evaluate.
+
+    Returns:
+        True when the SMILES parses and has <= 1 violation, otherwise False.
+    """
     mol = Chem.MolFromSmiles(smiles)
     if not mol:
         return False
@@ -124,8 +177,26 @@ def follows_lipinski(smiles):
 
 
 class GenerateRunner():
+    """Load a trained Molformer checkpoint and sample molecule analogues.
+
+    A runner owns the output directory, the loaded vocabulary/tokenizer and
+    the logger. ``generate(opt)`` iterates the test CSV, calls ``sample`` for
+    every batch and writes the generated SMILES back into a CSV.
+    """
 
     def __init__(self, opt):
+        """Initialise output paths, logging, vocabulary and tokenizer.
+
+        Args:
+            opt: argparse namespace produced by ``generate_opts``. Must expose
+                ``save_directory``, ``test_file_name``, ``epoch`` and
+                ``vocab_path``.
+
+        Side effects:
+            Creates ``experiments/<save_directory>/<test_file_name>/
+            evaluation_<epoch>`` indirectly via the logger file handler and
+            sets the module-global ``LOG``.
+        """
 
         self.save_path = os.path.join('experiments', opt.save_directory, opt.test_file_name,
                                       f'evaluation_{opt.epoch}')
@@ -149,11 +220,22 @@ class GenerateRunner():
 
     def initialize_dataloader(self, opt, vocab, test_file):
         """
-        Initialize dataloader
-        :param opt:
-        :param vocab: vocabulary
-        :param test_file: test_file_name
-        :return:
+        Initialize dataloader that feeds the source molecules into Molformer.
+
+        Args:
+            opt: argparse namespace; uses ``data_path``, ``prediction_mode``,
+                ``without_property`` and ``batch_size``.
+            vocab: SMILES vocabulary used to encode/decode tokens.
+            test_file: CSV file stem (without extension) inside ``data_path``.
+
+        Returns:
+            A torch ``DataLoader`` over ``models.dataset.Dataset`` yielding
+            collated batches with the source token matrix and a metadata
+            DataFrame.
+
+        Side effects:
+            Reads ``<data_path>/<test_file>.csv`` from disk; prints the
+            namespace and a progress marker.
         """
         print(opt)
         # Read test
@@ -169,6 +251,22 @@ class GenerateRunner():
         return dataloader
 
     def generate(self, opt):
+        """Generate analogues for every row of the configured test CSV.
+
+        Loads the model selected by ``opt.model_choice``, decodes
+        ``opt.num_generations`` analogues per source molecule and stores them
+        as ``Predicted_smi_<n>`` columns next to the original metadata.
+
+        Args:
+            opt: argparse namespace produced by ``generate_opts``.
+
+        Returns:
+            None.
+
+        Side effects:
+            Writes ``generated_molecules.csv`` into ``self.save_path`` and
+            logs progress through the module-global ``LOG``.
+        """
         print("generate start")
         # import IPython; IPython.embed(); exit(1)
 
@@ -223,6 +321,9 @@ class GenerateRunner():
         sampled_smiles_list = np.array(sampled_smiles_list)
         sampled_smiles_list = [list(lst) if isinstance(lst, np.ndarray) else lst for lst in sampled_smiles_list]
 
+        # Rows can hold a different number of analogues, so pad each list to the
+        # longest one before transposing. The transposed matrix has one row per
+        # generation index and one column per source molecule.
         max_length = max(len(lst) for lst in sampled_smiles_list)
         padded_smiles_list = [lst + [None] * (max_length - len(lst)) for lst in sampled_smiles_list]
         transposed_smiles = list(map(list, zip(*padded_smiles_list)))
@@ -233,6 +334,11 @@ class GenerateRunner():
             try:
                 data_sorted['Predicted_smi_{}'.format(i + 1)] = transposed_smiles[i]
             except:
+                # NOTE (known issue, left unchanged): if a batch produced fewer
+                # rows than num_generations (transposed_smiles is shorter than
+                # opt.num_generations), this raises IndexError; the bare except
+                # swallows it and the remaining Predicted_smi_* columns are
+                # silently omitted from the output CSV.
                 print("fail")
                 continue
 
@@ -245,6 +351,52 @@ class GenerateRunner():
 
     def sample(self, model_choice, model, src, src_mask, source_length, decode_type, without_property, num_generations=10, delta_weight=30, tanimoto_filter=0.2, filter_higher=1, max_trials=100,
                max_len=cfgd.DATA_DEFAULT['max_sequence_length'], isomericSmiles=False, device=None, max_scaffold_generations=10):
+        """Sample up to ``num_generations`` analogues per source molecule.
+
+        The routine repeatedly decodes 10 sequences from the current source
+        molecule and keeps those that are valid, Lipinski-compliant, differ in
+        molecular weight by less than ``delta_weight``, are new, and satisfy the
+        Tanimoto filter (above ``tanimoto_filter`` when ``filter_higher == 1``,
+        below it when ``filter_higher == 0``). Generated molecules are grouped
+        by Murcko scaffold; when a scaffold reaches
+        ``max_scaffold_generations`` the source is switched to a molecule from
+        a less populated scaffold to encourage diversity.
+
+        Args:
+            model_choice: ``'transformer'`` (only supported branch).
+            model: already loaded (and, for transformer, eval-mode) model.
+            src: LongTensor of source token ids, shape ``(batch, seq_len)``.
+            src_mask: attention mask matching ``src``.
+            source_length: per-row source lengths (unused here).
+            decode_type: decoder sampling strategy string.
+            without_property: whether property tokens are absent.
+            num_generations: target number of analogues per source molecule.
+            delta_weight: maximum allowed absolute molecular-weight difference.
+            tanimoto_filter: initial similarity threshold.
+            filter_higher: 1 to require similarity above the threshold, 0 below.
+            max_trials: maximum decode attempts per source molecule.
+            max_len: maximum decoded sequence length.
+            isomericSmiles: passed to canonicalisation.
+            device: torch device for the model inputs.
+            max_scaffold_generations: cap of molecules sharing one scaffold.
+
+        Returns:
+            Tuple ``(smiles_lists, scaffold_dict)`` where ``smiles_lists`` is
+            one list of generated SMILES per source molecule and
+            ``scaffold_dict`` is the scaffold grouping of the last processed
+            molecule.
+
+        Side effects:
+            Progress bars/prints, and mutates ``tanimoto_filter`` locally when
+            no alternative scaffold is available. Note that ``src_current``,
+            ``mask_current`` and the returned ``scaffold_dict`` are (re)assigned
+            inside the loop, so the returned grouping only reflects the last
+            source molecule.
+        """
+        # NOTE (known issue, left unchanged): ``src`` is dereferenced here before
+        # the later ``if src is not None`` guard. Calling with src=None raises
+        # AttributeError immediately; the guard below is therefore unreachable
+        # for that case.
         batch_size = src.shape[0]
         batch_index = torch.LongTensor(range(batch_size))
         batch_index_current = torch.LongTensor(range(batch_size)).to(device)
@@ -287,6 +439,11 @@ class GenerateRunner():
                         print(current_trials)
                     current_trials += 1
                     scaffold_trials += 1
+                    # NOTE (known issue, left unchanged): only the transformer
+                    # branch assigns ``sequences``. With model_choice ==
+                    # 'seq2seq' the name is undefined, raising NameError that
+                    # the bare except below swallows; the loop then spins until
+                    # max_trials without generating anything.
                     if model_choice == 'transformer':
                         try:
                             #import IPython; IPython.embed();
@@ -424,6 +581,11 @@ class GenerateRunner():
                                     tanimoto_filter = min(tanimoto_filter + 0.1, 1)  # Ensuring filter doesn't exceed one
 
                 print(f"Num generations: {num_generations}")
+                # NOTE (known issue, left unchanged): the comparison is inverted.
+                # When fewer than num_generations were found no padding happens
+                # (the list stays short), and when enough were found the range
+                # is empty so the line is a no-op. Consequently downstream
+                # transposition sees ragged rows and may drop columns.
                 if len(smiles_list) >= num_generations:
                     smiles_list = smiles_list + ["NAN" for i in range(num_generations-len(smiles_list))]
                 smiles_lists.append(smiles_list)
@@ -432,6 +594,27 @@ class GenerateRunner():
         return smiles_lists, scaffold_dict
 
     def sample_seq2seq(self, model, mask, batch_index_current, decoder_hidden, encoder_outputs, max_len, device):
+        """Greedy/ancestral decoding loop for a seq2seq model (legacy helper).
+
+        Repeatedly feeds the previous token through the decoder and samples the
+        next token from the softmax distribution.
+
+        Args:
+            model: seq2seq ``Model`` exposing ``network.decoder``.
+            mask: encoder padding mask.
+            batch_index_current: indices of the rows still being generated.
+            decoder_hidden: initial decoder hidden state (tensor or tuple).
+            encoder_outputs: encoder states for the selected rows.
+            max_len: number of decoding steps.
+            device: torch device.
+
+        Returns:
+            LongTensor of token ids with shape ``(batch, max_len)``.
+
+        Side effects:
+            None beyond allocating tensors on ``device``. Not called by the
+            current ``sample`` implementation.
+        """
         # batch size will change when some of the generated molecules are valid
         encoder_outputs_current = encoder_outputs.index_select(0, batch_index_current)
         batch_size = encoder_outputs_current.shape[0]
@@ -484,7 +667,23 @@ class GenerateRunner():
 #     return ExactMolWt(m)
 
 def check_delta_weights(data_sorted):
-    """This function is to check the weight differences between target and generated molecule used in molformer notebook"""
+    """Print the molecular-weight difference for every generated molecule.
+
+    Debug helper used in the Molformer notebook: for every ``SMILES`` row it
+    iterates the ``Predicted_smi_*`` columns and prints
+    ``source_weight - generated_weight``.
+
+    Args:
+        data_sorted: DataFrame with a ``SMILES`` column and one or more
+            ``Predicted_smi_*`` columns.
+
+    Returns:
+        None.
+
+    Side effects:
+        Prints one difference per comparable column; unparsable/invalid
+        entries are silently skipped by a bare ``except``.
+    """
     for i in range(len(data_sorted["SMILES"])):
         source = data_sorted.iloc[i]["SMILES"]
 
@@ -500,6 +699,19 @@ def check_delta_weights(data_sorted):
                 
 
 def generate_opts(parser):
+    """Register all CLI options used by ``GenerateRunner`` on ``parser``.
+
+    Args:
+        parser: an ``argparse.ArgumentParser`` instance (normally the module
+            level ``parser``).
+
+    Returns:
+        None.
+
+    Side effects:
+        Mutates ``parser`` in place by adding arguments/groups. This is called
+        at import time immediately after ``parser`` is created.
+    """
     # Transformer or Seq2Seq
     parser.add_argument('--model-choice', required=True, help="transformer or seq2seq")
     """Input output settings"""
@@ -532,6 +744,9 @@ def generate_opts(parser):
                        help="""0=False, 1=True; If it should generate lower or higher tanimoto values""")
     group.add_argument('--max-scaffold-generations', type=int, default=10, 
                        help="""defines the maximum number of generated molecules with the same scaffold""")                       
+    # NOTE (known issue, left unchanged): ``action="store_false"`` combined with
+    # ``default=False`` means the flag can only ever be False (passing it also
+    # sets False), so isomeric SMILES can never be enabled from the CLI.
     group.add_argument('--isomericSmiles', default=False,
                        help='isomericSmiles', action="store_false")     
     group.add_argument('--max-trials', type=int, default=100,
@@ -546,6 +761,25 @@ generate_opts(parser)
 
 
 def prep_dataframe_with_generated_molecules(csv_file):    
+    """Reshape the generated-molecules CSV into one column per source molecule.
+
+    The CSV produced by ``GenerateRunner.generate`` stores one source molecule
+    per row with ``Predicted_smi_*`` columns. This helper pivots that layout so
+    each source molecule becomes a column named by its ``sample-id``, holding
+    ``SMILES`` followed by all generated analogues.
+
+    Args:
+        csv_file: path to ``generated_molecules.csv``.
+
+    Returns:
+        DataFrame whose columns are sample ids and whose rows are the original
+        molecule plus each generation index.
+
+    Side effects:
+        Reads ``csv_file`` from disk. Columns named ``sample-id`` are required.
+        Note that rows with differing lengths cannot be represented column-wise;
+        the loop assumes every row yields the same number of entries.
+    """
     df = pd.read_csv(csv_file)
     df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
     # columns_ = [f"Predicted_smi_{i}" for i in range(1,len(df.columns)-1)]
@@ -569,11 +803,44 @@ def prep_dataframe_with_generated_molecules(csv_file):
 
 
 def worker_init_fn(worker_id):
+    """Seed numpy and ``random`` per DataLoader worker for reproducibility.
+
+    Args:
+        worker_id: worker index supplied by torch's DataLoader.
+
+    Returns:
+        None.
+
+    Side effects:
+        Sets the global numpy and Python ``random`` seeds from the worker's
+        torch seed. ``worker_id`` itself is unused.
+    """
     np.random.seed(torch.initial_seed() % (2**32))
     random.seed(torch.initial_seed() % (2**32))
     
     
 def load_data(config, mode, stoi, stoi_MF, itos, itos_MF):
+    """Load the multimodal dataset and write its SMILES to the Molformer CSV.
+
+    Iterates a batch-size-1 DataLoader, decodes each target SMILES, canonicalises
+    it and assigns a random ``MF_<id>`` sample id. The result is written to
+    ``<config.MF_csv_source_folder_location>/<config.MF_csv_source_file_name>.csv``
+    and also returned, so the same file can be consumed by Molformer.
+
+    Args:
+        config: experiment config exposing the ``MF_csv_source_*`` paths.
+        mode: dataset split mode (e.g. ``'train'``/``'val'``/``'test'``).
+        stoi/stoi_MF: token-to-index maps for SMILES and molecular formula.
+        itos/itos_MF: index-to-token maps (only ``itos`` is used here).
+
+    Returns:
+        DataFrame with columns ``SMILES`` and ``sample-id``.
+
+    Side effects:
+        Reads the dataset, writes the CSV to disk, prints unparsable SMILES.
+    Note ``drop_last=True`` with ``batch_size=1`` silently discards the final
+    sample of the dataset.
+    """
     data = MultimodalData(config, stoi, stoi_MF, mode=mode)
     dataloader = DataLoader(data, 
                                 batch_size=1, 
@@ -695,6 +962,28 @@ def load_data(config, mode, stoi, stoi_MF, itos, itos_MF):
 
 
 def main_molformer(config):
+    """Generate analogues with Molformer and return them as a DataFrame.
+
+    Runs one generation pass per method listed in ``config.MF_methods``
+    (``'MMP'`` for matched-molecular-pair generation and ``'scaffold'`` for
+    scaffold hopping), rebuilds the CLI argument list from the config, invokes
+    ``GenerateRunner`` for each method and merges the resulting per-molecule
+    DataFrames.
+
+    Args:
+        config: experiment config providing ``MF_methods`` plus the
+            ``MF_*`` / ``max_scaffold_generations`` hyper-parameters listed
+            below.
+
+    Returns:
+        DataFrame combining the generated molecules from all selected methods
+        (one column per sample id).
+
+    Side effects:
+        Runs model inference, writes ``generated_molecules.csv`` files under
+        ``experiments/...`` and reads them back. Note that both branches reuse
+        ``test_file_name`` and ``data_path`` overrides from ``config``.
+    """
     df_samples_MMP = pd.DataFrame()
     df_samples_scaffold = pd.DataFrame()
 

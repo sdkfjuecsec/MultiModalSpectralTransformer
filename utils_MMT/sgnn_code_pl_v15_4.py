@@ -1,3 +1,22 @@
+"""Inference helpers for the NMR message-passing graph neural network (SGNN).
+
+The module converts RDKit molecules into the sparsified DGL graphs expected by
+the pretrained ``nmr_mpnn_PROPOSED`` models, runs 13C and 1H shift prediction,
+and writes the predicted shifts back into SDF files.
+
+High-level pipeline (``main_execute``):
+    1. ``save_as_npy_for_13C`` / ``save_as_npy_for_1H`` featurise each molecule
+       and dump an intermediate ``.npz`` file in the system temp directory.
+    2. ``load_model`` loads the matching pretrained checkpoint per nucleus.
+    3. ``inference_C`` / ``inference_H`` run the forward pass.
+    4. ``create_shift_list`` re-assembles per-atom shifts and
+       ``save_results_sdf_file`` writes them into a ``NMR_<id>.sdf`` record.
+
+Import-time side effects: RDKit logging is disabled, the chemical feature
+factory is built, DGL/RDKit keys are registered and a fixed random seed
+constant is defined. Global hyper-parameters at module level are defaults only;
+the ``save_as_npy_*`` functions re-declare their own local copies.
+"""
 
 # Standard library imports
 import argparse
@@ -103,9 +122,23 @@ readout_n_hidden_dim = 512
 
 def mol_with_atom_index(mol, include_H=True):
     """
+    Label every atom with its index so the mapping can be drawn.
+
     Takes a mol as input and adds H to them
     Visualizes the number which is assigned to which atom as a mol
     if include_H is True then H will be added and also labeled in the mol file
+
+    Args:
+        mol: RDKit ``Mol`` instance.
+        include_H: add explicit hydrogens (with coordinates) before labelling.
+
+    Returns:
+        The same ``Mol`` object with a ``molAtomMapNumber`` property on every
+        atom, suitable for ``moltosvg`` / RDKit drawing.
+
+    Side effects:
+        Mutates the passed molecule in place when ``include_H`` is False; when
+        True a new hydrogen-added copy is returned.
     """
     # mol = MolFromSmiles(smiles)
     if include_H:
@@ -118,6 +151,21 @@ def mol_with_atom_index(mol, include_H=True):
 
 
 def moltosvg(mol, molSize = (300,300), kekulize = True):
+    """Render a molecule as an inline SVG string for notebook display.
+
+    Args:
+        mol: RDKit ``Mol`` to draw.
+        molSize: ``(width, height)`` of the SVG canvas in pixels.
+        kekulize: attempt aromatic kekulisation before drawing; if it fails the
+            original (possibly aromatic) molecule is used.
+
+    Returns:
+        SVG markup as a ``str`` with the ``svg:`` namespace prefixes removed
+        so it can be embedded directly in HTML/Jupyter output.
+
+    Side effects:
+        None; 2D coordinates are computed on an internal copy only.
+    """
     mc = Chem.Mol(mol.ToBinary())
     if kekulize:
         try:
@@ -134,9 +182,25 @@ def moltosvg(mol, molSize = (300,300), kekulize = True):
 
 
 def mol2SDF(mol, folder=None, name=None):
-    """ Saves a smile to a given folder with a given name/ID in sdf format
-    adding the H is crutial for the ICOLOS workflow
-    ir no name is provided then it saves it under a random number"""
+    """Write one molecule to ``<folder>/<name>.sdf``.
+
+    The molecule itself is written unchanged; callers are responsible for
+    adding explicit hydrogens beforehand (required by the ICOLOS workflow).
+    The default folder is ``../../trash`` relative to the script, created if
+    missing.
+
+    Args:
+        mol: RDKit ``Mol`` instance.
+        folder: destination directory; defaults to ``<script>/../../trash``.
+        name: file stem; a random 4-digit number when omitted.
+
+    Returns:
+        Full path of the written ``.sdf`` file.
+
+    Side effects:
+        Creates the destination directory (``exist_ok=True``) and writes the
+        file.
+    """
     #print("mol2SDF")
     #import IPython; IPython.embed();
     
@@ -163,9 +227,35 @@ def mol2SDF(mol, folder=None, name=None):
 
 
 def get_molecule_data(compound_path):
-    """ This function returns the list of atoms of the molecules
+    """Parse an SDF file manually and reconstruct the RDKit molecule.
+
+    This function returns the list of atoms of the molecules
     and a list of strings with each line of the compound document as one string
-    because reading the SDF files with pandas causes an error"""
+    because reading the SDF files with pandas causes an error
+
+    The atom block and the bond/connectivity block are parsed as plain text
+    (rather than with RDKit/pandas), the atom list is written out as a
+    companion ``.mol`` file, and the molecule is then loaded from it.
+
+    Args:
+        compound_path: path to a ``.sdf`` file. The extension is assumed to be
+            exactly three characters because ``[:-4]`` is used to build the
+            companion ``.mol`` path.
+
+    Returns:
+        Tuple ``(atom_list, connectivity_list, docline_list, name, mol)``:
+        element symbols per atom, raw bond rows, all file lines, the file stem,
+        and the parsed RDKit molecule.
+
+    Side effects:
+        Writes ``<compound_path without extension>.mol`` next to the input.
+
+    NOTE (known issue, left unchanged): ``name`` is derived with
+    ``split("/")[-1]``, so on Windows (paths use ``\\``) the "name" becomes the
+    whole path. Also ``counter`` is only initialised when a ``V2000`` line is
+    found; absence of that marker leaves the atom listing empty instead of
+    raising a clear error.
+    """
 
     ################ atom_list ################
     index_list_C =[]
@@ -244,8 +334,27 @@ def get_molecule_data(compound_path):
 
 # Get C-H connectivity dict with index starting from 0 to correct it to python convention
 def get_x_h_connectivity(connectivity_list, atom_list):
-    """ This function checks the connectifity list and creates a dictionary with all the
-    X atoms that are connected to hydrogens with their labelled numbers"""
+    """ Build a mapping of heavy atoms to the hydrogens bonded to them.
+
+    This function checks the connectifity list and creates a dictionary with all the
+    X atoms that are connected to hydrogens with their labelled numbers
+
+    Args:
+        connectivity_list: rows of the SDF bond block, each a list/tuple of
+            atom indices (1-based) plus bond metadata.
+        atom_list: element symbol per atom, indexed from 0.
+
+    Returns:
+        Dict ``{heavy_atom_index: [hydrogen_indices...]}`` for every X-H bond
+        where X is C, N, O, P or S. Indices are converted to 0-based.
+
+    Side effects:
+        None.
+
+    Note: the ``type(...) == list`` statements are no-ops; the code relies on
+    the KeyError of the first access to initialise the list, which works but
+    is fragile.
+    """
     x_h_connectivity_dict = {}
     for i in connectivity_list:
         selected_atom_nr = int(i[0])-1
@@ -278,7 +387,17 @@ def get_x_h_connectivity(connectivity_list, atom_list):
 
 
 def _DA(mol):
+    """Return the donor and acceptor atom indices of a molecule.
 
+    Uses RDKit's ``BaseFeatures.fdef`` chemical feature factory: atoms of
+    family ``Donor`` and ``Acceptor`` are collected.
+
+    Args:
+        mol: RDKit ``Mol``.
+
+    Returns:
+        Tuple ``(D_list, A_list)`` of integer atom indices.
+    """
     D_list, A_list = [], []
     for feat in chem_feature_factory.GetFeaturesForMol(mol):
         if feat.GetFamily() == 'Donor': D_list.append(feat.GetAtomIds()[0])
@@ -287,7 +406,15 @@ def _DA(mol):
     return D_list, A_list
 
 def _chirality(atom):
+    """Encode tetrahedral chirality of one atom as two boolean flags.
 
+    Args:
+        atom: RDKit ``Atom``.
+
+    Returns:
+        ``[is_Tet_CW, is_Tet_CCW]`` when a ``Chirality`` property exists,
+        otherwise ``[0, 0]``.
+    """
     if atom.HasProp('Chirality'):
         c_list = [(atom.GetProp('Chirality') == 'Tet_CW'), (atom.GetProp('Chirality') == 'Tet_CCW')]
     else:
@@ -297,7 +424,15 @@ def _chirality(atom):
 
 
 def _stereochemistry(bond):
+    """Encode double-bond cis/trans stereochemistry as two boolean flags.
 
+    Args:
+        bond: RDKit ``Bond``.
+
+    Returns:
+        ``[is_Bond_Cis, is_Bond_Trans]`` when a ``Stereochemistry`` property
+        exists, otherwise ``[0, 0]``.
+    """
     if bond.HasProp('Stereochemistry'):
         s_list = [(bond.GetProp('Stereochemistry') == 'Bond_Cis'), (bond.GetProp('Stereochemistry') == 'Bond_Trans')]
     else:
@@ -306,7 +441,31 @@ def _stereochemistry(bond):
     return s_list
 
 def add_mol_sparsified_graph(mol_dict, mol, x_h_connectivity_dict=None):
+    """Append one molecule's graph features to an accumulating dict.
 
+    Builds the node feature matrix by one-hot encoding element, charge,
+    degree, hybridisation, hydrogen count, valence, donor/acceptor status,
+    chirality, ring sizes and aromaticity, and (when bonds exist) the doubled
+    edge list/edge features for the sparsified graph representation. Shift
+    values and masks are read from atom properties.
+
+    Args:
+        mol_dict: accumulator dict of lists (see ``save_as_npy_*``).
+        mol: RDKit ``Mol`` whose atoms carry ``shift``/``mask`` properties.
+        x_h_connectivity_dict: heavy-atom-to-hydrogen mapping for this
+            molecule, stored for the 1H loader.
+
+    Returns:
+        The same ``mol_dict`` with one entry appended to each list.
+
+    Side effects:
+        Mutates ``mol_dict`` in place.
+
+    NOTE (known issue, left unchanged): the module-level ``mol_dict`` declares
+    the key ``'h_c_connectivity'`` whereas this function appends to
+    ``'h_x_connectivity'``. Using that module-level dict raises KeyError; the
+    ``save_as_npy_*`` functions avoid it by declaring the correct key locally.
+    """
     n_node = mol.GetNumAtoms()
     n_edge = mol.GetNumBonds() * 2
 
@@ -359,13 +518,37 @@ def add_mol_sparsified_graph(mol_dict, mol, x_h_connectivity_dict=None):
 # Python code to merge dict using a single
 # expression
 def Merge(dict1, dict2):
+    """Merge two dictionaries into a new one (keys of ``dict2`` win).
+
+    Args:
+        dict1: base mapping.
+        dict2: mapping overriding/extending ``dict1``.
+
+    Returns:
+        A new dict combining both; inputs are left unchanged.
+    """
     res = {**dict1, **dict2}
     return res
 
 ########################################## Dataset Class ##########################################
 class GraphDataset_sample():
+    """Single (or batched) sample dataset backed by a saved ``.npz`` graph dict.
+
+    Used for inference only: it loads the intermediate file produced by
+    ``save_as_npy_for_13C``/``save_as_npy_for_1H`` and reconstructs one DGL
+    graph per molecule on demand.
+    """
 
     def __init__(self, target, file_path):
+        """Load the graph dictionary from an ``.npz`` file.
+
+        Args:
+            target: ``"13C"`` or ``"1H"``; selects how shifts are returned.
+            file_path: path to the ``.npz`` created by ``save_as_npy_*``.
+
+        Side effects:
+            Reads the file eagerly via :meth:`load`.
+        """
 
         self.target = target
         # self.graph_representation = graph_representation
@@ -375,6 +558,19 @@ class GraphDataset_sample():
 
 
     def load(self):
+        """Read the ``.npz`` file and split concatenated arrays per molecule.
+
+        Populates node/edge features, bond endpoints, shifts, masks and the
+        H-connectivity list, and precomputes cumulative node/edge offsets
+        (``n_csum``/``e_csum``) used to slice per-molecule views.
+
+        Returns:
+            None.
+
+        Side effects:
+            Reads ``self.file_path`` and sets instance attributes. For 1H the
+            connectivity list is also stored as ``self.h_x_connectivity``.
+        """
         if self.target == "13C":
             [mol_dict] = np.load(self.file_path, allow_pickle=True)['data']
         elif self.target == "1H":
@@ -399,6 +595,23 @@ class GraphDataset_sample():
 
 
     def __getitem__(self, idx):
+        """Build the DGL graph and target tensors for molecule ``idx``.
+
+        Args:
+            idx: molecule index within the loaded sample.
+
+        Returns:
+            Tuple ``(g, n_node, numHshifts, shift_test, shift, mask)``:
+            the DGL graph with ``node_attr``/``edge_attr``, node count, number
+            of hydrogens per heavy atom, the zero placeholder shifts used for
+            inference, the stored shift values and the boolean mask.
+
+        Side effects:
+            None (tensors are created per call).
+
+        Note for 1H: ``shift``/``shift_test`` are filled with zeros because
+        the model predicts new shifts rather than reusing stored ones.
+        """
         g = graph((self.src[self.e_csum[idx]:self.e_csum[idx+1]], self.dst[self.e_csum[idx]:self.e_csum[idx+1]]), num_nodes = self.n_node[idx])
         g.ndata['node_attr'] = torch.from_numpy(self.node_attr[self.n_csum[idx]:self.n_csum[idx+1]]).float()
         g.edata['edge_attr'] = torch.from_numpy(self.edge_attr[self.e_csum[idx]:self.e_csum[idx+1]]).float()
@@ -420,7 +633,7 @@ class GraphDataset_sample():
 
 
     def __len__(self):
-
+        """Return the number of molecules stored in the sample."""
         return self.n_node.shape[0]
 
 
@@ -429,7 +642,22 @@ class GraphDataset_sample():
 # Load Model
 
 def load_std_mean(target,graph_representation):
-    """This functions returns the train_y_mean, train_y_std of the train dataset for either H or C"""
+    """Return the training-set mean and standard deviation of shifts.
+
+    This functions returns the train_y_mean, train_y_std of the train dataset for either H or C
+
+    Args:
+        target: ``"1H"`` or ``"13C"``; selects the graph dataset.
+        graph_representation: graph representation name passed to
+            ``GraphDataset`` (e.g. ``"sparsified"``).
+
+    Returns:
+        Tuple ``(train_y_mean, train_y_std)`` computed over all training
+        shifts (numpy scalars).
+
+    Side effects:
+        Reads the training dataset from disk and builds a temporary DataLoader.
+    """
     #Load Train data (to get the train_y_mean and std)
     batch_size = 128
     data = GraphDataset(target, graph_representation)
@@ -439,7 +667,29 @@ def load_std_mean(target,graph_representation):
     return train_y_mean, train_y_std
 
 def load_model(target, save_path):
-    """ """
+    """Instantiate and load the pretrained SGNN model for a nucleus.
+
+    The input dimensions are inferred from a sample file, then the matching
+    ``<target>_sparsified_proposed_proposed_1.pt`` checkpoint is located
+    (with several alternative directories tried) and loaded into
+    ``nmr_mpnn_PROPOSED``.
+
+    Args:
+        target: ``"1H"`` or ``"13C"``.
+        save_path: path to a sample file readable by ``GraphDataset_sample``,
+            used only to determine node/edge feature dimensions.
+
+    Returns:
+        The loaded ``nmr_mpnn_PROPOSED`` network (in eval-agnostic train mode).
+
+    Side effects:
+        Reads files from disk and prints path resolution messages.
+
+    NOTE (known issue, left unchanged): the network is moved with ``.cuda()``
+    unconditionally, so this fails on CPU-only machines. ``torch.load`` is
+    also called without ``map_location``, so a checkpoint saved on GPU cannot
+    be loaded on CPU.
+    """
     node_embedding_dim = 256
     node_hidden_dim = 512
     readout_n_hidden_dim = 512
@@ -499,7 +749,30 @@ def load_model(target, save_path):
 ########################################## C related ##########################################
 
 def save_as_npy_for_13C(mol_list):
-    """ This functions executes all the code for creating the npy file for inference"""
+    """Featurise molecules for 13C inference and save an intermediate ``.npz``.
+
+    For each molecule: add hydrogens, write a temporary SDF, parse it back to
+    recover the explicit atom/bond ordering, derive C-H connectivity, restore
+    stereochemistry properties, set a zero shift and a mask of 1 for every
+    carbon (mask 0 otherwise), and accumulate the sparsified graph features.
+    The concatenated arrays are then written to
+    ``<tempdir>/sample_<rand>_13C.npz``.
+
+    Args:
+        mol_list: list of RDKit ``Mol`` objects (usually from SMILES).
+
+    Returns:
+        Path to the written ``.npz`` file.
+
+    Side effects:
+        Creates temporary SDF files (via ``mol2SDF``) and the ``.npz`` file;
+        prints nothing but relies on RDKit logging being disabled.
+
+    NOTE (known issue, left unchanged): ``np.vstack`` is used for
+    ``edge_attr`` unconditionally. A molecule with no bonds never appends an
+    edge array (see ``add_mol_sparsified_graph``), so such input makes the
+    stack fail with a ValueError.
+    """
 
     x_h_connectivity_dict_list = []
     target = "13C" #"1H"
@@ -604,6 +877,22 @@ def save_as_npy_for_13C(mol_list):
 
 
 def inference_C(net, save_path, train_y_mean_C, train_y_std_C):
+    """Run 13C shift inference for the sample stored at ``save_path``.
+
+    Args:
+        net: loaded 13C ``nmr_mpnn_PROPOSED`` network.
+        save_path: ``.npz`` sample produced by ``save_as_npy_for_13C``.
+        train_y_mean_C: training mean used to un-standardise predictions.
+        train_y_std_C: training std used to un-standardise predictions.
+
+    Returns:
+        Array of predicted 13C shifts (one per carbon, in graph order).
+
+    Side effects:
+        Builds a DataLoader (batch size from the module-level ``batch_size``)
+        and runs a forward pass. Timing is produced by ``inference`` but only
+        the predictions are returned.
+    """
     # Load data sample
     target = "13C"
 
@@ -618,6 +907,26 @@ def inference_C(net, save_path, train_y_mean_C, train_y_std_C):
 ########################################## H related ##########################################
 
 def save_as_npy_for_1H(mol_list):
+    """Featurise molecules for 1H inference and save an intermediate ``.npz``.
+
+    Mirrors ``save_as_npy_for_13C`` but selects atoms that carry hydrogens
+    (via the X-H connectivity dict) as masked prediction targets, and stores
+    the connectivity dicts so shifts can be reassembled later.
+
+    Args:
+        mol_list: list of RDKit ``Mol`` objects.
+
+    Returns:
+        Tuple ``(save_path, x_h_connectivity_dict_list)``: the ``.npz`` path
+        and one connectivity dict per molecule.
+
+    Side effects:
+        Creates temporary SDF files and the ``.npz`` file.
+
+    NOTE (known issue, left unchanged): like the 13C variant, ``np.vstack``
+    over ``edge_attr`` fails for a bond-less molecule because no edge array
+    was appended in that case.
+    """
     length = len(mol_list)
 
     x_h_connectivity_dict_list = []
@@ -728,6 +1037,21 @@ def save_as_npy_for_1H(mol_list):
 
 
 def inference_H(net, save_path, train_y_mean_H, train_y_std_H):
+    """Run 1H shift inference for the sample stored at ``save_path``.
+
+    Args:
+        net: loaded 1H ``nmr_mpnn_PROPOSED`` network.
+        save_path: ``.npz`` sample produced by ``save_as_npy_for_1H``.
+        train_y_mean_H: training mean used to un-standardise predictions.
+        train_y_std_H: training std used to un-standardise predictions.
+
+    Returns:
+        Array of predicted 1H shifts.
+
+    Side effects:
+        Builds a DataLoader and runs a forward pass; only predictions are
+        returned.
+    """
     # Load data sample
     target = "1H" #"13C"
     data_sample = GraphDataset_sample(target, save_path)
@@ -741,7 +1065,30 @@ def inference_H(net, save_path, train_y_mean_H, train_y_std_H):
 ########################################## Reconstruct ##########################################
 
 def create_shift_list(mol, x_h_connectivity_dict, test_y_pred_C, test_y_pred_H):
-    """This function recreates the shift list based on the index labelling of the molecule (including H atoms)"""
+    """Re-assemble a per-atom shift list from C and H predictions.
+
+    This function recreates the shift list based on the index labelling of the molecule (including H atoms)
+
+    Walks the (hydrogen-added) molecule in atom order: carbons consume the
+    next 13C prediction, hydrogens consume one 1H prediction per bonded heavy
+    atom group, and all other elements get 0.
+
+    Args:
+        mol: RDKit ``Mol`` including explicit hydrogens.
+        x_h_connectivity_dict: heavy-atom-to-hydrogen index mapping.
+        test_y_pred_C: predicted 13C shifts, ordered by carbon.
+        test_y_pred_H: predicted 1H shifts.
+
+    Returns:
+        List of shifts, one per atom (index-aligned with ``mol.GetAtoms()``).
+
+    Side effects:
+        Prints diagnostic dumps on exception (bare ``except``) and returns the
+        partially built ``final_list`` in that case.
+
+    Note: all hydrogens of one heavy atom receive the same prediction
+    (``test_y_pred_H[h_count]``) and ``h_count`` advances once per heavy atom.
+    """
     try:
         final_list = []
         c_count = 0
@@ -778,8 +1125,15 @@ def create_shift_list(mol, x_h_connectivity_dict, test_y_pred_C, test_y_pred_H):
 
 
 def get_shift_string(assigned_shifts):
-    """ This function just converts the the nmr shifts to one long
-    string that can ve saved in the sdf file"""
+    """Convert a shift list into the single space-separated SDF property line.
+
+    Args:
+        assigned_shifts: iterable of numeric shifts (one per atom).
+
+    Returns:
+        A string of the form ``"a b c"`` followed by a newline, ready to be
+        written as the value of ``averaged_NMR_shifts``.
+    """
     string = ""
     for idx,shift in enumerate(assigned_shifts):
         string = string + " " + str(shift)
@@ -788,7 +1142,32 @@ def get_shift_string(assigned_shifts):
 
 
 def save_results_sdf_file(mol, save_folder, ID, final_list):
-    """ This function saves the final shift predictions into a SDF files with the lowest energy conformer"""
+    """Write an SDF record with the predicted shifts as an ``NMR_<ID>.sdf``.
+
+    This function saves the final shift predictions into a SDF files with the lowest energy conformer
+
+    The molecule is first written with ``mol2SDF`` and then copied line by
+    line into ``NMR_<ID>.sdf``; after the ``M  END`` marker an
+    ``averaged_NMR_shifts`` data field is inserted.
+
+    Args:
+        mol: RDKit ``Mol`` (typically with explicit hydrogens).
+        save_folder: destination directory.
+        ID: sample identifier used in the output filename and record.
+        final_list: per-atom shifts produced by ``create_shift_list``.
+
+    Returns:
+        Path to the written ``NMR_<ID>.sdf``.
+
+    Side effects:
+        Writes two SDF files (the intermediate ``<ID>.sdf`` and the final
+        ``NMR_<ID>.sdf``).
+
+    NOTE (known issue, left unchanged): the shift block is only inserted when
+    a line is exactly ``'M  END\n'``. On Windows-style files terminated with
+    ``'M  END\r\n'`` the comparison fails, so the shifts are silently omitted
+    from the output SDF.
+    """
 
     sdf_path = mol2SDF(mol, save_folder, ID)
 
@@ -810,7 +1189,18 @@ def save_results_sdf_file(mol, save_folder, ID, final_list):
 
 
 def split_predictions(test_y_pred, n_shifts):
-    """ This function splits up the predictions of the batch into a list of lists that contain just the predictions for each molecule in separate lists"""
+    """Split a flat prediction array into per-molecule chunks.
+
+    This function splits up the predictions of the batch into a list of lists that contain just the predictions for each molecule in separate lists
+
+    Args:
+        test_y_pred: flat array of predictions for the whole batch.
+        n_shifts: iterable giving the number of predictions for each molecule,
+            in batch order.
+
+    Returns:
+        List of sub-arrays, one per molecule.
+    """
     split_atom_pred = []
     start_index = 0
 
@@ -822,6 +1212,20 @@ def split_predictions(test_y_pred, n_shifts):
 
 
 def count_atoms(mol_list, mol_dict):
+    """Count carbons and hydrogen-bearing heavy atoms per molecule.
+
+    Args:
+        mol_list: list of RDKit ``Mol`` objects (hydrogen-free input molecules).
+        mol_dict: graph dict containing ``h_x_connectivity`` per molecule.
+
+    Returns:
+        Tuple ``(c_list, h_list)``: carbon counts and counts of heavy atoms
+        bonded to at least one hydrogen, both in input order. ``h_list`` is
+        used to split the 1H predictions.
+
+    Side effects:
+        None; ``mol_list`` entries are copied by ``Chem.AddHs``.
+    """
     c_list = []  # list to store carbon counts
     h_list = []  # list to store hydrogen counts
 
@@ -851,20 +1255,63 @@ def count_atoms(mol_list, mol_dict):
     return c_list, h_list
 
 class MoleculeDataset(Dataset):
+    """Minimal torch Dataset wrapping a ``SMILES``/``sample-id`` DataFrame."""
+
     def __init__(self, data_df):
+        """Store the source DataFrame.
+
+        Args:
+            data_df: DataFrame with ``SMILES`` and ``sample-id`` columns.
+        """
         self.data_df = data_df
 
     def __len__(self):
+        """Return the number of molecules in the DataFrame."""
         return len(self.data_df)
 
     def __getitem__(self, idx):
+        """Return ``(SMILES, sample_id)`` for row ``idx`` as strings.
+
+        Args:
+            idx: positional row index (``iloc``).
+        """
         return self.data_df.iloc[idx]["SMILES"], str(self.data_df.iloc[idx]["sample-id"])
 
 ########################################## Main Execution Function ##########################################
 
 def main_execute(data_df, means_stds, ML_save_folder, batch_size):
-    """ Given a pandas dataframe with columns SMILES and sample-id it calculates
-    all the sdf files including the nmr shifts for every C and H atom"""
+    """Predict 13C/1H shifts for a batch and write SDF files.
+
+    Given a pandas dataframe with columns SMILES and sample-id it calculates
+    all the sdf files including the nmr shifts for every C and H atom
+
+    For each DataLoader batch the function featurises molecules, loads the C
+    and H models, runs inference, splits predictions per molecule, rebuilds
+    per-atom shifts and writes one SDF per molecule. Individual batch failures
+    are caught, reported and their sample ids returned.
+
+    Args:
+        data_df: DataFrame with ``SMILES`` and ``sample-id``.
+        means_stds: tuple ``(mean_C, std_C, mean_H, std_H)`` from
+            ``load_std_mean``.
+        ML_save_folder: destination directory for the SDF files.
+        batch_size: DataLoader batch size.
+
+    Returns:
+        Tuple ``(batch_data, failed_ids)``: a DataFrame with columns
+        ``sample-id``/``sdf_path``/``SMILES`` for successful molecules, and a
+        list of ids whose batch failed.
+
+    Side effects:
+        Writes SDF files and removes the temporary ``.npz`` files after each
+        successful batch.
+
+    NOTE (known issue, left unchanged): the ``.npz`` cleanup runs only on the
+    success path. If an exception occurs after ``save_as_npy_*`` created the
+    files, they are left behind in the temp directory. The exception handler
+    also references ``IDs``, which could be unbound if the failure happens
+    before the batch is unpacked.
+    """
     ############## General ##############
     (train_y_mean_C, train_y_std_C, train_y_mean_H, train_y_std_H) = means_stds
     SMILES_list = data_df["SMILES"]

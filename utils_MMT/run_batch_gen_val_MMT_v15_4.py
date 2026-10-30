@@ -1,3 +1,24 @@
+"""Batch generation and validation routines for the multimodal NMR pipeline.
+
+Exposes the helpers used to generate candidate SMILES from the multimodal
+transformer, score them with the CLIP model, and additionally evaluate
+Tanimoto similarity plus SGNN-based HSQC/COSY spectral errors:
+
+    * ``run_MMT_generations`` - multinomial sampling with temperature
+      annealing, returns the best-scoring analogues per target.
+    * ``run_test_performance_CLIP*`` - several validation variants (multinomial
+      and greedy decoding) that build ``results_dict``.
+    * ``plot_hist_of_results*`` - Tanimoto histograms from those results.
+
+Import-time side effects (important for callers):
+    * a random seed is drawn and applied to torch/numpy/random,
+    * the SGNN training mean/std for 13C and 1H are loaded from disk (through
+      ``sgnn.load_std_mean``), which reads the training dataset.
+
+The module assumes CUDA is available in several places (tensors are moved to
+``"cuda"`` explicitly); see the individual docstrings.
+"""
+
 # Standard library imports
 import operator
 import random
@@ -31,6 +52,8 @@ import utils_MMT.helper_functions_pl_v15_4 as hf
 
 
 # Constants and Random Seed Initialization
+# NOTE (known issue, left unchanged): ``SEED = 42`` is immediately overwritten
+# by a random draw, so runs are NOT reproducible despite the re-seeding below.
 SEED = 42
 SEED = random.randint(0,1000)
 print(SEED)
@@ -54,12 +77,41 @@ sgnn_means_stds = (train_y_mean_C, train_y_std_C, train_y_mean_H, train_y_std_H)
 
 
 def worker_init_fn(worker_id):
+    """Seed numpy and ``random`` in each DataLoader worker.
+
+    Args:
+        worker_id: worker index supplied by torch (unused; the torch seed is).
+
+    Returns:
+        None.
+
+    Side effects:
+        Sets the global numpy/Python random seeds from the worker's torch seed.
+    """
     np.random.seed(torch.initial_seed() % (2**32))
     random.seed(torch.initial_seed() % (2**32))
     
 ##3change batch
 def load_data_and_CLIP_model(config, mode, stoi, stoi_MF, itos, itos_MF, single=True):
-    
+    """Build the validation DataLoader and load the CLIP checkpoint.
+
+    Args:
+        config: experiment config (``batch_size``, ``CLIP_model_path``,
+            ``device``).
+        mode: dataset split (``"val"`` in the callers).
+        stoi/stoi_MF: token-to-index maps passed to ``MultimodalData``.
+        itos/itos_MF: index-to-token maps (unused here).
+        single: batch size 1 when True, otherwise ``config.batch_size``.
+
+    Returns:
+        Tuple ``(CLIP_model, val_dataloader)`` with the model moved to
+        ``config.device``.
+
+    Side effects:
+        Reads the dataset and checkpoint from disk; uses ``drop_last=True``
+        (the final partial batch is discarded).
+    """
+
     # Loading the test dataset and dataloader
     val_data = MultimodalData(config, stoi, stoi_MF, mode=mode)
     if single:
@@ -91,12 +143,37 @@ def load_data_and_CLIP_model(config, mode, stoi, stoi_MF, itos, itos_MF, single=
 
 # Function to duplicate tensor
 def duplicate_tensor(tensor, n_times):
+    """Repeat a tensor ``n_times`` along its first (batch/sequence) dimension.
+
+    Args:
+        tensor: input tensor.
+        n_times: replication factor.
+
+    Returns:
+        The repeated tensor, moved to ``"cuda"``.
+
+    Side effects:
+        None on the input.
+
+    NOTE (known issue, left unchanged): the device is hard-coded to ``"cuda"``
+    instead of ``config.device``, so this fails on CPU-only systems even when
+    the model otherwise runs on CPU.
+    """
     repeat_dims = [n_times] + [1] * (tensor.dim() - 1)
     duplicated_tensor = tensor.repeat(*repeat_dims)
     return duplicated_tensor.to("cuda")
 
 # Function to duplicate tensor
 def duplicate_dict(data_dict, n_times):
+    """Duplicate every tensor in a batch dict ``n_times`` (see above).
+
+    Args:
+        data_dict: mapping of key to tensor.
+        n_times: replication factor.
+
+    Returns:
+        New dict with each tensor repeated; non-tensor values would fail.
+    """
     # Dictionary to hold duplicated tensors
     duplicated_dict = {}
     # Duplicating tensors within each key of the dictionary
@@ -108,6 +185,16 @@ def duplicate_dict(data_dict, n_times):
 
 # Function to filter valid SMILES
 def filter_valid_smiles_and_canonicolize(smiles_list, canonical=True, isomericSmiles=False):
+    """Parse, canonicalise and keep only valid SMILES.
+
+    Args:
+        smiles_list: iterable of SMILES strings (invalid ones are dropped).
+        canonical: canonicalise output with RDKit.
+        isomericSmiles: keep stereochemistry when writing SMILES.
+
+    Returns:
+        List of valid canonical SMILES, preserving input order.
+    """
     valid_smiles = []
     for smi in smiles_list:
         mol = Chem.MolFromSmiles(smi)
@@ -119,6 +206,31 @@ def filter_valid_smiles_and_canonicolize(smiles_list, canonical=True, isomericSm
 
 # Multinomial
 def multinomial_sequence_multi(model, memory, src_padding_mask, stoi, config):
+    """Autoregressively sample token sequences with multinomial decoding.
+
+    Starts from ``<SOS>`` and, for ``config.max_len`` steps, computes the
+    decoder distribution (scaled by ``config.temperature``) and samples one
+    token per sequence until ``<EOS>``.
+
+    Args:
+        model: multimodal transformer exposing ``embed_trg``/``pe_trg``/
+            ``decoder``/``fc_out``.
+        memory: encoder memory, shape ``(src_len, batch, d_model)``.
+        src_padding_mask: encoder padding mask.
+        stoi: token-to-index map (uses ``"<SOS>"``).
+        config: config with ``device``, ``max_len``, ``temperature``.
+
+    Returns:
+        Tuple ``(multinom_tensor, multinom_token_prob)``: sampled token ids
+        ``(max_len, batch)`` without the leading ``<SOS>``, and the stacked
+        probability of each chosen token.
+
+    Side effects:
+        Puts ``model`` in eval mode and consumes random numbers for sampling.
+
+    Note: sampling does not stop early on ``<EOS>``; full-length sequences are
+    always produced.
+    """
     # Initialization
 
     model.eval()
@@ -159,6 +271,23 @@ def multinomial_sequence_multi(model, memory, src_padding_mask, stoi, config):
 
 
 def add_tanimoto_similarity(trg_conv_SMI, combined_list):
+    """Append the Tanimoto similarity to each generated molecule entry.
+
+    Args:
+        trg_conv_SMI: target SMILES used as the reference fingerprint.
+        combined_list: list of ``[smiles, loss, cosine]`` entries (mutated).
+
+    Returns:
+        The same ``combined_list`` where each valid entry gains a fourth
+        element (the Tanimoto score).
+
+    Side effects:
+        Mutates the inner lists in place; prints nothing.
+
+    NOTE (known issue, left unchanged): invalid generated SMILES are skipped,
+    leaving those entries with only three elements. A later sort keyed on
+    index 3 then raises IndexError for such entries.
+    """
     # Generate fingerprint for the ground truth molecule
     ground_truth_mol = Chem.MolFromSmiles(trg_conv_SMI)
     ground_truth_fp = AllChem.GetMorganFingerprintAsBitVect(ground_truth_mol, 2, nBits=512)
@@ -175,6 +304,18 @@ def add_tanimoto_similarity(trg_conv_SMI, combined_list):
 
 
 def calculate_molecular_weights(smiles_list):
+    """Compute exact molecular weights for a list of SMILES.
+
+    Args:
+        smiles_list: iterable of SMILES strings.
+
+    Returns:
+        List with one exact molecular weight per input; ``None`` for SMILES
+        that RDKit cannot parse.
+
+    Side effects:
+        Shows a tqdm progress bar and prints failures.
+    """
     molecular_weights = []  # List to store the molecular weights
     for smiles in tqdm(smiles_list):  # tqdm displays a progress bar
         mol = Chem.MolFromSmiles(smiles)  # Convert SMILES to Mol object
@@ -187,6 +328,19 @@ def calculate_molecular_weights(smiles_list):
     return molecular_weights
 
 def prepare_HSQC_data_from_src(src_HSQC_list):
+    """Flatten HSQC source tensors and rescale them to ppm-like coordinates.
+
+    Args:
+        src_HSQC_list: list of batches, each containing per-molecule HSQC
+            tensors of shape ``(seq, 2)``.
+
+    Returns:
+        List of 2-column tensors (1H scaled by 10, 13C scaled by 200) for
+        molecules with at least one non-zero row; an empty list otherwise.
+
+    Side effects:
+        None.
+    """
     tensor_HSQC = []
     for src_HSQC in src_HSQC_list:
         for src in src_HSQC:
@@ -205,6 +359,19 @@ def prepare_HSQC_data_from_src(src_HSQC_list):
     return tensor_HSQC
 
 def prepare_COSY_data_from_src(src_COSY_list):
+    """Flatten COSY source tensors and rescale both dimensions by 10.
+
+    Args:
+        src_COSY_list: list of batches, each containing per-molecule COSY
+            tensors of shape ``(seq, 2)``.
+
+    Returns:
+        List of 2-column tensors (both axes scaled by 10) for molecules with
+        at least one non-zero row; an empty list otherwise.
+
+    Side effects:
+        None.
+    """
     tensor_COSY = []
     for src_COSY in src_COSY_list:
         for src in src_COSY:
@@ -223,6 +390,24 @@ def prepare_COSY_data_from_src(src_COSY_list):
     return tensor_COSY
 
 def add_HSQC_COSY_error(config, combined_list, data_dict_dup, gen_conv_SMI_list, _trg_conv_SMI, n_times):
+    """Compute Tanimoto and HSQC/COSY SGNN errors and append them per candidate.
+
+    Args:
+        config: experiment config forwarded to the SGNN error routine.
+        combined_list: list of candidate entries (mutated in place).
+        data_dict_dup: duplicated batch containing ``src_HSQC``/``src_COSY``.
+        gen_conv_SMI_list: generated SMILES for this target.
+        _trg_conv_SMI: target SMILES.
+        n_times: number of candidates to score.
+
+    Returns:
+        Tuple ``(combined_list, batch_data)``: entries gain a fifth element
+        ``[HSQC_error, COSY_error]`` (or ``9`` when the per-candidate lookup
+        fails), plus spectra batch data from the SGNN step.
+
+    Side effects:
+        Runs SGNN inference (may write temp files) and mutates the input list.
+    """
     src_HSQC_list = [data_dict_dup["src_HSQC"]]
     src_COSY_list = [data_dict_dup["src_COSY"]]
     tensor_HSQC = prepare_HSQC_data_from_src(src_HSQC_list)
@@ -426,8 +611,39 @@ def add_HSQC_COSY_error(config, combined_list, data_dict_dup, gen_conv_SMI_list,
 # Number of times to duplicate each tensor
 
 def run_MMT_generations(config, MMT_model, CLIP_model, dataloader, stoi, itos, sort_num):
-    """ sort_num -> 3 = taniomoto, 4 = HSQC error, 3 = Cosine sim, 2 = Clip Loss
-    just runs Multinomial sampling
+    """Generate, score and rank analogues for every target in the dataloader.
+
+    For each batch: duplicate the encoder inputs ``config.MMT_batch`` times,
+    run the multimodal encoder, sample with
+    ``multinomial_sequence_multi`` until at least ``config.MMT_generations``
+    distinct valid SMILES are found (raising the temperature every 10 rounds
+    and restoring it afterwards), score with CLIP, add Tanimoto and
+    HSQC/COSY SGNN errors, then sort descending by ``sort_num``.
+
+    Args:
+        config: config exposing ``MMT_batch``, ``MMT_generations``,
+            ``n_samples``, ``temperature`` and ``device``.
+        MMT_model: multimodal transformer.
+        CLIP_model: CLIP scoring model.
+        dataloader: validation DataLoader yielding batch dicts.
+        stoi/itos: token maps.
+        sort_num: index of the ranking key within each candidate entry
+            (3 = Tanimoto for the ``add_tanimoto_similarity`` layout).
+
+    Returns:
+        ``defaultdict(list)`` mapping target SMILES to
+        ``[sorted_list, batch_data]``.
+
+    Side effects:
+        Mutates ``config.MMT_batch`` and temporarily ``config.temperature``.
+        Runs CLIP/SGNN inference (SGNN may create temporary files).
+
+    NOTE (known issues, left unchanged):
+        * ``config.MMT_batch`` is permanently lowered when
+          ``MMT_generations < MMT_batch`` and never restored.
+        * ``if i == config.n_samples: break`` stops after index ``n_samples``,
+          so ``n_samples + 1`` batches are processed (off-by-one if the value
+          is intended as a count).
     """
     results_dict = defaultdict(list)
     # generate all the smiles of trg and greedy gen
@@ -439,6 +655,9 @@ def run_MMT_generations(config, MMT_model, CLIP_model, dataloader, stoi, itos, s
         trg_conv_SMI = hf.tensor_to_smiles(trg_enc_SMI[1:], itos)
 
         ### multiply the input to paralellize the generation
+        # NOTE (known issue, left unchanged): this permanently mutates
+        # config.MMT_batch for the rest of the run; the original value is never
+        # restored.
         if config.MMT_generations < config.MMT_batch:
             config.MMT_batch = config.MMT_generations 
         data_dict_dup = duplicate_dict(data_dict, config.MMT_batch)
@@ -472,11 +691,16 @@ def run_MMT_generations(config, MMT_model, CLIP_model, dataloader, stoi, itos, s
 
 
         combined_list = add_tanimoto_similarity(trg_conv_SMI, combined_list)
+        # NOTE (known issue, left unchanged): ``add_HSQC_error`` is not defined
+        # or imported anywhere in this module (the local equivalent is named
+        # ``add_HSQC_COSY_error``), so this line raises NameError.
         combined_list, batch_data = add_HSQC_error(config, combined_list, data_dict_dup, gen_conv_SMI_list, trg_conv_SMI, config.MMT_batch)
         #import IPython; IPython.embed();
         sorted_list = sorted(combined_list, key=lambda x: -x[sort_num]) # sort by highest tanimoto similarity
 
         results_dict[trg_conv_SMI] = [sorted_list, batch_data]
+        # NOTE (known issue, left unchanged): equality against n_samples means
+        # batches 0..n_samples inclusive are processed (n_samples + 1 results).
         if i == config.n_samples:
             break
     return results_dict
@@ -486,7 +710,30 @@ def run_test_performance_CLIP(config,
                          stoi_MF, 
                          itos, 
                          itos_MF):
+    """Multinomial validation run using both CLIP and MMT models.
 
+    Loads the CLIP model/dataloader, then replaces the dataloader with one
+    from ``vgmmt.load_data_and_MMT_model``, samples ``config.multinom_runs``
+    candidates per target, scores them and sorts by Tanimoto (index 3).
+
+    Args:
+        config: experiment config (``multinom_runs``, ``temperature``,
+            ``CLIP_model_path``, ``device``).
+        stoi/stoi_MF/itos/itos_MF: token maps.
+
+    Returns:
+        ``defaultdict(list)`` mapping target SMILES to
+        ``[sorted_list, batch_data]``.
+
+    Side effects:
+        Loads checkpoints/datasets, runs inference and temporarily changes
+        ``config.temperature``.
+
+    Note: the dataloader returned by ``load_data_and_CLIP_model`` is discarded
+    and replaced by the MMT loader; ``model_MMT`` taken from the CLIP wrapper
+    is likewise overwritten. Also ``add_HSQC_error`` is undefined in this
+    module, so scoring raises NameError (see ``run_MMT_generations``).
+    """
     mode = "val"
     CLIP_model, val_dataloader = load_data_and_CLIP_model(config, 
                                                             mode, 
@@ -544,6 +791,8 @@ def run_test_performance_CLIP(config,
         #sorted_list = sorted(combined_list, key=lambda x: x[1])
         #import IPython; IPython.embed();
         combined_list = add_tanimoto_similarity(trg_conv_SMI, combined_list)
+        # NOTE (known issue, left unchanged): undefined name; see the Note in
+        # ``run_MMT_generations`` (NameError).
         combined_list, batch_data = add_HSQC_error(config, combined_list, data_dict_dup, gen_conv_SMI_list, trg_conv_SMI, config.multinom_runs) # config.MMT_batch
 
         sorted_list = sorted(combined_list, key=lambda x: -x[3]) # SMILES = 0, losses =1, dot_sim= 2, tanimoto = 3 
@@ -559,7 +808,24 @@ def run_test_performance_CLIP_greedy(config,
                          stoi_MF, 
                          itos, 
                          itos_MF):
+    """Greedy-decoding validation run with CLIP and MMT models.
 
+    For each target, decodes one greedy sequence, scores it with CLIP, adds
+    Tanimoto and HSQC/COSY errors, and sorts by index 3 (Tanimoto).
+
+    Args:
+        config: experiment config.
+        stoi/stoi_MF/itos/itos_MF: token maps.
+
+    Returns:
+        ``defaultdict(list)`` mapping target SMILES to
+        ``[sorted_list, batch_data]``.
+
+    Side effects:
+        Loads checkpoints/datasets and runs inference. ``add_HSQC_error`` is
+        undefined in this module, so scoring raises NameError (see
+        ``run_MMT_generations``).
+    """
     mode = "val"
     CLIP_model, val_dataloader = load_data_and_CLIP_model(config, 
                                                                 mode, 
@@ -604,6 +870,8 @@ def run_test_performance_CLIP_greedy(config,
         #sorted_list = sorted(combined_list, key=lambda x: x[1])
         
         combined_list = add_tanimoto_similarity(trg_conv_SMI, combined_list)
+        # NOTE (known issue, left unchanged): undefined name; see the Note in
+        # ``run_MMT_generations`` (NameError).
         combined_list, batch_data = add_HSQC_error(config, combined_list, data_dict_dup, gen_conv_SMI_list, trg_conv_SMI, config.MMT_batch)
 
         sorted_list = sorted(combined_list, key=lambda x: -x[3]) # SMILES = 0, losses =1, dot_sim= 2, tanimoto = 3 
@@ -615,6 +883,21 @@ def run_test_performance_CLIP_greedy(config,
     return results_dict
 
 def calculate_HSQC_COSY_error(config, data_dict_dup, gen_conv_SMI):
+    """Score generated SMILES against the source HSQC/COSY via SGNN simulation.
+
+    Args:
+        config: experiment config forwarded to the SGNN routine.
+        data_dict_dup: duplicated batch containing ``src_HSQC``/``src_COSY``.
+        gen_conv_SMI: one generated SMILES (or a list of them) to score.
+
+    Returns:
+        Tuple ``(avg_HSQC, avg_COSY, list_HSQC, list_COSY, batch_data)`` from
+        the SGNN similarity calculations.
+
+    Side effects:
+        Builds a DataFrame with random sample ids and runs SGNN inference
+        (may create temporary files).
+    """
     succ_gen_list = []
     
     src_HSQC_list = [data_dict_dup["src_HSQC"]]
@@ -632,8 +915,24 @@ def calculate_HSQC_COSY_error(config, data_dict_dup, gen_conv_SMI):
 
 
 def try_calculate_tanimoto_from_two_smiles(smi1, smi2, nbits, extra_info = False):
-    """This function takes two smile_stings and 
-    calculates the Tanimoto similarity and returns it and prints it out"""
+    """Tanimoto similarity of two SMILES, returning ``None`` on any error.
+
+    This function takes two smile_stings and 
+    calculates the Tanimoto similarity and returns it and prints it out
+
+    Args:
+        smi1: first SMILES.
+        smi2: second SMILES.
+        nbits: Morgan fingerprint length.
+        extra_info: print the score and the two SMILES.
+
+    Returns:
+        Rounded Tanimoto coefficient (float) or ``None`` if either SMILES is
+        invalid (bare except).
+
+    Side effects:
+        Optionally prints a summary.
+    """
     
     try:
         pattern1 = Chem.MolFromSmiles(smi1)
@@ -655,7 +954,29 @@ def run_test_performance_CLIP_greedy2(config,
                          stoi_MF, 
                          itos, 
                          itos_MF):
+    """Greedy validation returning per-target scores and failed generations.
 
+    For each target it decodes one greedy SMILES, computes the Tanimoto score,
+    CLIP losses/cosine and SGNN HSQC/COSY errors, and stores the combined
+    result. Generations whose SMILES cannot be parsed are collected in the
+    ``failed`` list.
+
+    Args:
+        config: experiment config.
+        stoi/stoi_MF/itos/itos_MF: token maps.
+
+    Returns:
+        Tuple ``(results_dict, failed)``: mapping target -> ``[combined_list,
+        batch_data]``, and a list of ``[target, generated, combined_list,
+        batch_data]`` for failed cases.
+
+    Side effects:
+        Loads checkpoints/datasets and runs CLIP/SGNN inference.
+
+    NOTE (known issue, left unchanged): this calls ``run_model(...)`` which is
+    NOT defined or imported in this module (the only definition is
+    commented out). Every invocation raises NameError at the first batch.
+    """
     mode = "val"
     CLIP_model, val_dataloader = load_data_and_CLIP_model(config, 
                                                                 mode, 
@@ -710,7 +1031,28 @@ def run_test_performance_CLIP_2(config,
                          stoi_MF, 
                          itos, 
                          itos_MF):
+    """Aggregate sequence-probability statistics over the validation set.
 
+    Calls ``vgmmt.calculate_corr_max_multinom_prob`` (greedy count 1) and
+    returns the mean/sum of the correlated, max and multinomial probabilities,
+    grouped by aggregation mode.
+
+    Args:
+        config: experiment config.
+        stoi/stoi_MF/itos/itos_MF: token maps (only ``stoi``/MMT loader used).
+
+    Returns:
+        Dict with keys ``statistics_multiplication_avg``,
+        ``statistics_multiplication_sum`` and ``statistics_avg_avg``, each a
+        three-element list.
+
+    Side effects:
+        Loads the MMT model/dataloader and runs inference.
+
+    NOTE (known issue, left unchanged): the ``try`` block computes the
+    ``final_prob_*`` variables, but on failure the ``except`` only prints, so
+    the subsequent ``total_results`` assignments raise UnboundLocalError.
+    """
     mode = "val"
     # CLIP_model, val_dataloader = load_data_and_CLIP_model(config, 
     #                                                             mode, 
@@ -821,6 +1163,26 @@ def run_test_performance_CLIP_2(config,
 from io import BytesIO
 import base64
 def plot_hist_of_results(results_dict):
+    """Plot a histogram of the best Tanimoto score per target (MMT results).
+
+    Args:
+        results_dict: mapping produced by ``run_MMT_generations`` where each
+            value is ``[sorted_list, batch_data]``.
+
+    Returns:
+        Tuple ``(avg_tani, html)``: mean of the best Tanimoto scores and an
+        inline base64 ``<img>`` tag of the rendered PNG.
+
+    Side effects:
+        Shows a matplotlib figure (``plt.show()``), saves it to a BytesIO
+        buffer and closes it afterwards.
+
+    NOTE (known issue, left unchanged): it reads ``sorted_list[0][0][4]``
+    (and calls it "Tanimoto"), but for the MMT layout index 3 is the Tanimoto
+    score and index 4 is the ``[HSQC, COSY]`` error list. The histogram is
+    therefore plotting the wrong quantity. The ``try`` around the loop is also
+    commented out, so a malformed entry raises instead of being skipped.
+    """
     # Initialize an empty list to store the 3rd elements
     tani_list = []
 
@@ -862,6 +1224,28 @@ def plot_hist_of_results(results_dict):
 
 
 def plot_hist_of_results_greedy(results_dict):
+    """Plot a histogram built from entries of a greedy results dict.
+
+    Args:
+        results_dict: mapping where each value is ``[sorted_list,
+            batch_data]``.
+
+    Returns:
+        Tuple ``(avg_tani, html)``: mean of the collected values and an inline
+        base64 ``<img>`` tag of the PNG.
+
+    Side effects:
+        Shows a matplotlib figure, saves it to a BytesIO buffer, closes it.
+
+    NOTE (known issues, left unchanged):
+        * ``sorted_list[0][3]`` reads the fourth *candidate* (``results_dict
+          [key][0][3]``), not the Tanimoto score of the best candidate
+          (``results_dict[key][0][0][3]``). The collected value is a list,
+          so ``ax.hist`` receives a list of lists and fails; a target with
+          fewer than four candidates raises IndexError.
+        * ``avg_tani = sum/len`` has no empty guard, so an empty
+          ``results_dict`` raises ZeroDivisionError.
+    """
     # Initialize an empty list to store the 3rd elements
     tani_list = []
 
@@ -898,6 +1282,21 @@ def plot_hist_of_results_greedy(results_dict):
 
 
 def plot_hist_of_results_greedy_new(results_dict):
+    """Plot a Tanimoto histogram from a flat ``tanimoto_sim`` list.
+
+    Unlike the other two plot helpers this expects
+    ``results_dict`` to already contain a ``"tanimoto_sim"`` list (zeros are
+    treated as failed generations).
+
+    Args:
+        results_dict: mapping containing an optional ``"tanimoto_sim"`` list.
+
+    Returns:
+        Mean Tanimoto over non-zero entries (0 when the list is empty).
+
+    Side effects:
+        Shows a matplotlib figure via ``plt.show()``.
+    """
     # Extract the Tanimoto similarities
     tani_list = results_dict.get('tanimoto_sim', [])
     
