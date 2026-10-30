@@ -1,3 +1,34 @@
+"""Batching strategies and training glue for the CLIP-style alignment model.
+
+The CLIP model (:mod:`utils_MMT.models_CLIP_v15_4`) learns to align a molecule's
+learned embedding with its *spectrum* embedding. Contrastive training works
+much better when a batch contains chemically related molecules, so this module
+supplies three custom batch samplers:
+
+``WeightSortedBatchSampler``
+    Sort molecules by molecular weight, then shuffle inside a sliding "window"
+    of neighbouring weights. Cheap approximation of "similar molecules in the
+    same batch".
+``TanimotoBatchSampler``
+    Greedy clustering: pick an anchor, pull in molecules within
+    ``weight_delta`` Da **and** Tanimoto >= ``similarity_threshold``, then top
+    the batch up with weight-neighbours.
+``create_batches`` / ``filter_molecules_by_weight`` / ``tanimoto_similarity``
+    The helpers implementing the greedy clustering.
+
+Runtime requirements
+--------------------
+Training needs GPUs + W&B; annotated statically only.
+
+NOTE (known issue, left unchanged)
+    1. :func:`create_batches` 的“补位”循环可能把**已经加入当前 batch 的索引
+       再加一次**（见函数内 NOTE），从而产生重复样本、batch 实际大小翻倍。
+    2. :class:`WeightSortedBatchSampler` 只在 ``len(batch) == batch_size`` 时
+       ``yield``；若 ``window_size > batch_size``（允许的情况），这个等式
+       永远不会成立，训练过程中一个 batch 都发不出来。默认
+       ``window_size = max(batch_size, 4)``，所以只在显式传大窗口时才触发。
+"""
+
 # Standard library imports
 import random
 
@@ -28,6 +59,9 @@ from IPython.display import display, HTML, SVG
 from utils_MMT.dataloaders_pl_v15_4 import collate_fn, MultimodalData
 #from utils.models_MMT_v14_1 import MultimodalTransformer
 from utils_MMT.models_CLIP_v15_4 import CLIPModel, ChembertaFingerprint, CLIPMultiGPU
+# NOTE: kept for historical reasons; ``dg`` is not used below anymore
+#       (see the trailing comment: "Decide if I want to use
+#       dg.create_CLIP_dataloaders or from here").
 import utils_MMT.data_generation_v15_4 as dg
 
 def create_batches(dataset, similarity_threshold, batch_size, max_search_size, weight_delta):
@@ -43,8 +77,23 @@ def create_batches(dataset, similarity_threshold, batch_size, max_search_size, w
         
     Returns:
         batches (list): A list of lists containing indices of molecules in each batch.
+
+    Cost:
+        ``filter_molecules_by_weight`` scans every molecule for every anchor,
+        so this is O(N^2) in the number of molecules. Called once per dataset
+        (inside ``TanimotoBatchSampler.__init__``), not per epoch.
+
+    NOTE (known issue, left unchanged)
+        The top-up loop at the end re-iterates ``search_indices`` from the
+        beginning **without checking membership**, so indices already added by
+        the similarity loop are appended a second time. A batch can therefore
+        contain duplicates and exceed ``batch_size``. Left unchanged as
+        instructed; currently ``TanimotoBatchSampler`` is not used by
+        ``create_CLIP_dataloaders`` (only ``WeightSortedBatchSampler`` is).
     """
+    # NOTE: invalid SMILES -> None -> ``CalcExactMolWt(None)`` raises later.
     molecules = [Chem.MolFromSmiles(smi) for smi in tqdm(dataset.ref_data["SMILES"])]
+    # A set, so ``pop`` returns an arbitrary (not shuffled) anchor each round.
     available_indices = set(range(len(molecules)))
     batches = []
 
@@ -62,6 +111,7 @@ def create_batches(dataset, similarity_threshold, batch_size, max_search_size, w
         min_weight, max_weight = anchor_weight - weight_delta, anchor_weight + weight_delta
         weight_filtered_indices = filter_molecules_by_weight(molecules, min_weight, max_weight)
         # Filter out the unavailable indices
+        # (only still-unassigned molecules may join this batch)
         search_indices = list(set(weight_filtered_indices).intersection(available_indices))
         random.shuffle(search_indices)
 
@@ -77,11 +127,14 @@ def create_batches(dataset, similarity_threshold, batch_size, max_search_size, w
             searched_molecules += 1
 
             # Stop searching if max_search_size is reached
+            # (caps the fingerprint cost; the batch may then stay under-sized)
             if searched_molecules >= max_search_size:
                 break
 
         # Add the remaining spots in the batch with molecules within the weight range
         if len(current_batch) < batch_size:
+            # NOTE: see the function-level NOTE - this loop can re-add indices
+            #       that the similarity loop already appended.
             for i in search_indices:
                 if len(current_batch) >= batch_size:
                     break
@@ -108,6 +161,7 @@ def filter_molecules_by_weight(molecules, min_weight, max_weight):
     filtered_indices = []
 
     for i, mol in enumerate(molecules):
+        # exact (monoisotopic) mass, computed on the fly on every call
         mol_weight = rdkit.Chem.rdMolDescriptors.CalcExactMolWt(mol)
         if min_weight <= mol_weight <= max_weight:
             filtered_indices.append(i)
@@ -115,6 +169,31 @@ def filter_molecules_by_weight(molecules, min_weight, max_weight):
     return filtered_indices
 
 class WeightSortedBatchSampler(Sampler):
+    """Batch sampler that keeps molecules of similar mass together.
+
+    Algorithm: sort all indices by ``MW``, walk over them accumulating a
+    ``window``; when the window is full, shuffle it (so batches are not fully
+    deterministic across epochs) and append it to the current batch. Emit as
+    soon as the accumulated batch reaches ``batch_size``.
+
+    Args:
+        dataset (MultimodalData): must expose ``ref_data`` with columns
+            ``MW`` (sort key) and the given indices.
+        batch_size (int): target batch size.
+        drop_last (bool): drop the trailing partial batch.
+        window_size (Optional[int]): how many mass-neighbours get shuffled
+            together; defaults to ``max(batch_size, 4)`` so at least a few
+            molecules are permuted.
+
+    NOTE (known issue, left unchanged)
+        Batches are only emitted when ``len(batch) == batch_size`` *exactly*.
+        If ``window_size`` is not a divisor of / is larger than
+        ``batch_size``, the accumulated length jumps over the equality check
+        and the loop emits nothing; all data then arrives in the single
+        trailing ``yield``. With the default ``window_size == batch_size``
+        this does not happen.
+    """
+
     def __init__(self, dataset, batch_size, drop_last, window_size=None):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -122,6 +201,9 @@ class WeightSortedBatchSampler(Sampler):
         self.window_size = window_size if window_size is not None else max(batch_size, 4)
 
         # Sort the dataset by molecular weight
+        # NOTE: ``.index`` here is the *DataFrame* index, which the dataset's
+        #       ``__getitem__`` must interpret as a positional index; it works
+        #       because ``ref_data`` is written with a default RangeIndex.
         self.sorted_indices = self.dataset.ref_data.sort_values("MW").index.tolist()
 
     def __iter__(self):
@@ -130,6 +212,8 @@ class WeightSortedBatchSampler(Sampler):
         for idx in self.sorted_indices:
             window.append(idx)
             if len(window) == self.window_size:
+                # Local shuffle inside the mass window -> "similar but not
+                # identical" batches, without breaking the sorted order.
                 random.shuffle(window)
                 batch.extend(window)
                 window = []
@@ -138,6 +222,7 @@ class WeightSortedBatchSampler(Sampler):
                     yield batch
                     batch = []
 
+        # flush the leftover window and the partial batch
         if len(window) > 0:
             random.shuffle(window)
             batch.extend(window)
@@ -146,6 +231,8 @@ class WeightSortedBatchSampler(Sampler):
             yield batch
 
     def __len__(self):
+        # NOTE: this formula assumes the "exact" emit path above; with a
+        #       custom ``window_size`` the real number of batches can differ.
         if self.drop_last:
             return len(self.sorted_indices) // self.batch_size
         else:
@@ -168,6 +255,10 @@ class TanimotoBatchSampler(Sampler):
         batch_size (int): The number of samples per batch.
         drop_last (bool): Whether to drop the last incomplete batch.
         batches (list): A list of lists, where each inner list contains indices corresponding to a batch of molecules.
+
+    Note:
+        The expensive clustering runs once, in ``__init__`` (not per epoch),
+        so the batch composition is fixed for the whole training run.
     """
     def __init__(self, dataset, batch_size, drop_last, similarity_threshold, max_search_size, weight_delta):
         self.dataset = dataset
@@ -188,6 +279,18 @@ class TanimotoBatchSampler(Sampler):
 
 
 def tanimoto_similarity(mol1, mol2, radius=2, num_class=1024):
+    """Tanimoto similarity between two molecules using Morgan fingerprints.
+
+    Args:
+        mol1, mol2 (Chem.Mol): molecules to compare.
+        radius (int): Morgan radius (2 == ECFP4-like environments).
+        num_class (int): fingerprint length in bits.
+
+    Returns:
+        float: similarity in [0, 1]. Note the fingerprint is **1024 bits here**
+        whereas :mod:`utils_MMT.clustering_visualization_v15_4` uses 512 bits -
+        similarities are consistent only within one setting.
+    """
     fp1 = AllChem.GetMorganFingerprintAsBitVect(mol1, radius, nBits=num_class)
     fp2 = AllChem.GetMorganFingerprintAsBitVect(mol2, radius, nBits=num_class)
     return DataStructs.TanimotoSimilarity(fp1, fp2)
@@ -195,6 +298,26 @@ def tanimoto_similarity(mol1, mol2, radius=2, num_class=1024):
 
 
 def create_CLIP_dataloaders(config, stoi, stoi_MF):
+    """Build the three dataloaders used by CLIP training/evaluation.
+
+    Args:
+        config (argparse.Namespace): ``CLIP_batch_size``, ``num_workers`` and
+            everything :class:`MultimodalData` needs.
+        stoi (dict): SMILES char -> index.
+        stoi_MF (dict): molecular-formula char -> index.
+
+    Returns:
+        Dict[str, DataLoader]: keys ``"train"``, ``"test"``, ``"val"``.
+
+    Design notes:
+        * train/test use the mass-window sampler (``batch_sampler=``), so
+          ``shuffle``/``batch_size`` must NOT also be passed to ``DataLoader``
+          (PyTorch rejects that combination).
+        * the val loader uses ``batch_size=1`` because the downstream
+          validation step runs the multimodal model on many samples in parallel
+          outside of the loader; a large batch would only add padding.
+        * ``drop_last=False`` everywhere: every molecule must be scored.
+    """
     #NUM_WORKERS = os.cpu_count()
     batch_size = config.CLIP_batch_size
 
@@ -203,6 +326,8 @@ def create_CLIP_dataloaders(config, stoi, stoi_MF):
                                    stoi_MF, 
                                    mode="train")
     
+    # Mass-sorted sampling: keeps "similar size" molecules in the same
+    # contrastive batch.
     train_sampler = WeightSortedBatchSampler(train_dataset, 
                                              batch_size, 
                                              drop_last=False)
@@ -226,6 +351,8 @@ def create_CLIP_dataloaders(config, stoi, stoi_MF):
     #                                        drop_last=False)
         
     # Create DataLoaders
+    # NOTE: ``batch_sampler=`` replaces ``batch_size``/``shuffle``/``drop_last``,
+    #       therefore they are given to the sampler only, not to the loader.
     train_dataloader = DataLoader(train_dataset, 
                                   batch_sampler=train_sampler,
                                   #shuffle=True, 
@@ -250,6 +377,12 @@ def create_CLIP_dataloaders(config, stoi, stoi_MF):
     return dataloaders
 
 class AvgMeter:
+    """Running mean tracker (used by the CLIP training loop for loss logging).
+
+    ``update`` accumulates a batch mean and its sample count so that the
+    reported average is weighted by batch size rather than by batch index.
+    """
+
     def __init__(self, name="Metric"):
         self.name = name
         self.reset()
@@ -267,6 +400,12 @@ class AvgMeter:
         return text
 
 def get_lr(optimizer):
+    """Return the learning rate of the first parameter group.
+
+    Note:
+        Returns ``None`` for an optimizer with no parameter groups
+        (``param_groups`` empty), which ``f"{...:.4f}"`` would then crash on.
+    """
     for param_group in optimizer.param_groups:
         return param_group["lr"]
 
@@ -274,6 +413,28 @@ def get_lr(optimizer):
 
 
 def run_training_CLIP(train_dataloader, test_dataloader, config):
+    """Mirror of :func:`utils_MMT.MT_functions_v15_4.run_training_MMT` for CLIP.
+
+    Differences vs. the MMST trainer:
+        * output directory/model name come from ``CLIP_*`` config fields;
+        * training resumes from ``config.CLIP_model_path`` when
+          ``config.CLIP_continue_training`` is set;
+        * epochs come from ``config.CLIP_NUM_EPOCHS``;
+        * there is no ``use_real_data`` linear-probe branch.
+
+    Args:
+        train_dataloader, test_dataloader: from :func:`create_CLIP_dataloaders`
+            (``"train"`` and ``"test"`` entries).
+        config: parsed ``argparse.Namespace``.
+
+    Returns:
+        None.
+
+    NOTE (known issue, left unchanged)
+        Same two problems as in ``run_training_MMT``: ``os.mkdir`` is not
+        recursive, and the ``except`` block touches ``trainer`` which is
+        unbound when the ``pl.Trainer`` constructor itself raises.
+    """
     if not os.path.exists(config.CLIP_model_save_dir):
         os.mkdir(config.CLIP_model_save_dir)
 
@@ -287,6 +448,8 @@ def run_training_CLIP(train_dataloader, test_dataloader, config):
         json.dump(config_dict, f, indent=4) 
 
     filepath= config.CLIP_model_save_dir
+    # One checkpoint per epoch, all kept (used later to compare alignment
+    # quality across epochs).
     checkpoint_callback = ModelCheckpoint(
         monitor='loss',
         mode='min',
@@ -324,11 +487,22 @@ def run_training_CLIP(train_dataloader, test_dataloader, config):
         trainer.fit(CLIP_multi_gpu_model, train_dataloader, test_dataloader)
     except Exception as e:
         print(f"Error occurred: {e}")
+        # keep whatever state exists, same fallback as the MMST trainer
         backup_ckpt_path = config.CLIP_model_save_dir+"/last_backup_checkpoint.ckpt"
         trainer.save_checkpoint(backup_ckpt_path)
         print("Model saved.")
 
 def run_CLIP(config, stoi, stoi_MF):
+    """One-call wrapper: build dataloaders (train/test/val), then train on train/test.
+
+    Args:
+        config: parsed ``argparse.Namespace``.
+        stoi, stoi_MF: token dictionaries.
+
+    Returns:
+        None. The ``"val"`` dataloader is created but not used for training
+        (validation is done separately by the generation/evaluation code).
+    """
     dataloaders = create_CLIP_dataloaders(config, stoi, stoi_MF)
 
     #train_dataloader, test_dataloader = load_dataloaders(config, stoi, stoi_MF)
